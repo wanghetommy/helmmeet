@@ -1,0 +1,7 @@
+{
+  "protocol_version": 1,
+  "runtime": "tauri",
+  "capture_available": true,
+  "asr_available": true,
+  "analysis_available": true
+}

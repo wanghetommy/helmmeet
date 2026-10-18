@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>NSMicrophoneUsageDescription</key><string>HelmMeet 需要麦克风来录制你主动开始的会议。音频保存在本机。</string>
+<key>NSAudioCaptureUsageDescription</key><string>HelmMeet 在你选择电脑声音时采集会议播放音频，不保存屏幕视频。</string>
+<key>LSMinimumSystemVersion</key><string>14.0</string>
+</dict></plist>

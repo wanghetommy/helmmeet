@@ -1,0 +1,17 @@
+{
+  "asr": {
+    "model_path": "/absolute/path/to/ggml-large-v3-turbo.bin",
+    "model_sha256": null,
+    "backend": "metal",
+    "language": "zh"
+  },
+  "analysis": {
+    "mode": "transcript_only",
+    "provider": "deepseek",
+    "protocol": "openai_compatible_chat",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-flash",
+    "api_key": "",
+    "timeout_seconds": 120
+  }
+}

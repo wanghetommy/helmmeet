@@ -1,0 +1,39 @@
+{
+  "name": "helmmeet",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first personal meeting assistant for macOS",
+  "workspaces": [
+    "apps/desktop",
+    "packages/contracts"
+  ],
+  "engines": {
+    "node": ">=22.18.0",
+    "npm": ">=10"
+  },
+  "scripts": {
+    "dev": "npm run dev -w @helmmeet/desktop",
+    "build": "npm run build -w @helmmeet/desktop",
+    "desktop:dev": "sh scripts/with-toolchain.sh npm run tauri -w @helmmeet/desktop -- dev",
+    "desktop:build": "sh scripts/build-desktop.sh",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/contracts/*.test.ts",
+    "test:storage": "python3 -m unittest discover -s tests/integration -p 'test_*.py' -v",
+    "test:core": "sh scripts/with-toolchain.sh cargo test --workspace",
+    "check:docs": "python3 scripts/check_docs.py",
+    "doctor": "python3 scripts/doctor.py",
+    "verify": "npm run typecheck && npm test && npm run test:storage && npm run check:docs && npm run build",
+    "bootstrap": "sh scripts/bootstrap.sh",
+    "desktop:run": "sh scripts/run-desktop.sh"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.3",
+    "@types/node": "^22.19.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "typescript": "5.9.3",
+    "vite": "8.3.4"
+  }
+}

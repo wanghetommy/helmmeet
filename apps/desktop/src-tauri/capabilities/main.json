@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Main window may read capability status and invoke the typed meeting, model profile and audio command dispatcher.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "allow-get-system-status",
+    "allow-dispatch"
+  ]
+}

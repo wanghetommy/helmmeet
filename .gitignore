@@ -66,3 +66,30 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# HelmMeet local data and tooling
+.DS_Store
+node_modules/
+dist/
+target/
+.build/
+.swiftpm/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+config/local.json
+*.sqlite
+*.sqlite-*
+*.db
+*.bin
+*.wav
+*.pcm
+*.mp3
+*.m4a
+coverage/
+apps/desktop/src-tauri/gen/
+artifacts/
+.tools/
+native/macos-audio/.build/
