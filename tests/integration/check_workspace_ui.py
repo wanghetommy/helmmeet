@@ -92,7 +92,7 @@ window.__TAURI_INTERNALS__={transformCallback:()=>1,unregisterCallback:()=>{},in
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port',type=int,default=1421)
-    parser.add_argument('--scenario',choices=['normal','voice-lifecycle','render-recovery'],default='normal')
+    parser.add_argument('--scenario',choices=['normal','voice-lifecycle','render-recovery','minutes-overlap'],default='normal')
     args=parser.parse_args()
     dist=ROOT/'apps/desktop/dist'
     scenario = ""
@@ -108,6 +108,8 @@ let syntheticPolls=0;
 const syntheticInvoke=window.__TAURI_INTERNALS__.invoke;
 window.__TAURI_INTERNALS__.invoke=async(cmd,args)=>{if(cmd==='dispatch'&&args.operation.kind==='assistant_detail'){syntheticPolls++;const t=syntheticChat.turns.at(-1);if(syntheticPolls>5){t.state='failed';t.error='合成超时，界面保持可操作';t.answer={evidence:null};}else if(syntheticPolls>2)t.state='running';}return syntheticInvoke(cmd,args)};
 """
+    elif args.scenario == 'minutes-overlap':
+        scenario = "for(const art of details[b].artifacts.filter(x=>x.type==='minutes')){art.status='incomplete';art.coverage.incomplete=true;art.coverage.assistant_playback_overlap_segments=10;}details[b].jobs=[{id:'synthetic-minute-success',type:'final_map',state:'succeeded',error:null}];"
     elif args.scenario == 'render-recovery':
         scenario = "details[a].segments[0].text={synthetic_render_fault:true};"
 

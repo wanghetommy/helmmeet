@@ -6,7 +6,12 @@ use crate::{
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, sync::Arc, thread, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
 pub fn target(config: &ModelConfig) -> String {
     format!(
@@ -382,6 +387,126 @@ fn sections_valid(value: &Value) -> bool {
         .as_array()
         .is_some_and(|items| items.iter().all(|i| i["section"].is_string()))
 }
+// Per-call citation IDs reduce long UUID copying errors. The host owns the exact
+// original (segment, revision) mapping; neither a batch nor a reducer can widen it.
+#[derive(Debug)]
+struct CitationScope {
+    aliases: HashMap<String, (String, u64)>,
+    known: HashSet<(String, u64)>,
+}
+fn reference_pair(v: &Value) -> Option<(String, u64)> {
+    Some((v["segment_id"].as_str()?.into(), v["revision"].as_u64()?))
+}
+fn prepare_citations(
+    input: &mut Value,
+    known: &HashSet<(String, u64)>,
+) -> Result<CitationScope, String> {
+    let mut pairs = vec![];
+    if let Some(rows) = input.get_mut("transcript").and_then(Value::as_array_mut) {
+        rows.retain(|r| {
+            r["assistant_playback_overlap"] != true
+                && reference_pair(r).is_some_and(|p| known.contains(&p))
+        });
+        if rows.is_empty() {
+            return Err("本轮没有可自动引用的原文；与小舵播报重叠的段落需先人工核对".into());
+        }
+        pairs.extend(rows.iter().filter_map(reference_pair));
+    } else if let Some(parts) = input["parts"].as_array() {
+        for part in parts {
+            for key in ["summary", "actions"] {
+                for item in part[key].as_array().into_iter().flatten() {
+                    pairs.extend(
+                        item["evidence"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(reference_pair)
+                            .filter(|p| known.contains(p)),
+                    );
+                }
+            }
+        }
+    }
+    let mut unique = HashSet::new();
+    pairs.retain(|p| unique.insert(p.clone()));
+    let aliases: HashMap<_, _> = pairs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (format!("ref_{:03}", i + 1), p.clone()))
+        .collect();
+    let reverse: HashMap<_, _> = aliases
+        .iter()
+        .map(|(alias, p)| (p.clone(), alias.clone()))
+        .collect();
+    fn rewrite(v: &mut Value, map: &HashMap<(String, u64), String>) {
+        match v {
+            Value::Array(rows) => {
+                for row in rows {
+                    rewrite(row, map);
+                }
+            }
+            Value::Object(object) => {
+                // Prior summaries/history are indexes, not an extra source scope.
+                if let Some(refs) = object.get_mut("evidence").and_then(Value::as_array_mut) {
+                    refs.retain(|r| reference_pair(r).is_some_and(|p| map.contains_key(&p)));
+                }
+                if let (Some(sid), Some(rev)) = (
+                    object.get("segment_id").and_then(Value::as_str),
+                    object.get("revision").and_then(Value::as_u64),
+                ) {
+                    if let Some(alias) = map.get(&(sid.into(), rev)) {
+                        object.insert("segment_id".into(), json!(alias));
+                    }
+                }
+                for value in object.values_mut() {
+                    rewrite(value, map);
+                }
+            }
+            _ => {}
+        }
+    }
+    rewrite(input, &reverse);
+    input["allowed_evidence"] = json!(pairs
+        .iter()
+        .map(|p| json!({"segment_id":reverse[p],"revision":p.1}))
+        .collect::<Vec<_>>());
+    Ok(CitationScope {
+        aliases,
+        known: unique,
+    })
+}
+impl CitationScope {
+    fn restore_and_validate(&self, mut value: Value) -> Result<Value, String> {
+        for key in ["summary", "actions"] {
+            for item in value
+                .get_mut(key)
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                for r in item
+                    .get_mut("evidence")
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some((sid, rev)) =
+                        r["segment_id"].as_str().and_then(|s| self.aliases.get(s))
+                    {
+                        if r["revision"].as_u64() == Some(*rev) {
+                            r["segment_id"] = json!(sid);
+                        }
+                    }
+                }
+            }
+        }
+        validate(&value, &self.known)?;
+        if !sections_valid(&value) {
+            return Err("模型缺少有效结果章节".into());
+        }
+        Ok(value)
+    }
+}
 fn checked_request(
     rt: &Runtime,
     check: &dyn Fn() -> Result<(), String>,
@@ -396,16 +521,11 @@ fn checked_request(
             object.insert("task_type".into(), kind);
         }
     }
+    let citations = prepare_citations(&mut input, known)?;
     let messages =
         json!([{"role":"system","content":RULES},{"role":"user","content":input.to_string()}]);
     let output = request(rt, config, messages.clone(), check)?;
-    let first = parse(&output).and_then(|v| {
-        validate(&v, known)?;
-        if !sections_valid(&v) {
-            return Err("模型缺少有效结果章节".into());
-        }
-        Ok(v)
-    });
+    let first = parse(&output).and_then(|v| citations.restore_and_validate(v));
     if let Ok(value) = first {
         return Ok(value);
     }
@@ -413,14 +533,10 @@ fn checked_request(
     check()?;
     // Regenerate from the original evidence instead of doubling context with a malformed reply.
     let mut repair = messages;
-    repair.as_array_mut().unwrap().push(json!({"role":"user","content":format!("上次结果未通过校验：{reason}。请依据同一输入重新生成一个完整JSON对象，必须含summary和actions数组。summary每项须有text、kind、section、evidence。kind只能是discussion、decision、risk、question、suggestion、unanswered之一，不能使用任务类型stage/minutes/answer或章节名；section只能是topic、outline、progress、open、minutes、answer之一。引用只能来自输入。没有依据不增加事实，缺失的行动负责人/日期用null。不要Markdown或说明文字。") }));
+    repair.as_array_mut().unwrap().push(json!({"role":"user","content":format!("上次结果未通过校验：{reason}。请依据同一输入重新生成一个完整JSON对象，必须含summary和actions数组。summary每项须有text、kind、section、evidence。kind只能是discussion、decision、risk、question、suggestion、unanswered之一，不能使用任务类型stage/minutes/answer或章节名；section只能是topic、outline、progress、open、minutes、answer之一。引用只能逐字复制allowed_evidence中的segment_id短编号与revision，不能使用上个批次或历史结果的编号。没有依据不增加事实，缺失的行动负责人/日期用null。不要Markdown或说明文字。") }));
     let value = parse(&request(rt, config, repair, check)?)
         .map_err(|e| format!("重新生成后仍未得到有效结构：{e}"))?;
-    validate(&value, known)?;
-    if !sections_valid(&value) {
-        return Err("模型缺少有效结果章节".into());
-    }
-    Ok(value)
+    citations.restore_and_validate(value)
 }
 pub fn test_structure(
     rt: &Runtime,
@@ -703,7 +819,8 @@ fn submit_inner(
                 .iter()
                 .map(|s| json!({"segment_id":s["id"],"revision":s["revision"]}))
                 .collect::<Vec<_>>();
-            let snapshot = json!({"request":input,"manifest":manifest,"new_manifest":new_manifest,"template":detail["template"],"knowledge_manifest":knowledge["bindings"],"config":config,"generation":generation,"consent_version":detail["consent_version"],"previous_artifact_id":previous.as_ref().map(|a|&a["id"]),"through_ms":detail["duration_ms"]});
+            let excluded_manifest = segments.iter().filter(|s|s["assistant_playback_overlap"]==true).map(|s|json!({"segment_id":s["id"],"revision":s["revision"],"reason":"assistant_playback_overlap"})).collect::<Vec<_>>();
+            let snapshot = json!({"excluded_manifest":excluded_manifest,"citation_policy":"batch_aliases_no_assistant_overlap_v1","request":input,"manifest":manifest,"new_manifest":new_manifest,"template":detail["template"],"knowledge_manifest":knowledge["bindings"],"config":config,"generation":generation,"consent_version":detail["consent_version"],"previous_artifact_id":previous.as_ref().map(|a|&a["id"]),"through_ms":detail["duration_ms"]});
             let frozen_key = format!("{:x}", Sha256::digest(format!("{task}:{snapshot}")));
             rt.db()?.execute("UPDATE analysis_jobs SET idempotency_key=?,input_snapshot=?,state='running',attempts=attempts+1 WHERE id=?",params![frozen_key,snapshot.to_string(),task]).map_err(err)?;
             let known: HashSet<_> = segments
@@ -716,6 +833,9 @@ fn submit_inner(
                     )
                 })
                 .collect();
+            if known.is_empty() {
+                return Err("本轮原文均与小舵播报重叠，请先核对或修订原稿后再生成".into());
+            }
             let deadline = std::time::Instant::now()
                 + Duration::from_secs(if automatic.is_some() { 180 } else { 900 });
             let check = || {
@@ -733,8 +853,12 @@ fn submit_inner(
             let mut batches = vec![];
             let mut current = vec![];
             let mut size = 0;
-            for seg in &segments {
-                let n = seg.to_string().len();
+            for seg in segments
+                .iter()
+                .filter(|s| s["assistant_playback_overlap"] != true)
+            {
+                // Reserve room for the per-request allowed_evidence entry.
+                let n = seg.to_string().len() + 64;
                 if size + n > batch_limit && !current.is_empty() {
                     batches.push(std::mem::take(&mut current));
                     size = 0;
@@ -1186,6 +1310,198 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("不能使用任务类型"));
+    }
+    #[test]
+    fn citation_aliases_exclude_overlap_and_fence_batches_revisions_and_reducers() {
+        let known = HashSet::from([("long-original-a".into(), 3), ("long-original-b".into(), 1)]);
+        let mut input = json!({"transcript":[{"segment_id":"long-original-a","revision":3,"text":"允许原文"},{"segment_id":"overlap","revision":1,"text":"不可外发的播报重叠片段","assistant_playback_overlap":true}],"previous_summary":{"summary":[{"evidence":[{"segment_id":"long-original-b","revision":1}]}]}});
+        let scope = prepare_citations(&mut input, &known).unwrap();
+        assert_eq!(input["transcript"].as_array().unwrap().len(), 1);
+        assert_eq!(input["transcript"][0]["segment_id"], "ref_001");
+        assert!(!input.to_string().contains("long-original"));
+        assert!(!input.to_string().contains("播报重叠片段"));
+        assert_eq!(
+            input["previous_summary"]["summary"][0]["evidence"],
+            json!([])
+        );
+        let mut output = fact();
+        output["summary"][0]["evidence"] = json!([{"segment_id":"ref_001","revision":3}]);
+        output["actions"] = json!([{"task":"合成行动","owner_text":null,"due_text":null,"evidence":[{"segment_id":"ref_001","revision":3}]}]);
+        let restored = scope.restore_and_validate(output.clone()).unwrap();
+        assert_eq!(
+            restored["summary"][0]["evidence"][0]["segment_id"],
+            "long-original-a"
+        );
+        assert_eq!(
+            restored["actions"][0]["evidence"][0]["segment_id"],
+            "long-original-a"
+        );
+        output["summary"][0]["evidence"][0]["revision"] = json!(2);
+        assert!(scope.restore_and_validate(output.clone()).is_err());
+        output["summary"][0]["evidence"] = json!([{"segment_id":"long-original-b","revision":1}]);
+        assert!(scope.restore_and_validate(output).is_err());
+        let mut reduce = json!({"parts":[restored]});
+        let reduce_scope = prepare_citations(&mut reduce, &known).unwrap();
+        assert_eq!(reduce_scope.known.len(), 1);
+        assert_eq!(
+            reduce["parts"][0]["summary"][0]["evidence"][0]["segment_id"],
+            "ref_001"
+        );
+        let mut blocked = json!({"transcript":[{"segment_id":"overlap","revision":1,"assistant_playback_overlap":true}]});
+        assert!(prepare_citations(&mut blocked, &known)
+            .unwrap_err()
+            .contains("人工核对"));
+    }
+    #[test]
+    fn outside_batch_reference_is_repaired_using_only_allowed_aliases() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (_root, rt, c) = fixture(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = thread::spawn(move || {
+            let mut seen = vec![];
+            for sid in ["other-batch", "ref_001"] {
+                let (mut socket, _) = listener.accept().unwrap();
+                seen.push(receive(&mut socket));
+                let mut output = fact();
+                output["summary"][0]["evidence"] = json!([{"segment_id":sid,"revision":1}]);
+                respond(&mut socket, 200, reply(&output.to_string()));
+            }
+            seen
+        });
+        let output=checked_request(&rt,&||Ok(()),&c,json!({"kind":"minutes","transcript":[{"segment_id":"original","revision":1,"text":"合成允许原文"}]}),&HashSet::from([("original".into(),1),("other-batch".into(),1)])).unwrap();
+        assert_eq!(
+            output["summary"][0]["evidence"][0]["segment_id"],
+            "original"
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]["messages"][2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("allowed_evidence"));
+    }
+    #[test]
+    fn whole_minutes_with_212_segments_and_10_playback_overlaps_persists_partial_draft() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (_root, rt, _c) = fixture(&format!("http://{}", listener.local_addr().unwrap()));
+        let mid = rt.create("合成整场纪要回归", "general").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        {
+            let mut db = rt.db().unwrap();
+            let tx = db.transaction().unwrap();
+            tx.execute(
+                "UPDATE meetings SET state='completed',recording_duration_ms=212000 WHERE id=?",
+                [&mid],
+            )
+            .unwrap();
+            for i in 0..212 {
+                let sid = id();
+                let text = format!(
+                    "合成段落{i}：{}",
+                    "本段讨论会议目标与方案验收条件，观点仍需通过测试验证。".repeat(4)
+                );
+                tx.execute(
+                    "INSERT INTO transcript_segments VALUES (?,?,?,?,'mixed',1,'final')",
+                    params![sid, mid, i * 1000, (i + 1) * 1000],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO transcript_revisions VALUES (?,1,?,?,'asr','now')",
+                    params![sid, mid, text],
+                )
+                .unwrap();
+                if i < 200 && i % 20 == 0 {
+                    tx.execute("INSERT INTO assistant_playback_events(id,meeting_id,text,start_host_ns,start_ms,end_ms) VALUES (?,?,'合成播报',0,?,?)",params![id(),mid,i*1000,i*1000+300]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = stopped.clone();
+        let server = thread::spawn(move || {
+            let mut inputs = vec![];
+            let until = std::time::Instant::now() + Duration::from_secs(12);
+            while !stop.load(Ordering::Acquire) && std::time::Instant::now() < until {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("fake HTTP: {e}"),
+                };
+                let body = receive(&mut socket);
+                let input: Value =
+                    serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+                let reference = input["allowed_evidence"][0].clone();
+                assert!(reference.is_object());
+                let mut output = fact();
+                output["summary"][0]["section"] = json!("minutes");
+                output["summary"][0]["evidence"] = json!([reference]);
+                respond(&mut socket, 200, reply(&output.to_string()));
+                inputs.push(input);
+            }
+            inputs
+        });
+        let job = submit(rt.clone(), &mid, "minutes", "", "all").unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let (state, error) = loop {
+            let v: (String, Option<String>) = rt
+                .db()
+                .unwrap()
+                .query_row(
+                    "SELECT state,error_code FROM analysis_jobs WHERE id=?",
+                    [job["job_id"].as_str().unwrap()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            if !["pending", "running"].contains(&v.0.as_str()) {
+                break v;
+            }
+            assert!(std::time::Instant::now() < until);
+            thread::sleep(Duration::from_millis(10));
+        };
+        stopped.store(true, Ordering::Release);
+        let inputs = server.join().unwrap();
+        assert_eq!(state, "succeeded", "{error:?}");
+        assert!(inputs.iter().any(|v| v["parts"].is_array()));
+        assert_eq!(
+            inputs
+                .iter()
+                .filter_map(|v| v["transcript"].as_array())
+                .map(Vec::len)
+                .sum::<usize>(),
+            202
+        );
+        assert!(inputs
+            .iter()
+            .all(|v| !v.to_string().contains("assistant_playback_overlap\":true")));
+        let d = rt.detail(&mid).unwrap();
+        let artifact = &d["artifacts"][0];
+        assert_eq!(artifact["status"], "incomplete");
+        assert_eq!(
+            artifact["coverage"]["assistant_playback_overlap_segments"],
+            10
+        );
+        let sid = artifact["content"]["summary"][0]["evidence"][0]["segment_id"]
+            .as_str()
+            .unwrap();
+        assert!(uuid::Uuid::parse_str(sid).is_ok());
+        let raw: String = rt
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT input_snapshot FROM analysis_jobs WHERE id=?",
+                [job["job_id"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let snapshot: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(snapshot["excluded_manifest"].as_array().unwrap().len(), 10);
+        assert_eq!(snapshot["manifest"].as_array().unwrap().len(), 212);
     }
     #[test]
     fn compatibility_fallback_only_follows_explicit_unsupported_json_error() {

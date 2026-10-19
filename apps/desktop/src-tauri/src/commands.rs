@@ -1147,6 +1147,14 @@ pub fn export_text(detail: &Value, format: &str) -> String {
                     artifact["coverage"]["config_version"]
                 );
             }
+            if let Some(count) = artifact["coverage"]["assistant_playback_overlap_segments"]
+                .as_u64()
+                .filter(|n| *n > 0)
+            {
+                out += &format!(
+                    "覆盖说明：{count}段原文与小舵播报重叠，未纳入自动生成内容，请核对原稿。\n\n"
+                );
+            }
             out += &artifact["content"]
                 .get("manual_text")
                 .and_then(Value::as_str)
@@ -1249,6 +1257,11 @@ mod tests {
         assert!(md.contains("不代表会上共识"));
         assert!(md.contains("s1 r1: 当时原文"));
         assert!(!md.contains("manual_text"));
+    }
+    #[test]
+    fn minutes_export_explains_playback_overlap_exclusion() {
+        let data = json!({"title":"合成会议","artifacts":[{"type":"minutes","version":1,"status":"incomplete","content":{"summary":[],"actions":[]},"coverage":{"assistant_playback_overlap_segments":10}}],"segments":[],"actions":[],"export_evidence":[]});
+        assert!(export_text(&data, "md").contains("10段原文与小舵播报重叠"));
     }
     #[test]
     fn csv_formula_and_quotes() {

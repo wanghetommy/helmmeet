@@ -586,14 +586,14 @@ mod tests {
         assert_eq!(seen[0]["task_type"], "answer");
         assert_eq!(seen[1]["task_type"], "stage");
         assert_eq!(seen[1]["transcript"].as_array().unwrap().len(), 2);
-        let ids = seen[2]["transcript"]
+        let texts = seen[2]["transcript"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|s| s["segment_id"].as_str())
+            .filter_map(|s| s["text"].as_str())
             .collect::<Vec<_>>();
-        assert!(ids.contains(&third.as_str()));
-        assert!(!ids.contains(&second.as_str()));
+        assert!(texts.contains(&"下一轮新增"));
+        assert!(!texts.contains(&"排队后新增"));
         assert!(seen[2]["previous_summary"].is_object());
         let raw: String = rt
             .db()
@@ -605,6 +605,8 @@ mod tests {
             )
             .unwrap();
         assert!(!raw.contains("下一轮新增"));
+        assert!(raw.contains(&third));
+        assert!(!raw.contains(&second));
         assert!(raw.contains("new_manifest"));
         join(&rt);
         drop(rt);
