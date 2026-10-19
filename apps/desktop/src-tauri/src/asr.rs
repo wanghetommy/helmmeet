@@ -1,13 +1,14 @@
 use crate::{
     audio,
     db::{err, id, now, safe_relative, Runtime},
+    lifecycle::{StopToken, Worker},
 };
 use meeting_core::coverage::{missing_intervals, Interval};
 use rusqlite::params;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::{sync::Arc, thread, time::Duration};
+use std::{sync::Arc, time::Duration};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 pub fn recover(rt: &Runtime) -> Result<(), String> {
@@ -103,7 +104,7 @@ pub fn mix_source(
 ) -> Result<Vec<f32>, String> {
     let rows = {
         let db = rt.db()?;
-        let mut s=db.prepare("SELECT relative_path,start_ms,end_ms FROM audio_chunks WHERE meeting_id=? AND status='sealed' AND start_ms<? AND end_ms>? AND (? IS NULL OR source=?) ORDER BY start_ms").map_err(err)?;
+        let mut s=db.prepare("SELECT c.relative_path,coalesce(t.start_sample,c.start_ms*16),CASE WHEN t.chunk_id IS NULL THEN (c.end_ms-c.start_ms)*16 ELSE c.sample_count END FROM audio_chunks c LEFT JOIN audio_chunk_timing t ON t.chunk_id=c.id WHERE c.meeting_id=? AND c.status='sealed' AND coalesce(t.start_sample,c.start_ms*16)<?*16 AND coalesce(t.start_sample,c.start_ms*16)+CASE WHEN t.chunk_id IS NULL THEN (c.end_ms-c.start_ms)*16 ELSE c.sample_count END>?*16 AND (? IS NULL OR c.source=?) ORDER BY c.start_ms").map_err(err)?;
         let rows = s
             .query_map(params![meeting, end, start, source, source], |r| {
                 Ok((
@@ -117,24 +118,26 @@ pub fn mix_source(
             .map_err(err)?;
         rows
     };
+    // A missing packet is silence for that source, not an instruction to boost
+    // every other source. Use one gain for the whole meeting, including export
+    // blocks, so availability/chunk boundaries cannot produce level jumps.
+    let tracks: usize = if source.is_some() {
+        1
+    } else {
+        rt.db()?.query_row("SELECT count(*) FROM (SELECT source FROM audio_chunks WHERE meeting_id=?1 UNION SELECT source FROM recording_sources WHERE meeting_id=?1)",[meeting],|r|r.get(0)).map_err(err)?
+    };
+    let gain = meeting_core::audio_clock::mix_gain(tracks);
     let mut pcm = vec![0.0; ((end - start) * 16) as usize];
-    let mut counts = vec![0u8; pcm.len()];
-    for (path, from, to) in rows {
+    for (path, from, count) in rows {
         let samples = audio::read_wav(&safe_relative(&rt.root, &path)?)?;
-        let lo = start.max(from);
-        let hi = end.min(to);
-        for t in lo * 16..hi * 16 {
+        let lo = (start * 16).max(from);
+        let hi = (end * 16).min(from + count);
+        for t in lo..hi {
             let out = (t - start * 16) as usize;
-            let input = (t - from * 16) as usize;
+            let input = (t - from) as usize;
             if let Some(v) = samples.get(input) {
-                pcm[out] += *v;
-                counts[out] += 1;
+                pcm[out] += *v * gain;
             }
-        }
-    }
-    for (i, value) in pcm.iter_mut().enumerate() {
-        if counts[i] > 1 {
-            *value /= f32::from(counts[i]);
         }
     }
     Ok(pcm)
@@ -144,20 +147,40 @@ pub fn decode(
     pcm: &[f32],
     language: &str,
 ) -> Result<Vec<(u64, u64, String)>, String> {
-    decode_with_partial(context, pcm, language, None)
+    decode_with_partial(context, pcm, language, None, None, "")
 }
 fn decode_with_partial(
     context: &WhisperContext,
     pcm: &[f32],
     language: &str,
     partial: Option<Box<dyn FnMut(whisper_rs::SegmentCallbackData)>>,
+    stop: Option<StopToken>,
+    initial_prompt: &str,
 ) -> Result<Vec<(u64, u64, String)>, String> {
+    if stop.as_ref().is_some_and(StopToken::is_stopped) {
+        return Err("转写已取消，原音频保留待下次处理".into());
+    }
     let energy = pcm.iter().map(|v| v * v).sum::<f32>() / pcm.len().max(1) as f32;
     if energy < 0.000004 {
         return Ok(vec![]);
     }
     let mut state = context.create_state().map_err(|_| "无法创建推理状态")?;
     let mut p = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    if let Some(token) = stop.as_ref() {
+        unsafe extern "C" fn abort(data: *mut std::ffi::c_void) -> bool {
+            // The borrowed token stays alive and unmoved through state.full().
+            // Native inference invokes this only synchronously within full().
+            unsafe { (&*data.cast::<StopToken>()).is_stopped() }
+        }
+        unsafe {
+            p.set_abort_callback(Some(abort));
+            p.set_abort_callback_user_data(
+                (token as *const StopToken)
+                    .cast_mut()
+                    .cast::<std::ffi::c_void>(),
+            );
+        }
+    }
     p.set_segment_callback_safe_lossy::<_, Box<dyn FnMut(whisper_rs::SegmentCallbackData)>>(
         partial,
     );
@@ -172,6 +195,9 @@ fn decode_with_partial(
     p.set_print_timestamps(false);
     p.set_print_special(false);
     p.set_no_context(true);
+    if !initial_prompt.is_empty() {
+        p.set_initial_prompt(initial_prompt);
+    }
     p.set_suppress_blank(true);
     p.set_temperature(0.0);
     state.full(p, pcm).map_err(|_| "本地识别失败")?;
@@ -192,17 +218,19 @@ fn decode_with_partial(
     }
     Ok(output)
 }
-pub fn spawn(rt: Arc<Runtime>) {
-    thread::spawn(move || {
+pub fn spawn(rt: Arc<Runtime>) -> Worker {
+    Worker::spawn(move |stop| {
         let mut loaded = String::new();
         let mut context = None;
-        loop {
-            thread::sleep(Duration::from_millis(700));
+        'jobs: while stop.wait(Duration::from_millis(700)) {
             let job = match work(&rt) {
                 Ok(Some(v)) => v,
                 _ => continue,
             };
             let (meeting, start, end, _) = job;
+            if stop.is_stopped() {
+                break;
+            }
             let config = match rt.config.lock() {
                 Ok(c) => c.asr.clone(),
                 Err(_) => continue,
@@ -224,6 +252,9 @@ pub fn spawn(rt: Arc<Runtime>) {
                         let mut hash = Sha256::new();
                         let mut bytes = [0u8; 1024 * 1024];
                         loop {
+                            if stop.is_stopped() {
+                                return Err("转写已取消".into());
+                            }
                             let n = f.read(&mut bytes).map_err(err)?;
                             if n == 0 {
                                 break;
@@ -233,8 +264,11 @@ pub fn spawn(rt: Arc<Runtime>) {
                         Ok(format!("{:x}", hash.finalize()))
                     })();
                     if check.as_deref() != Ok(expected.as_str()) {
+                        if stop.is_stopped() {
+                            break 'jobs;
+                        }
                         rt.error(&meeting, "模型 SHA-256 不匹配或文件不可读");
-                        thread::sleep(Duration::from_secs(5));
+                        stop.wait(Duration::from_secs(5));
                         continue;
                     }
                 }
@@ -246,11 +280,17 @@ pub fn spawn(rt: Arc<Runtime>) {
                         loaded = config.model_path.clone();
                     }
                     Err(_) => {
+                        if stop.is_stopped() {
+                            break;
+                        }
                         rt.error(&meeting, "模型加载失败，请检查模型文件");
-                        thread::sleep(Duration::from_secs(5));
+                        stop.wait(Duration::from_secs(5));
                         continue;
                     }
                 }
+            }
+            if stop.is_stopped() {
+                break;
             }
             let began = std::time::Instant::now();
             let lo = start.saturating_sub(750);
@@ -264,14 +304,27 @@ pub fn spawn(rt: Arc<Runtime>) {
                     t[&partial_mid]["partial"] = json!(segment.text);
                 }
             });
+            let lexicon = match crate::knowledge::asr_context(&rt, &meeting) {
+                Ok(v) => v,
+                Err(_) => {
+                    rt.error(&meeting, "本场词库暂不可用，本轮使用原始转写");
+                    json!({"prompt":"","bindings":[],"unavailable":true})
+                }
+            };
             let result = mix(&rt, &meeting, lo, end).and_then(|pcm| {
                 decode_with_partial(
                     context.as_ref().unwrap(),
                     &pcm,
                     &config.language,
                     Some(callback),
+                    Some(stop.clone()),
+                    lexicon["prompt"].as_str().unwrap_or(""),
                 )
             });
+            // Cancellation cannot acknowledge coverage or commit partial text.
+            if stop.is_stopped() {
+                break;
+            }
             match result {
                 Ok(segments) => {
                     let result = (|| -> Result<(), String> {
@@ -293,6 +346,11 @@ pub fn spawn(rt: Arc<Runtime>) {
                             }
                             let segment = id();
                             tx.execute("INSERT INTO transcript_segments VALUES (?,?,?,?,'mixed',1,'final')",params![segment,meeting,a,b]).map_err(err)?;
+                            tx.execute(
+                                "INSERT INTO asr_lexicon_snapshots VALUES (?,?,?)",
+                                params![segment, meeting, lexicon.to_string()],
+                            )
+                            .map_err(err)?;
                             tx.execute(
                                 "INSERT INTO transcript_revisions VALUES (?,1,?,?,'asr',?)",
                                 params![segment, meeting, text, now()],
@@ -321,9 +379,69 @@ pub fn spawn(rt: Arc<Runtime>) {
                 }
                 Err(e) => {
                     rt.error(&meeting, &e);
-                    thread::sleep(Duration::from_secs(3));
+                    stop.wait(Duration::from_secs(3));
                 }
             }
         }
-    });
+        // Drop cached GPU buffers on this worker before its owner can join and
+        // permit AppKit/libc's global Metal device destructors to run.
+        drop(context);
+    })
+}
+
+#[cfg(test)]
+mod mix_regression_tests {
+    use super::*;
+    #[test]
+    fn missing_system_packets_do_not_double_microphone_gain() {
+        let root = std::env::temp_dir().join(format!("helmmeet-mix-{}", id()));
+        let rt = Runtime::open_with_vault(
+            root.clone(),
+            Arc::new(crate::models::tests::MemoryVault::default()),
+        )
+        .unwrap();
+        let m = rt.create("合成混音测试", "general").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::create_dir_all(rt.meeting_dir(&m).join("audio")).unwrap();
+        let microphone = (0..48000)
+            .map(|i| {
+                0.6 * (std::f32::consts::TAU * 440.0 * i as f32 / 16000.0
+                    + std::f32::consts::FRAC_PI_2)
+                    .sin()
+            })
+            .collect::<Vec<_>>();
+        for (name, source, from, to, pcm) in [
+            ("mic", "microphone", 0, 3000, microphone.clone()),
+            ("system-a", "system", 0, 1000, vec![0.0; 16000]),
+            ("system-b", "system", 2000, 3000, vec![0.0; 16000]),
+        ] {
+            let relative = format!("meetings/{m}/audio/{name}.wav");
+            let mut wav = audio::WavFile::create(&rt.root.join(&relative)).unwrap();
+            wav.write(&pcm).unwrap();
+            wav.sync().unwrap();
+            rt.db()
+                .unwrap()
+                .execute(
+                    "INSERT INTO audio_chunks VALUES (?,?,?,?,?,?,?,'sealed')",
+                    params![id(), m, source, relative, from, to, pcm.len()],
+                )
+                .unwrap();
+        }
+        let mixed = mix(&rt, &m, 0, 3000).unwrap();
+        assert!(
+            (mixed[16000] - microphone[16000] * 0.5).abs() < 0.0001,
+            "missing packets changed the other source's gain: {}",
+            mixed[16000]
+        );
+        assert!(
+            (mixed[16000] - mixed[15999]).abs() < 0.02,
+            "artificial click at packet availability boundary"
+        );
+        let track = mix_source(&rt, &m, 0, 3000, Some("microphone")).unwrap();
+        assert!((track[16000] - microphone[16000]).abs() < 0.0001);
+        drop(rt);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

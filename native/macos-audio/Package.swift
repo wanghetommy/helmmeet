@@ -5,5 +5,5 @@ let package = Package(
     name: "HelmMeetAudio",
     platforms: [.macOS(.v14)],
     products: [.library(name: "HelmMeetAudio", type: .static, targets: ["HelmMeetAudio"])],
-    targets: [.target(name: "HelmMeetAudio")]
+    targets: [.target(name: "HelmMeetAudio"), .testTarget(name: "HelmMeetAudioTests", dependencies: ["HelmMeetAudio"])]
 )

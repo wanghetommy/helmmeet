@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title"><title id="title">HelmMeet 浅色应用图标提案</title><rect x="1" y="1" width="254" height="254" rx="56" fill="#FFFFFF" stroke="#DDE3ED"/><g transform="translate(20 16) scale(.84)">  <g fill="#0A3281">
+    <path d="M124 28C162 67 192 112 208 160H124Z"/>
+    <path d="M108 68V160H48Z"/>
+    <path d="M36 180H220C201 207 176 220 136 220H112C78 220 53 207 36 180Z"/>
+  </g></g></svg>

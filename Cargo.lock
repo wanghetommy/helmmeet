@@ -1609,6 +1609,7 @@ dependencies = [
  "swift-rs",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tokio",
  "url",
  "uuid",

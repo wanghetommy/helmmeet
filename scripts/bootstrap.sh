@@ -10,10 +10,12 @@ if ! command -v cargo >/dev/null 2>&1 && [ ! -x .tools/cargo/bin/cargo ]; then
   CARGO_HOME="$TASK_ROOT/.tools/cargo" RUSTUP_HOME="$TASK_ROOT/.tools/rustup" .tools/rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.99.1
   sh scripts/with-toolchain.sh rustup component add rustfmt clippy
 fi
-if ! command -v cmake >/dev/null 2>&1 && [ ! -x .tools/python/bin/cmake ]; then
+if [ ! -x .tools/python/bin/python3 ]; then
   python3 -m venv .tools/python
+fi
+if ! command -v cmake >/dev/null 2>&1 && [ ! -x .tools/python/bin/cmake ]; then
   .tools/python/bin/pip install cmake==4.4.4
 fi
 npm ci
 sh scripts/with-toolchain.sh cargo fetch --locked
-printf '%s\n' '构建环境已准备。运行 npm run desktop:dev 或 npm run desktop:build。'
+printf '%s\n' '基础构建环境已准备。首次还需按 README 准备固定 APM 缓存，再运行 npm run desktop:dev 或 npm run desktop:build。'

@@ -3,7 +3,10 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::Duration,
 };
 
@@ -22,18 +25,32 @@ pub struct Runtime {
     pub config: Mutex<Config>,
     pub capture: Mutex<Option<CaptureSession>>,
     pub llm_gate: Mutex<()>,
+    pub analysis_waiting: Mutex<Vec<(String, u8)>>,
+    pub analysis_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     pub model_gate: Mutex<()>,
     pub import_gate: Mutex<()>,
     pub vault: Arc<dyn crate::models::CredentialStore>,
     pub transient: Mutex<Value>,
+    pub shutting_down: AtomicBool,
 }
 impl Runtime {
     pub fn open(root: PathBuf) -> Result<Arc<Self>, String> {
-        Self::open_with_vault(root, Arc::new(crate::models::Keychain))
+        Self::open_inner(
+            root.clone(),
+            Arc::new(crate::credentials::FileStore::new(root)),
+            true,
+        )
     }
     pub fn open_with_vault(
         root: PathBuf,
         vault: Arc<dyn crate::models::CredentialStore>,
+    ) -> Result<Arc<Self>, String> {
+        Self::open_inner(root, vault, false)
+    }
+    fn open_inner(
+        root: PathBuf,
+        vault: Arc<dyn crate::models::CredentialStore>,
+        migrate: bool,
     ) -> Result<Arc<Self>, String> {
         std::fs::create_dir_all(root.join("meetings")).map_err(err)?;
         let conn = Connection::open(root.join("app.sqlite")).map_err(err)?;
@@ -45,10 +62,10 @@ impl Runtime {
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(err)?;
-        if version > 6 {
+        if version > 10 {
             return Err("数据库版本较新，请使用匹配的应用版本".into());
         }
-        if version > 0 && version < 6 {
+        if version > 0 && version < 10 {
             let mut backup = Connection::open(root.join("before-migration.sqlite")).map_err(err)?;
             rusqlite::backup::Backup::new(&conn, &mut backup)
                 .map_err(err)?
@@ -87,6 +104,28 @@ impl Runtime {
             ))
             .map_err(err)?;
         }
+        if version < 7 {
+            conn.execute_batch(include_str!("../../../../migrations/0007_workspace.sql"))
+                .map_err(err)?;
+        }
+        if version < 8 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0008_audio_enhancement.sql"
+            ))
+            .map_err(err)?;
+        }
+        if version < 9 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0009_echo_cancellation.sql"
+            ))
+            .map_err(err)?;
+        }
+        if version < 10 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0010_product_workspace.sql"
+            ))
+            .map_err(err)?;
+        }
         for template in [
             include_str!("../../../../templates/general.json"),
             include_str!("../../../../templates/project.json"),
@@ -102,6 +141,10 @@ impl Runtime {
             )
             .map_err(err)?;
         }
+        crate::workspace::seed_templates(&conn)?;
+        conn.execute("INSERT OR IGNORE INTO template_versions SELECT id,version,name,instructions FROM assistant_templates", []).map_err(err)?;
+        conn.execute("UPDATE summary_schedules SET tail_done=1", [])
+            .map_err(err)?;
         conn.execute("UPDATE meetings SET state='interrupted',last_error='应用退出导致采集中断，请恢复或结束会议' WHERE state IN ('recording','paused')", []).map_err(err)?;
         conn.execute("UPDATE recording_sources SET state='failed',reason='应用退出导致采集中断' WHERE state='active'",[]).map_err(err)?;
         conn.execute("UPDATE analysis_jobs SET state='failed',error_code='INTERRUPTED' WHERE state IN ('pending','running')", []).map_err(err)?;
@@ -112,11 +155,19 @@ impl Runtime {
             config: Mutex::new(config),
             capture: Mutex::new(None),
             llm_gate: Mutex::new(()),
+            analysis_waiting: Mutex::new(vec![]),
+            analysis_threads: Mutex::new(vec![]),
             model_gate: Mutex::new(()),
             import_gate: Mutex::new(()),
             vault,
             transient: Mutex::new(json!({})),
+            shutting_down: AtomicBool::new(false),
         });
+        if migrate {
+            if let Err(e) = crate::credentials::migrate(&runtime, false) {
+                runtime.transient.lock().map_err(|_| "状态锁异常")?["startup_warning"] = json!(e);
+            }
+        }
         if let Err(e) = crate::models::bootstrap(&runtime) {
             runtime.transient.lock().map_err(|_| "状态锁异常")?["startup_warning"] = json!(
                 format!("旧模型配置迁移未完成：{e}。录音转写仍可使用，可在设置中重试。")
@@ -126,6 +177,12 @@ impl Runtime {
     }
     pub fn db(&self) -> Result<MutexGuard<'_, Connection>, String> {
         self.conn.lock().map_err(|_| "数据库锁异常".into())
+    }
+    pub fn ensure_running(&self) -> Result<(), String> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("应用正在退出，已停止接收新任务".into());
+        }
+        Ok(())
     }
     pub fn check_id(&self, meeting: &str) -> Result<(), String> {
         uuid::Uuid::parse_str(meeting).map_err(|_| "会议 ID 无效")?;
@@ -145,8 +202,8 @@ impl Runtime {
     }
     pub fn list(&self) -> Result<Value, String> {
         let db = self.db()?;
-        let mut s=db.prepare("SELECT id,title,state,recording_duration_ms,created_at,last_error FROM meetings WHERE state!='deleting' ORDER BY created_at DESC").map_err(err)?;
-        let rows=s.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"duration_ms":r.get::<_,u64>(3)?,"created_at":r.get::<_,String>(4)?,"last_error":r.get::<_,Option<String>>(5)?}))).map_err(err)?;
+        let mut s=db.prepare("SELECT m.id,m.title,m.state,m.recording_duration_ms,m.created_at,m.last_error,m.assistant_id,v.name,m.parent_meeting_id FROM meetings m LEFT JOIN template_versions v ON v.template_id=m.assistant_id AND v.version=m.template_version WHERE m.state!='deleting' ORDER BY m.created_at DESC").map_err(err)?;
+        let rows=s.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"duration_ms":r.get::<_,u64>(3)?,"created_at":r.get::<_,String>(4)?,"last_error":r.get::<_,Option<String>>(5)?,"assistant_id":r.get::<_,String>(6)?,"type_name":r.get::<_,Option<String>>(7)?,"parent_meeting_id":r.get::<_,Option<String>>(8)?}))).map_err(err)?;
         Ok(Value::Array(
             rows.collect::<Result<Vec<_>, _>>().map_err(err)?,
         ))
@@ -171,13 +228,22 @@ impl Runtime {
         let tx = db.transaction().map_err(err)?;
         tx.execute("INSERT INTO meetings(id,title,timezone,created_at,assistant_id) VALUES (?,?,'Asia/Shanghai',?,?)",params![meeting,title.trim(),now(),assistant]).map_err(err)?;
         tx.execute("INSERT INTO meeting_model_bindings SELECT ?,p.id,p.current_version FROM model_profiles p JOIN app_preferences a ON a.key='default_profile' AND a.value=p.id WHERE p.archived=0", [&meeting]).map_err(err)?;
+        tx.execute("UPDATE meetings SET template_source='selected',template_version=(SELECT version FROM assistant_templates WHERE id=assistant_id),auto_summary_minutes=0 WHERE id=?", [&meeting]).map_err(err)?;
+        tx.execute(
+            "INSERT INTO summary_schedules(meeting_id) VALUES (?)",
+            [&meeting],
+        )
+        .map_err(err)?;
+        tx.execute("INSERT INTO audio_enhancement(meeting_id,mode) SELECT ?,value FROM app_preferences WHERE key='audio_enhancement_default'", [&meeting]).map_err(err)?;
         tx.commit().map_err(err)?;
+        drop(db);
+        crate::product::initialize_analysis(self, &meeting)?;
         Ok(json!({"id":meeting}))
     }
     pub fn detail(&self, meeting: &str) -> Result<Value, String> {
         self.check_id(meeting)?;
         let db = self.db()?;
-        let mut data=db.query_row("SELECT id,title,state,recording_duration_ms,analysis_mode,assistant_id,auto_summary_minutes,last_error,generation,version,source_mask,context_json FROM meetings WHERE id=?",[meeting],|r|Ok(json!({"id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"duration_ms":r.get::<_,u64>(3)?,"analysis_mode":r.get::<_,String>(4)?,"assistant_id":r.get::<_,String>(5)?,"auto_summary_minutes":r.get::<_,u32>(6)?,"last_error":r.get::<_,Option<String>>(7)?,"generation":r.get::<_,u64>(8)?,"version":r.get::<_,u64>(9)?,"source_mask":r.get::<_,i32>(10)?,"context":serde_json::from_str::<Value>(&r.get::<_,String>(11)?).unwrap_or(json!({}))}))).map_err(err)?;
+        let mut data=db.query_row("SELECT id,title,state,recording_duration_ms,analysis_mode,assistant_id,auto_summary_minutes,last_error,generation,version,source_mask,context_json,created_at FROM meetings WHERE id=?",[meeting],|r|Ok(json!({"id":r.get::<_,String>(0)?,"title":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"duration_ms":r.get::<_,u64>(3)?,"analysis_mode":r.get::<_,String>(4)?,"assistant_id":r.get::<_,String>(5)?,"auto_summary_minutes":r.get::<_,u32>(6)?,"last_error":r.get::<_,Option<String>>(7)?,"generation":r.get::<_,u64>(8)?,"version":r.get::<_,u64>(9)?,"source_mask":r.get::<_,i32>(10)?,"context":serde_json::from_str::<Value>(&r.get::<_,String>(11)?).unwrap_or(json!({})),"created_at":r.get::<_,String>(12)?}))).map_err(err)?;
         macro_rules! query {
             ($sql:expr,$mapper:expr) => {{
                 let mut s = db.prepare($sql).map_err(err)?;
@@ -185,7 +251,7 @@ impl Runtime {
                 Value::Array(rows.collect::<Result<Vec<Value>, _>>().map_err(err)?)
             }};
         }
-        data["segments"]=query!("SELECT s.id,s.start_ms,s.end_ms,s.current_revision,r.text,s.state FROM transcript_segments s JOIN transcript_revisions r ON r.segment_id=s.id AND r.revision=s.current_revision WHERE s.meeting_id=? ORDER BY s.start_ms",|r|Ok(json!({"id":r.get::<_,String>(0)?,"start_ms":r.get::<_,u64>(1)?,"end_ms":r.get::<_,u64>(2)?,"revision":r.get::<_,u32>(3)?,"text":r.get::<_,String>(4)?,"state":r.get::<_,String>(5)?})));
+        data["segments"]=query!("SELECT s.id,s.start_ms,s.end_ms,s.current_revision,r.text,s.state FROM transcript_segments s JOIN transcript_revisions r ON r.segment_id=s.id AND r.revision=s.current_revision WHERE s.meeting_id=? ORDER BY s.start_ms,s.id",|r|Ok(json!({"id":r.get::<_,String>(0)?,"start_ms":r.get::<_,u64>(1)?,"end_ms":r.get::<_,u64>(2)?,"revision":r.get::<_,u32>(3)?,"text":r.get::<_,String>(4)?,"state":r.get::<_,String>(5)?})));
         data["artifacts"]=query!("SELECT id,type,version,content_json,status,coverage_json FROM artifacts WHERE meeting_id=? ORDER BY rowid DESC",|r|Ok(json!({"id":r.get::<_,String>(0)?,"type":r.get::<_,String>(1)?,"version":r.get::<_,u32>(2)?,"content":serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(Value::Null),"status":r.get::<_,String>(4)?,"coverage":serde_json::from_str::<Value>(&r.get::<_,String>(5)?).unwrap_or(Value::Null)})));
         data["actions"]=query!("SELECT id,version,task,owner_text,due_text,confirmation_state,execution_state FROM action_items WHERE meeting_id=? ORDER BY rowid",|r|Ok(json!({"id":r.get::<_,String>(0)?,"version":r.get::<_,u32>(1)?,"task":r.get::<_,String>(2)?,"owner_text":r.get::<_,Option<String>>(3)?,"due_text":r.get::<_,Option<String>>(4)?,"confirmation_state":r.get::<_,String>(5)?,"execution_state":r.get::<_,String>(6)?})));
         data["notes"]=query!("SELECT id,recording_time_ms,text FROM user_notes WHERE meeting_id=? ORDER BY recording_time_ms",|r|Ok(json!({"id":r.get::<_,String>(0)?,"time_ms":r.get::<_,u64>(1)?,"text":r.get::<_,String>(2)?})));
@@ -199,8 +265,35 @@ impl Runtime {
                 |r| r.get::<_, u64>(0)
             )
             .map_err(err)?);
+        data["asr_processed_ms"] = json!(db
+            .query_row(
+                "SELECT coalesce(sum(end_ms-start_ms),0) FROM asr_chunks WHERE meeting_id=?",
+                [meeting],
+                |r| r.get::<_, u64>(0)
+            )
+            .map_err(err)?);
         data["sources"]=query!("SELECT source,state,device,gap_start_ms,reason FROM recording_sources WHERE meeting_id=? ORDER BY source",|r|Ok(json!({"source":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"device":r.get::<_,u32>(2)?,"gap_start_ms":r.get::<_,Option<u64>>(3)?,"reason":r.get::<_,Option<String>>(4)?})));
+        data["legacy_answer_ids"]=query!("SELECT a.id FROM artifacts a WHERE a.meeting_id=? AND a.type='answer' AND NOT EXISTS(SELECT 1 FROM conversation_turns t WHERE t.artifact_id=a.id)",|r|Ok(json!(r.get::<_,String>(0)?)));
+        data["conversation"]=query!("SELECT t.job_id,t.question,t.scope,t.artifact_id,j.state,j.error_code FROM conversation_turns t JOIN meetings m ON m.id=t.meeting_id JOIN analysis_jobs j ON j.id=t.job_id WHERE t.meeting_id=? AND t.epoch=m.chat_epoch ORDER BY t.rowid",|r|Ok(json!({"job_id":r.get::<_,String>(0)?,"question":r.get::<_,String>(1)?,"scope":r.get::<_,String>(2)?,"artifact_id":r.get::<_,Option<String>>(3)?,"state":r.get::<_,String>(4)?,"error":r.get::<_,Option<String>>(5)?})));
+        data["summary_pending_segments"]=json!(db.query_row("SELECT count(*) FROM transcript_segments s LEFT JOIN summary_coverage c ON c.meeting_id=s.meeting_id AND c.segment_id=s.id WHERE s.meeting_id=? AND (c.revision IS NULL OR c.revision!=s.current_revision)",[meeting],|r|r.get::<_,u64>(0)).map_err(err)?);
+        data["schedule"] = db.query_row("SELECT enabled,mode,version,failures,paused_reason FROM summary_schedules WHERE meeting_id=?", [meeting], |r| Ok(json!({"enabled":r.get::<_,bool>(0)?,"mode":r.get::<_,String>(1)?,"version":r.get::<_,u64>(2)?,"failures":r.get::<_,u32>(3)?,"paused_reason":r.get::<_,Option<String>>(4)?}))).map_err(err)?;
+        data["context_consent"] = json!(db
+            .query_row(
+                "SELECT context_consent FROM meetings WHERE id=?",
+                [meeting],
+                |r| r.get::<_, bool>(0)
+            )
+            .map_err(err)?);
+        data["template_source"] = json!(db
+            .query_row(
+                "SELECT template_source FROM meetings WHERE id=?",
+                [meeting],
+                |r| r.get::<_, String>(0)
+            )
+            .map_err(err)?);
+        data["template"] = db.query_row("SELECT v.template_id,v.version,v.name,v.instructions FROM template_versions v JOIN meetings m ON m.assistant_id=v.template_id AND m.template_version=v.version WHERE m.id=?",[meeting],|r|Ok(json!({"id":r.get::<_,String>(0)?,"version":r.get::<_,u32>(1)?,"name":r.get::<_,String>(2)?,"instructions":r.get::<_,String>(3)?}))).unwrap_or(json!(null));
         drop(db);
+        data["enhancement"] = crate::enhancement::detail(self, meeting)?;
         data["model_profile"] = crate::models::meeting_dto(self, meeting)?;
         data["transient"] = self
             .transient
@@ -209,6 +302,27 @@ impl Runtime {
             .get(meeting)
             .cloned()
             .unwrap_or(json!({}));
+        data["knowledge"] = crate::knowledge::bound(self, meeting)?;
+        data["capabilities"] = crate::product::capabilities(self, &data)?;
+        data["capture_epoch"] = self
+            .db()?
+            .query_row(
+                "SELECT id FROM recording_epochs WHERE meeting_id=? ORDER BY rowid DESC LIMIT 1",
+                [meeting],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        data["parent_meeting_id"] = self
+            .db()?
+            .query_row(
+                "SELECT parent_meeting_id FROM meetings WHERE id=?",
+                [meeting],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .map_err(err)?
+            .map(Value::String)
+            .unwrap_or(Value::Null);
         Ok(data)
     }
     pub fn error(&self, meeting: &str, message: &str) {
@@ -338,7 +452,7 @@ mod recovery_tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                 .unwrap(),
-            6
+            10
         );
         assert!(root.join("before-migration.sqlite").is_file());
         drop(rt);

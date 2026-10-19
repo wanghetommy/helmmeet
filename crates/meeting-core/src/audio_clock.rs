@@ -64,6 +64,10 @@ pub fn resample_frame(input: &[f32], length: usize) -> Vec<f32> {
         })
         .collect()
 }
+/// Fixed source gain, independent of packet availability. Individual track exports use one source.
+pub fn mix_gain(source_count: usize) -> f32 {
+    1.0 / source_count.max(1) as f32
+}
 #[cfg(test)]
 mod tests {
     use super::*;

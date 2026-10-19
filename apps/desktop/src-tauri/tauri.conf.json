@@ -27,6 +27,9 @@
   },
   "bundle": {
     "active": true,
+    "resources": {
+      "../../../native/audio-processing/licenses/": "licenses/audio-processing/"
+    },
     "macOS": {
       "minimumSystemVersion": "14.0",
       "infoPlist": "Info.plist"
@@ -35,7 +38,8 @@
       "app"
     ],
     "icon": [
-      "icons/icon.png"
+      "icons/icon.png",
+      "icons/icon.icns"
     ]
   }
 }

@@ -6,4 +6,4 @@ if [ ! -x "$APP" ]; then
   echo '请先运行 npm run desktop:build。'
   exit 1
 fi
-exec sh "$TASK_ROOT/scripts/with-toolchain.sh" "$APP"
+exec sh "$TASK_ROOT/scripts/with-toolchain.sh" "$APP" "$@"

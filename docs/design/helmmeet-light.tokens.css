@@ -1,0 +1,27 @@
+/* HelmMeet light theme V1.1. Shared by product UI and design documentation. */
+:root {
+  color-scheme: light;
+  --hm-color-canvas: #F5F7FB;
+  --hm-color-surface: #FFFFFF;
+  --hm-color-sidebar: #F8FAFC;
+  --hm-color-surface-subtle: #F1F5F9;
+  --hm-color-border: #DDE3ED;
+  --hm-color-control-border: #7C8A9E;
+  --hm-color-text: #172033;
+  --hm-color-text-secondary: #526078;
+  --hm-color-text-muted: #5B6B82;
+  --hm-color-brand: #0A3281;
+  --hm-color-brand-hover: #082A6D;
+  --hm-color-brand-pressed: #062257;
+  --hm-color-brand-tint: #EAF0FB;
+  --hm-color-brand-border: #CAD8F4;
+  --hm-color-focus: #3B6BC4;
+  --hm-color-success: #157347;
+  --hm-color-success-bg: #EBF7F0;
+  --hm-color-warning: #8A5400;
+  --hm-color-warning-bg: #FFF6E5;
+  --hm-color-danger: #B42318;
+  --hm-color-danger-bg: #FFF0EE;
+  --hm-color-disabled-bg: #EEF1F6;
+  --hm-color-disabled-text: #5B6B82;
+}

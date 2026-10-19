@@ -1,0 +1,139 @@
+{
+  "date": "2026-10-19",
+  "method": "WCAG sRGB relative luminance, opaque colors; thresholds checked before rounding",
+  "scope": "Design token pairs only; does not certify full product accessibility",
+  "sources": [
+    "https://www.w3.org/WAI/WCAG22/Understanding/contrast-minimum.html",
+    "https://www.w3.org/WAI/WCAG22/Understanding/non-text-contrast.html"
+  ],
+  "pairs": [
+    {
+      "role": "主按钮白字",
+      "foreground": "#FFFFFF",
+      "background": "#0A3281",
+      "ratio": 11.7572,
+      "threshold": 4.5,
+      "pass": true
+    },
+    {
+      "role": "主要正文",
+      "foreground": "#172033",
+      "background": "#FFFFFF",
+      "ratio": 16.2685,
+      "threshold": 4.5,
+      "pass": true
+    },
+    {
+      "role": "次要文字",
+      "foreground": "#526078",
+      "background": "#FFFFFF",
+      "ratio": 6.3576,
+      "threshold": 4.5,
+      "pass": true
+    },
+    {
+      "role": "辅助文字/白底",
+      "foreground": "#5B6B82",
+      "background": "#FFFFFF",
+      "ratio": 5.426,
+      "threshold": 4.5,
+      "pass": true
+    },
+    {
+      "role": "辅助文字/页面",
+      "foreground": "#5B6B82",
+      "background": "#F5F7FB",
+      "ratio": 5.0591,
+      "threshold": 4.5,
+      "pass": true
+    },
+    {
+      "role": "选中导航",
+      "foreground": "#0A3281",
+      "background": "#EAF0FB",
+      "ratio": 10.2766,
+      "threshold": 4.5,
+      "pass": true
+    },
+    {
+      "role": "辅助文字/浅蓝",
+      "foreground": "#5B6B82",
+      "background": "#EAF0FB",
+      "ratio": 4.7427,
+      "threshold": 4.5,
+      "pass": true
+    },
+    {
+      "role": "禁用文字",
+      "foreground": "#5B6B82",
+      "background": "#EEF1F6",
+      "ratio": 4.7925,
+      "threshold": 4.5,
+      "pass": true
+    },
+    {
+      "role": "成功标签",
+      "foreground": "#157347",
+      "background": "#EBF7F0",
+      "ratio": 5.341,
+      "threshold": 4.5,
+      "pass": true
+    },
+    {
+      "role": "待确认标签",
+      "foreground": "#8A5400",
+      "background": "#FFF6E5",
+      "ratio": 5.8426,
+      "threshold": 4.5,
+      "pass": true
+    },
+    {
+      "role": "错误及录制标签",
+      "foreground": "#B42318",
+      "background": "#FFF0EE",
+      "ratio": 5.9327,
+      "threshold": 4.5,
+      "pass": true
+    },
+    {
+      "role": "危险确认白字",
+      "foreground": "#FFFFFF",
+      "background": "#B42318",
+      "ratio": 6.5743,
+      "threshold": 4.5,
+      "pass": true
+    },
+    {
+      "role": "输入边界",
+      "foreground": "#7C8A9E",
+      "background": "#FFFFFF",
+      "ratio": 3.5081,
+      "threshold": 3,
+      "pass": true
+    },
+    {
+      "role": "输入边界/浅灰",
+      "foreground": "#7C8A9E",
+      "background": "#F5F7FB",
+      "ratio": 3.2709,
+      "threshold": 3,
+      "pass": true
+    },
+    {
+      "role": "焦点/白底",
+      "foreground": "#3B6BC4",
+      "background": "#FFFFFF",
+      "ratio": 5.1393,
+      "threshold": 3,
+      "pass": true
+    },
+    {
+      "role": "焦点/浅灰",
+      "foreground": "#3B6BC4",
+      "background": "#F5F7FB",
+      "ratio": 4.7918,
+      "threshold": 3,
+      "pass": true
+    }
+  ]
+}

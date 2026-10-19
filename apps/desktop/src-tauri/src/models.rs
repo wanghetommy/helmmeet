@@ -13,34 +13,6 @@ pub trait CredentialStore: Send + Sync {
     fn put(&self, account: &str, secret: &str) -> Result<(), String>;
     fn remove(&self, account: &str) -> Result<(), String>;
 }
-pub struct Keychain;
-impl CredentialStore for Keychain {
-    fn get(&self, account: &str) -> Result<Option<String>, String> {
-        match security_framework::passwords::get_generic_password("com.helmmeet.models", account) {
-            Ok(bytes) => String::from_utf8(bytes)
-                .map(Some)
-                .map_err(|_| "凭据编码无效".into()),
-            Err(e) if e.code() == -25300 => Ok(None),
-            Err(_) => Err("无法读取 macOS Keychain，请检查访问权限".into()),
-        }
-    }
-    fn put(&self, account: &str, secret: &str) -> Result<(), String> {
-        security_framework::passwords::set_generic_password(
-            "com.helmmeet.models",
-            account,
-            secret.as_bytes(),
-        )
-        .map_err(|_| "无法保存到 macOS Keychain".into())
-    }
-    fn remove(&self, account: &str) -> Result<(), String> {
-        match security_framework::passwords::delete_generic_password("com.helmmeet.models", account)
-        {
-            Ok(()) => Ok(()),
-            Err(e) if e.code() == -25300 => Ok(()),
-            Err(_) => Err("无法清理 macOS Keychain 凭据".into()),
-        }
-    }
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileInput {
@@ -139,8 +111,12 @@ fn dto(rt: &Runtime, c: &ModelConfig, current: u32, archived: bool) -> Result<Va
     };
     let mut value = serde_json::to_value(c).map_err(err)?;
     value.as_object_mut().unwrap().remove("credential_ref");
-    value["has_api_key"] = json!(c.credential_ref.is_some() && !revoked);
-    value["credential_valid"] = json!(!revoked);
+    let present = c
+        .credential_ref
+        .as_ref()
+        .is_none_or(|k| rt.vault.get(k).ok().flatten().is_some());
+    value["has_api_key"] = json!(c.credential_ref.is_some() && !revoked && present);
+    value["credential_valid"] = json!(!revoked && present);
     value["is_local"] = json!(c.endpoint().map(|(_, local)| local).unwrap_or(false));
     value["bound_meetings"] = json!(rt
         .db()?
@@ -300,7 +276,7 @@ fn save_internal(rt: &Runtime, input: ProfileInput, importing: bool) -> Result<V
             .map_err(err)?;
         rt.vault.put(k, &input.api_key)?;
         if rt.vault.get(k)?.as_deref() != Some(input.api_key.as_str()) {
-            return Err("Keychain 写入校验失败，配置未提交".into());
+            return Err("本地凭据写入校验失败，配置未提交".into());
         }
     }
     let result = (|| -> Result<(), String> {
@@ -434,7 +410,7 @@ pub fn authorize(
     } else {
         ("transcript_only", None)
     };
-    if tx.execute("UPDATE meetings SET analysis_mode=?,consent_target=?,auto_summary_minutes=?,generation=generation+1,version=version+1,consent_version=consent_version+1 WHERE id=? AND version=? AND state!='deleting'",params![mode,target,interval,meeting,expected]).map_err(err)?!=1{return Err("会议版本冲突，请刷新重试".into());}
+    if tx.execute("UPDATE meetings SET analysis_mode=?,consent_target=?,auto_summary_minutes=?,context_consent=?,analysis_choice=?,generation=generation+1,version=version+1,consent_version=consent_version+1 WHERE id=? AND version=? AND state!='deleting'",params![mode,target,interval,enabled,if enabled {"enabled"}else{"disabled"},meeting,expected]).map_err(err)?!=1{return Err("会议版本冲突，请刷新重试".into());}
     if let Some(c) = &c {
         if selection.is_some() {
             tx.execute("INSERT INTO meeting_model_bindings VALUES (?,?,?) ON CONFLICT(meeting_id) DO UPDATE SET profile_id=excluded.profile_id,config_version=excluded.config_version",params![meeting,c.profile_id,c.config_version]).map_err(err)?;
@@ -566,17 +542,19 @@ pub fn bootstrap(rt: &Runtime) -> Result<(), String> {
 
 pub fn test(rt: &Runtime, profile: &str, version: u32) -> Result<Value, String> {
     let config = load(rt, profile, version)?;
-    let check = || load(rt, profile, version).map(|_| ());
-    let output = analysis::request(
-        rt,
-        &config,
-        json!([{"role":"user","content":"This is a connection test with no meeting content. Reply with OK."}]),
-        &check,
-    )?;
-    if output.trim().is_empty() {
-        return Err("服务未返回有效测试文本".into());
-    }
-    let result = json!({"ok":!output.is_empty(),"streaming":false,"structured_output":"validated_per_analysis","tested_at":now(),"message":"普通文本连接成功；结构化输出在分析任务中本地校验"});
+    let _permit = loop {
+        rt.ensure_running()?;
+        if let Ok(permit) = rt.llm_gate.try_lock() {
+            break permit;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let check = || {
+        rt.ensure_running()?;
+        load(rt, profile, version).map(|_| ())
+    };
+    analysis::test_structure(rt, &config, &check)?;
+    let result = json!({"ok":true,"streaming":false,"structured_output":"validated","tested_at":now(),"message":"连接、JSON结构及合成原文引用校验通过"});
     rt.db()?.execute("INSERT INTO app_preferences VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![format!("test:{profile}:{version}"),result.to_string()]).map_err(err)?;
     Ok(result)
 }
@@ -648,6 +626,10 @@ pub mod tests {
         authorize(rt, m, version(rt, m), enabled, 0, Some((p, v))).unwrap();
     }
     fn seed(rt: &Runtime, m: &str) {
+        rt.db()
+            .unwrap()
+            .execute("UPDATE meetings SET state='completed' WHERE id=?", [m])
+            .unwrap();
         let s = id();
         let db = rt.db().unwrap();
         db.execute(
@@ -700,7 +682,11 @@ pub mod tests {
             for _ in 0..2 {
                 let (mut s, _) = listener.accept().unwrap();
                 seen.push(receive(&mut s));
-                respond(&mut s, 200, "OK");
+                respond(
+                    &mut s,
+                    200,
+                    r#"{"summary":[{"text":"连接测试","kind":"discussion","section":"topic","evidence":[{"segment_id":"connection-test","revision":1}]}],"actions":[]}"#,
+                );
             }
             seen
         });
@@ -754,10 +740,7 @@ pub mod tests {
         let b = save(&rt, input("B", "http://127.0.0.1:11434/v1", "")).unwrap();
         set_default(&rt, b["profile_id"].as_str().unwrap()).unwrap();
         assert_eq!(selected(&rt, &m).unwrap().profile_id, p);
-        assert_eq!(
-            rt.detail(&mid(&rt)).unwrap()["analysis_mode"],
-            "transcript_only"
-        );
+        assert_eq!(rt.detail(&mid(&rt)).unwrap()["analysis_mode"], "local");
         let old = version(&rt, &m);
         select(&rt, &m, p, 2, false);
         assert!(authorize(&rt, &m, old, true, 0, Some((p, 1))).is_err());

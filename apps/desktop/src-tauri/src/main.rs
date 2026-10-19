@@ -1,19 +1,43 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod acoustic_probe;
 mod analysis;
 mod asr;
 mod audio;
 mod commands;
 mod config;
+mod credentials;
 mod db;
+#[cfg(feature = "audio-processing")]
+mod echo;
+mod enhancement;
+mod exit_probe;
+mod knowledge;
+mod lifecycle;
+#[path = "../../../../agent/prompts.rs"]
+mod meeting_prompts;
 mod models;
+#[cfg(feature = "audio-processing")]
+mod processing;
+mod product;
+mod routes;
+mod workspace;
 
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
+static QUIT_APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+extern "C" {
+    fn hm_application_install_quit_gate(callback: extern "C" fn()) -> i32;
+}
+extern "C" fn native_quit() {
+    if let Some(app) = QUIT_APP.get() {
+        app.exit(0);
+    }
+}
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Manager,
+    Emitter, Manager,
 };
 
 #[derive(Serialize)]
@@ -44,68 +68,86 @@ async fn dispatch(
         .await
         .map_err(|_| "后台任务中断".to_string())?
 }
-fn background(rt: Arc<db::Runtime>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(10));
-        let _ = commands::cleanup(&rt);
-        let meetings = match rt.list() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        for meeting in meetings.as_array().into_iter().flatten() {
-            let Some(mid) = meeting["id"].as_str() else {
-                continue;
-            };
-            let detail = match rt.detail(mid) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            if detail["analysis_mode"] == "transcript_only" {
-                continue;
-            }
-            let running = detail["jobs"].as_array().is_some_and(|j| {
-                j.iter()
-                    .any(|v| v["state"] == "running" || v["state"] == "pending")
-            });
-            if running {
-                continue;
-            }
-            let duration = detail["duration_ms"].as_u64().unwrap_or(0);
-            let interval = detail["auto_summary_minutes"].as_u64().unwrap_or(5) * 60000;
-            let completed = detail["state"] == "completed";
-            if completed {
-                let attempted = detail["jobs"]
-                    .as_array()
-                    .is_some_and(|j| j.iter().any(|v| v["type"] == "final_map"));
-                if !attempted {
-                    let _ = analysis::submit(rt.clone(), mid, "minutes", "", "all");
-                }
-            } else if interval > 0 && duration >= interval {
-                let last = rt
-                    .transient
-                    .lock()
-                    .ok()
-                    .and_then(|t| t[mid]["auto_at"].as_u64())
-                    .unwrap_or(0);
-                let chars: usize = detail["segments"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|s| s["text"].as_str().unwrap_or("").chars().count())
-                    .sum();
-                if duration >= last + interval && chars >= 200 {
-                    if let Ok(mut t) = rt.transient.lock() {
-                        t[mid]["auto_at"] = serde_json::json!(duration);
-                    }
-                    let _ = analysis::submit(rt.clone(), mid, "stage", "", "all");
-                }
+fn main() {
+    if std::env::args().any(|s| s == "--check-model-json") {
+        let root = std::env::var_os("HELMMEET_SMOKE_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("check-model-json requires an isolated HELMMEET_SMOKE_ROOT");
+        assert!(
+            !root.join("app.sqlite").exists(),
+            "model check requires a fresh isolated directory"
+        );
+        let result = (|| -> Result<Value, String> {
+            let rt = db::Runtime::open_with_vault(
+                root.clone(),
+                Arc::new(credentials::FileStore::new(root)),
+            )?;
+            let dir = models::list(&rt)?;
+            let pid = dir["default_profile_id"]
+                .as_str()
+                .ok_or("没有测试模型配置")?;
+            let profile = dir["profiles"]
+                .as_array()
+                .and_then(|v| v.iter().find(|p| p["profile_id"] == pid))
+                .ok_or("测试模型配置缺失")?;
+            models::test(
+                &rt,
+                pid,
+                profile["config_version"].as_u64().ok_or("配置版本缺失")? as u32,
+            )
+        })();
+        match result {
+            Ok(v) => println!("{v}"),
+            Err(e) => {
+                eprintln!("Structured model check failed: {e}");
+                std::process::exit(1);
             }
         }
-    });
-}
-fn main() {
+        return;
+    }
+    if std::env::args().any(|s| s == "--check-acoustic-aec") {
+        match acoustic_probe::run() {
+            Ok(result) => println!("{result}"),
+            Err(error) => {
+                eprintln!("Acoustic check failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if std::env::args().any(|s| s == "--check-output-route") {
+        println!("{}", audio::output_route_status());
+        return;
+    }
+    if std::env::args().any(|s| s == "--check-audio-processing") {
+        #[cfg(feature = "audio-processing")]
+        match processing::synthetic_probe() {
+            Ok(result) => println!("{result}"),
+            Err(error) => {
+                eprintln!("Audio processing probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(not(feature = "audio-processing"))]
+        {
+            eprintln!("Build with --features audio-processing to enable the synthetic probe");
+            std::process::exit(2);
+        }
+        #[cfg(feature = "audio-processing")]
+        return;
+    }
     // No log backend enabled: suppress upstream logs which may contain token text.
     whisper_rs::install_logging_hooks();
+    if std::env::args().any(|s| s == "--check-microphone") {
+        match audio::check_microphone() {
+            Ok(result) => println!("麦克风 3 秒电平检查通过（未保存、未转写、未联网）：{result}"),
+            Err(error) => {
+                eprintln!("麦克风检查失败：{error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if std::env::args().any(|s| s == "--smoke-test") {
         let root = std::env::var_os("HELMMEET_SMOKE_ROOT")
             .map(std::path::PathBuf::from)
@@ -227,6 +269,8 @@ fn main() {
                     commands::Request::Playback {
                         meeting_id: mid.into(),
                         start_ms: 0,
+                        audio_variant: "raw".into(),
+                        end_ms: None,
                     },
                 )
                 .unwrap();
@@ -237,24 +281,56 @@ fn main() {
         println!("Runtime smoke passed");
         return;
     }
+    let exit_probe = std::env::args().any(|s| s == "--check-asr-exit");
     let app = tauri::Builder::default()
-        .setup(|app| {
+        .setup(move |app| {
             let root = std::env::var_os("HELMMEET_DATA_ROOT")
                 .map(std::path::PathBuf::from)
                 .unwrap_or(app.path().app_data_dir()?);
+            if exit_probe
+                && (std::env::var_os("HELMMEET_DATA_ROOT").is_none()
+                    || root.join("app.sqlite").exists())
+            {
+                return Err("退出检查必须使用显式指定且不含数据库的独立目录".into());
+            }
             let rt = db::Runtime::open(root).map_err(std::io::Error::other)?;
+            let probe = if exit_probe {
+                let model = std::env::var_os("HELMMEET_TEST_MODEL")
+                    .ok_or("退出检查需要 HELMMEET_TEST_MODEL")?;
+                Some(
+                    exit_probe::prepare(&rt, &std::path::PathBuf::from(model))
+                        .map_err(std::io::Error::other)?,
+                )
+            } else {
+                None
+            };
             asr::recover(&rt).map_err(std::io::Error::other)?;
             commands::cleanup(&rt).map_err(std::io::Error::other)?;
-            asr::spawn(rt.clone());
-            background(rt.clone());
-            app.manage(rt);
+            enhancement::recover(&rt).map_err(std::io::Error::other)?;
+            app.manage(lifecycle::Shutdown::new(vec![
+                asr::spawn(rt.clone()),
+                workspace::background(rt.clone()),
+                enhancement::background(rt.clone()),
+            ]));
+            app.manage(rt.clone());
+            let _ = QUIT_APP.set(app.handle().clone());
+            if unsafe { hm_application_install_quit_gate(native_quit) } != 0 {
+                return Err("无法安装原生退出保护，请保留日志排查".into());
+            }
+            if let Some(mid) = probe {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+                let phase = std::env::var("HELMMEET_EXIT_PHASE").unwrap_or_else(|_| "idle".into());
+                exit_probe::request_native_quit(app.handle().clone(), rt, mid, phase);
+            }
             let open = MenuItem::with_id(app, "open", "打开 HelmMeet", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let end = MenuItem::with_id(app, "end-meeting", "结束当前会议…", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &end, &quit])?;
             TrayIconBuilder::new()
-                .icon(app.default_window_icon().cloned().unwrap_or_else(|| {
-                    tauri::image::Image::new_owned(vec![50; 16 * 16 * 4], 16, 16)
-                }))
+                .icon(tauri::include_image!("icons/tray-template.png"))
+                .icon_as_template(true)
                 .tooltip("HelmMeet · 会议助手")
                 .menu(&menu)
                 .on_menu_event(|app, event| {
@@ -262,6 +338,13 @@ fn main() {
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.show();
                             let _ = w.set_focus();
+                        }
+                    }
+                    if event.id.as_ref() == "end-meeting" {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                            let _ = w.emit("request-end-meeting", ());
                         }
                     }
                     if event.id.as_ref() == "quit" {
@@ -280,24 +363,52 @@ fn main() {
         .invoke_handler(tauri::generate_handler![get_system_status, dispatch])
         .build(tauri::generate_context!())
         .expect("启动 HelmMeet 失败");
-    app.run(|app, event| {
-        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+    app.run(move |app, event| {
+        if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+            let shutdown = app.state::<lifecycle::Shutdown>();
+            if shutdown.ready() {
+                return;
+            }
+            api.prevent_exit();
             let rt = app.state::<Arc<db::Runtime>>();
-            let active = rt.capture.lock().map(|c| c.is_some()).unwrap_or(true);
+            let capture = rt.capture.lock().unwrap_or_else(|e| e.into_inner());
+            let active = capture.is_some();
             if active {
-                api.prevent_exit();
+                let meeting = capture.as_ref().unwrap().meeting.clone();
+                drop(capture);
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.show();
                     let _ = w.set_focus();
                 }
-                rt.error(
-                    &rt.capture
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.as_ref().map(|s| s.meeting.clone()))
-                        .unwrap_or_default(),
-                    "仍在录制，请先在主窗口结束会议，再退出应用",
-                );
+                rt.error(&meeting, "仍在录制，请先在主窗口结束会议，再退出应用");
+            } else if let Some(workers) = shutdown.begin() {
+                // Serialize with audio::start/preview so a queued start cannot
+                // acquire capture after the exit decision and begin recording.
+                rt.shutting_down
+                    .store(true, std::sync::atomic::Ordering::Release);
+                drop(capture);
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.set_title("HelmMeet · 正在停止转写并释放模型…");
+                }
+                let handle = app.clone();
+                std::thread::spawn(move || {
+                    let result = lifecycle::stop_workers(workers);
+                    handle.state::<lifecycle::Shutdown>().finish(result.is_ok());
+                    match result {
+                        Ok(()) => {
+                            if exit_probe {
+                                println!("ASR exit probe: workers joined before final exit");
+                            }
+                            handle.exit(code.unwrap_or(0));
+                        }
+                        Err(error) => {
+                            eprintln!("退出清理未完成：{error}");
+                            if let Some(w) = handle.get_webview_window("main") {
+                                let _ = w.set_title("HelmMeet · 退出清理失败，请保留日志排查");
+                            }
+                        }
+                    }
+                });
             }
         }
     });

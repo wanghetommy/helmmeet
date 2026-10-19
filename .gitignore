@@ -93,3 +93,8 @@ apps/desktop/src-tauri/gen/
 artifacts/
 .tools/
 native/macos-audio/.build/
+
+# Per-user credential configuration, including accidental local copies
+credentials.json
+credentials.lock
+.credentials-*.tmp

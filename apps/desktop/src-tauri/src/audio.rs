@@ -17,6 +17,7 @@ use std::{
 };
 
 extern "C" {
+    fn hm_audio_output_route(values: *mut u64) -> i32;
     fn hm_audio_start(
         mask: i32,
         device: u32,
@@ -29,6 +30,7 @@ extern "C" {
     fn hm_audio_input_device() -> u32;
     fn hm_audio_devices() -> *mut std::ffi::c_char;
     fn hm_audio_free(pointer: *mut std::ffi::c_char);
+    fn hm_audio_pump_events();
 }
 struct Frame {
     source: i32,
@@ -47,6 +49,30 @@ enum Input {
 static BUS: Mutex<Option<SyncSender<Input>>> = Mutex::new(None);
 static NATIVE_GATE: Mutex<()> = Mutex::new(());
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+fn start_error(code: i32) -> &'static str {
+    match code {
+        1 => "麦克风权限未授权，请在系统设置的隐私与安全性中允许麦克风访问",
+        2 => "麦克风设备无法启动或音频格式不可用，请重新选择输入设备后重试",
+        3 => "电脑声音采集无法启动，请检查屏幕与系统音频录制权限及可用显示器；麦克风授权不能代替该权限",
+        _ => "音源无法启动，所有已启动采集已回滚，请核对音源选择后重试",
+    }
+}
+fn source_error(source: i32, code: i32) -> String {
+    if source == -1 {
+        return "系统睡眠或全局采集中断，请唤醒电脑后重试".into();
+    }
+    let name = if source == -2 {
+        "麦克风"
+    } else {
+        "电脑声音"
+    };
+    let reason = match code {
+        5 => "音频缓冲溢出，请关闭占用资源较高的程序后重试",
+        6 => "音频格式转换失败，请重新选择音源设备后重试",
+        _ => "设备或音频格式发生变化，请核对设备连接并重新选择音源后重试",
+    };
+    format!("{name}{reason}")
+}
 extern "C" fn receive(data: *const f32, source: i32, count: i32, host: u64) {
     // Swift owns this buffer only until the callback returns. Copy before enqueue.
     let samples = if !data.is_null() && count > 0 && source >= 0 {
@@ -77,9 +103,22 @@ trait CaptureHardware: Send + Sync {
     fn stop_source(&self, source: i32);
     fn microphone(&self, enabled: bool) -> Result<(), String>;
     fn host_ns(&self) -> u64;
+    fn output_route(&self) -> Option<crate::routes::Snapshot> {
+        None
+    }
 }
 struct MacHardware;
 impl CaptureHardware for MacHardware {
+    fn output_route(&self) -> Option<crate::routes::Snapshot> {
+        let mut values = [0u64; 3];
+        // Read-only CoreAudio properties, initialized synchronously on success.
+        let code = unsafe { hm_audio_output_route(values.as_mut_ptr()) };
+        (code == 0).then_some(crate::routes::Snapshot {
+            device: values[0] as u32,
+            transport: values[1] as u32,
+            rate: values[2] as u32,
+        })
+    }
     fn stop_all(&self) {
         let _native = NATIVE_GATE.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { hm_audio_stop() };
@@ -98,6 +137,14 @@ impl CaptureHardware for MacHardware {
     }
     fn host_ns(&self) -> u64 {
         unsafe { hm_audio_host_ns() }
+    }
+}
+pub fn output_route_status() -> serde_json::Value {
+    match MacHardware.output_route() {
+        Some(r) => {
+            json!({"available":true,"device_id":r.device,"transport":r.transport,"sample_rate":r.rate,"aec_supported":r.supported(),"capture_started":false})
+        }
+        None => json!({"available":false,"aec_supported":false,"capture_started":false}),
     }
 }
 pub struct CaptureSession {
@@ -229,6 +276,7 @@ pub fn repair(path: &Path) -> Result<u64, String> {
 }
 struct Track {
     name: &'static str,
+    host_origin: Option<u64>,
     position: u64,
     chunk: Option<(String, u64, WavFile)>,
     clock: AudioClock,
@@ -239,6 +287,7 @@ impl Track {
     fn new(name: &'static str) -> Self {
         Self {
             name,
+            host_origin: None,
             position: 0,
             chunk: None,
             clock: AudioClock::default(),
@@ -289,7 +338,10 @@ impl Track {
             .clock
             .align(target, samples.len())
             .map_err(|_| "音源时钟发生跳变")?;
-        if plan.start_sample > self.position + 1600 || plan.gap.is_some() {
+        if plan.start_sample > self.position + 1600
+            || plan.gap.is_some()
+            || (self.position == 0 && self.chunk.is_none() && plan.start_sample > 0)
+        {
             self.seal(rt, meeting)?;
             let start = base + self.position / 16;
             let end = base + plan.start_sample / 16;
@@ -317,7 +369,15 @@ impl Track {
                 let start = base + self.position / 16;
                 let chunk = id();
                 let rel = format!("meetings/{meeting}/audio/{}-{start}-{chunk}.wav", self.name);
-                rt.db()?.execute("INSERT INTO audio_chunks(id,meeting_id,source,relative_path,start_ms,status) VALUES (?,?,?,?,?,'writing')",params![chunk,meeting,self.name,rel,start]).map_err(err)?;
+                {
+                    let mut db = rt.db()?;
+                    let tx = db.transaction().map_err(err)?;
+                    tx.execute("INSERT INTO audio_chunks(id,meeting_id,source,relative_path,start_ms,status) VALUES (?,?,?,?,?,'writing')",params![chunk,meeting,self.name,rel,start]).map_err(err)?;
+                    if let Some(origin) = self.host_origin {
+                        tx.execute("INSERT INTO audio_chunk_timing SELECT ?,?,id,?,? FROM recording_epochs WHERE meeting_id=? AND wall_end IS NULL ORDER BY rowid DESC LIMIT 1",params![chunk,meeting,base*16+self.position,origin,meeting]).map_err(err)?;
+                    }
+                    tx.commit().map_err(err)?;
+                }
                 let wav = WavFile::create(&rt.root.join(rel))?;
                 self.chunk = Some((chunk, start, wav));
             }
@@ -389,6 +449,7 @@ pub fn start(
         return Err("磁盘剩余空间不足 200MB，请先释放空间".into());
     }
     let mut guard = rt.capture.lock().map_err(|_| "采集锁异常")?;
+    rt.ensure_running()?;
     if guard
         .as_ref()
         .is_some_and(|s| s.meeting == meeting && s.worker.as_ref().is_some_and(|w| w.is_finished()))
@@ -408,6 +469,7 @@ pub fn start(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(err)?;
+    crate::enhancement::validate_capture(&rt, meeting, mask, &state)?;
     if !matches!(state.as_str(), "ready" | "paused" | "interrupted") {
         return Err("当前会议不能开始录制".into());
     }
@@ -451,12 +513,7 @@ pub fn start(
             unsafe { hm_audio_stop() };
         }
         *BUS.lock().map_err(|_| "音频通道异常")? = None;
-        return Err(match code {
-            1 => "麦克风权限未授权，请在系统设置中开启",
-            3 => "系统声音采集失败，请检查屏幕录制权限",
-            _ => "音源不可用，所有已启动采集已回滚",
-        }
-        .into());
+        return Err(start_error(code).into());
     }
     let first = match rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Input::Frame(frame)) => frame,
@@ -476,7 +533,7 @@ pub fn start(
             unsafe { hm_audio_stop() };
         }
         *BUS.lock().map_err(|_| "音频通道异常")? = None;
-        return Err("音源初始化失败".into());
+        return Err(source_error(first.source, first.fault_code));
     }
     let origin = first.host;
     let persist = (|| -> Result<(), String> {
@@ -573,11 +630,42 @@ impl Writer {
         if mask & 2 != 0 {
             tracks.insert(1, Track::new("system"));
         }
+        for track in tracks.values_mut() {
+            track.host_origin = Some(origin);
+        }
+        let mut route_tracker = (|| {
+            let db = owner.db().ok()?;
+            let enabled: bool = db
+                .query_row(
+                    "SELECT echo_cancellation FROM audio_enhancement WHERE meeting_id=?",
+                    [&mid],
+                    |r| r.get(0),
+                )
+                .ok()?;
+            if !enabled {
+                return None;
+            }
+            let epoch:String=db.query_row("SELECT id FROM recording_epochs WHERE meeting_id=? AND wall_end IS NULL ORDER BY rowid DESC LIMIT 1",[&mid],|r|r.get(0)).ok()?;
+            Some(crate::routes::Tracker::new(epoch))
+        })();
+        let mut route_check = std::time::Instant::now() - Duration::from_secs(1);
         let mut pending = Some(Input::Frame(first));
         let mut maximum = 0u64;
         let mut failed = false;
         let mut disk_check = std::time::Instant::now();
         loop {
+            if route_check.elapsed() >= Duration::from_millis(250) {
+                route_check = std::time::Instant::now();
+                if let Some(tracker) = route_tracker.as_mut() {
+                    let at = base * 16 + hardware.host_ns().saturating_sub(origin) / 62500;
+                    if tracker
+                        .observe(&owner, &mid, at, hardware.output_route())
+                        .is_err()
+                    {
+                        route_tracker = None;
+                    }
+                }
+            }
             let item = pending
                 .take()
                 .or_else(|| rx.recv_timeout(Duration::from_millis(100)).ok());
@@ -766,6 +854,10 @@ impl Writer {
                 *bus = None;
             }
         }
+        if let Some(tracker) = route_tracker.as_mut() {
+            let at = base * 16 + hardware.host_ns().saturating_sub(origin) / 62500;
+            let _ = tracker.observe(&owner, &mid, at, hardware.output_route());
+        }
         for track in tracks.values_mut() {
             if let Err(e) = track
                 .seal(&owner, &mid)
@@ -799,6 +891,7 @@ pub fn set_microphone_enabled(
 ) -> Result<(), String> {
     rt.check_id(meeting)?;
     let guard = rt.capture.lock().map_err(|_| "采集锁异常")?;
+    rt.ensure_running()?;
     let session = guard
         .as_ref()
         .filter(|s| s.meeting == meeting && s.worker.as_ref().is_some_and(|w| !w.is_finished()))
@@ -821,9 +914,31 @@ pub fn preview(rt: &Runtime, mask: i32, device: u32) -> Result<serde_json::Value
         return Err("请选择音源".into());
     }
     let guard = rt.capture.lock().map_err(|_| "采集锁异常")?;
+    rt.ensure_running()?;
     if guard.is_some() {
         return Err("录制中请查看会议内的实时电平".into());
     }
+    preview_sources(mask, device)
+}
+/// Explicit CLI diagnostic: same native preview as the UI, no DB/config/ASR/HTTP.
+/// Called on the main thread so macOS can deliver engine notifications normally.
+pub fn check_microphone() -> Result<serde_json::Value, String> {
+    let (tx, rx) = sync_channel(1);
+    thread::spawn(move || {
+        let result = preview_sources(1, 0);
+        let _ = tx.send(result);
+    });
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err("麦克风检查线程异常退出".into());
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => unsafe { hm_audio_pump_events() },
+        }
+    }
+}
+fn preview_sources(mask: i32, device: u32) -> Result<serde_json::Value, String> {
     let (tx, rx) = sync_channel(256);
     *BUS.lock().map_err(|_| "音频通道锁异常")? = Some(tx);
     let code = {
@@ -831,7 +946,7 @@ pub fn preview(rt: &Runtime, mask: i32, device: u32) -> Result<serde_json::Value
         unsafe { hm_audio_start(mask, device, receive) }
     };
     let result = if code != 0 {
-        Err("音源预览无法启动，请检查麦克风与系统音频权限".into())
+        Err(start_error(code).into())
     } else {
         let until = std::time::Instant::now() + Duration::from_secs(3);
         let mut levels = serde_json::json!({});
@@ -839,7 +954,7 @@ pub fn preview(rt: &Runtime, mask: i32, device: u32) -> Result<serde_json::Value
         while std::time::Instant::now() < until {
             if let Ok(Input::Frame(f)) = rx.recv_timeout(Duration::from_millis(100)) {
                 if f.source < 0 {
-                    error = Some("音源预览中断，请检查设备".to_string());
+                    error = Some(source_error(f.source, f.fault_code));
                     break;
                 }
                 let name = if f.source == 0 {
@@ -853,6 +968,9 @@ pub fn preview(rt: &Runtime, mask: i32, device: u32) -> Result<serde_json::Value
                 levels[name] = json!(levels[name].as_f64().unwrap_or(0.0).max(rms as f64));
             }
         }
+        if mask & 1 != 0 && levels.get("microphone").is_none() && error.is_none() {
+            error = Some("麦克风启动后未收到音频，请重新选择输入设备后重试".into());
+        }
         error.map_or_else(|| Ok(json!({"levels":levels,"seconds":3})), Err)
     };
     MacHardware.stop_all();
@@ -860,18 +978,53 @@ pub fn preview(rt: &Runtime, mask: i32, device: u32) -> Result<serde_json::Value
     result
 }
 pub fn control(rt: &Runtime, meeting: &str, action: &str) -> Result<(), String> {
+    control_checked(rt, meeting, action, None)
+}
+pub fn finish_confirmed(
+    rt: &Runtime,
+    meeting: &str,
+    expected_version: u64,
+    epoch: &str,
+) -> Result<(), String> {
+    control_checked(rt, meeting, "stop", Some((expected_version, epoch)))
+}
+fn control_checked(
+    rt: &Runtime,
+    meeting: &str,
+    action: &str,
+    confirmation: Option<(u64, &str)>,
+) -> Result<(), String> {
     rt.check_id(meeting)?;
     let mut guard = rt.capture.lock().map_err(|_| "采集锁异常")?;
+    if let Some((version, epoch)) = confirmation {
+        let receipt:bool=rt.db()?.query_row("SELECT EXISTS(SELECT 1 FROM meeting_end_receipts WHERE meeting_id=? AND epoch_id=? AND expected_version=?)",rusqlite::params![meeting,epoch,version],|r|r.get(0)).map_err(err)?;
+        if receipt {
+            return Ok(());
+        }
+        let (state, current): (String, u64) = rt
+            .db()?
+            .query_row(
+                "SELECT state,version FROM meetings WHERE id=?",
+                [meeting],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(err)?;
+        meeting_core::product::validate_end(
+            &state,
+            current,
+            &crate::product::capture_epoch(rt, meeting)?,
+            version,
+            epoch,
+        )
+        .map_err(str::to_string)?;
+    }
     if let Some(session) = guard.as_ref() {
         if session.meeting != meeting {
             return Err("另一场会议正在录制".into());
         }
     }
-    if let Some(session) = guard.take() {
-        session.stop();
-    }
-    let db = rt.db()?;
-    let state: String = db
+    let state: String = rt
+        .db()?
         .query_row("SELECT state FROM meetings WHERE id=?", [meeting], |r| {
             r.get(0)
         })
@@ -881,11 +1034,24 @@ pub fn control(rt: &Runtime, meeting: &str, action: &str) -> Result<(), String> 
         "stop" if matches!(state.as_str(), "recording" | "paused" | "interrupted") => "finalizing",
         _ => return Err("当前状态不支持此操作".into()),
     };
-    db.execute(
+    if let Some(session) = guard.take() {
+        session.stop();
+    }
+    let mut db = rt.db()?;
+    let tx = db.transaction().map_err(err)?;
+    tx.execute(
         "UPDATE meetings SET state=?,version=version+1 WHERE id=?",
         params![next, meeting],
     )
     .map_err(err)?;
+    if let Some((version, epoch)) = confirmation {
+        tx.execute(
+            "INSERT INTO meeting_end_receipts VALUES (?,?,?,?)",
+            rusqlite::params![meeting, epoch, version, crate::db::now()],
+        )
+        .map_err(err)?;
+    }
+    tx.commit().map_err(err)?;
     Ok(())
 }
 pub fn devices() -> Result<serde_json::Value, String> {
@@ -904,6 +1070,19 @@ pub fn devices() -> Result<serde_json::Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capture_errors_distinguish_permission_device_and_runtime_faults() {
+        assert!(start_error(1).contains("权限未授权"));
+        assert!(start_error(2).contains("设备无法启动"));
+        assert!(!start_error(2).contains("未授权"));
+        assert!(start_error(3).contains("电脑声音"));
+        let configuration = source_error(-2, 7);
+        assert!(configuration.contains("麦克风"));
+        assert!(configuration.contains("音频格式发生变化"));
+        assert!(!configuration.contains("未授权"));
+        assert!(source_error(-3, 6).contains("电脑声音音频格式转换失败"));
+        assert!(source_error(-1, 7).contains("系统睡眠"));
+    }
     #[test]
     fn wav_roundtrip_and_repair() {
         let path = std::env::temp_dir().join(format!("{}.wav", id()));
@@ -1016,6 +1195,29 @@ mod source_tests {
             assert!(std::time::Instant::now() < until, "writer did not settle");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+    #[test]
+    fn stale_end_confirmation_leaves_writer_running_and_a_different_target_untouched() {
+        let (root, rt, m, hardware, tx) = writer();
+        let b = rt.create("合成历史会议", "general").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        hardware.clock.store(1_000_000_000, Ordering::Relaxed);
+        assert!(finish_confirmed(&rt, &b, 1, "").is_err());
+        assert!(finish_confirmed(&rt, &m, 0, "").is_err());
+        assert!(rt.capture.lock().unwrap().is_some());
+        tx.send(frame(0, 1_000_000_000, 1600, 0.1)).unwrap();
+        wait(|| rt.detail(&m).unwrap()["duration_ms"].as_u64().unwrap() > 0);
+        assert_eq!(rt.detail(&m).unwrap()["state"], "recording");
+        finish_confirmed(&rt, &m, 1, "").unwrap();
+        finish_confirmed(&rt, &m, 1, "").unwrap();
+        assert!(rt.capture.lock().unwrap().is_none());
+        assert_eq!(rt.detail(&b).unwrap()["state"], "ready");
+        assert_eq!(rt.detail(&m).unwrap()["state"], "finalizing");
+        drop(tx);
+        drop(rt);
+        std::fs::remove_dir_all(root).unwrap();
     }
     fn finish(rt: &Runtime) {
         rt.capture.lock().unwrap().take().unwrap().stop();
@@ -1163,6 +1365,47 @@ mod model_capture_tests {
             .unwrap()
             .iter()
             .all(|s| s["state"] == "active"));
+        drop(rt);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    #[test]
+    fn writer_persists_host_sample_offset_and_mix_preserves_fractional_millisecond() {
+        let root = std::env::temp_dir().join(format!("helmmeet-timing-{}", id()));
+        let rt = Runtime::open_with_vault(
+            root.clone(),
+            Arc::new(crate::models::tests::MemoryVault::default()),
+        )
+        .unwrap();
+        let mid = rt.create("合成时间轴", "general").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let epoch = id();
+        rt.db().unwrap().execute("INSERT INTO recording_epochs(id,meeting_id,recording_start_ms,wall_start,reason) VALUES (?,?,1000,'synthetic','recording')",params![epoch,mid]).unwrap();
+        std::fs::create_dir_all(rt.meeting_dir(&mid).join("audio")).unwrap();
+        let mut track = Track::new("microphone");
+        track.host_origin = Some(123456);
+        track.frame(&rt, &mid, 1000, 7, &vec![0.25; 3217]).unwrap();
+        track.seal(&rt, &mid).unwrap();
+        let (at, origin, saved_epoch): (u64, u64, String) = rt
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT start_sample,host_origin_ns,epoch_id FROM audio_chunk_timing",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((at, origin, saved_epoch), (16007, 123456, epoch));
+        let mix = crate::asr::mix_source(&rt, &mid, 1000, 1202, Some("microphone")).unwrap();
+        assert!(mix[..7].iter().all(|v| *v == 0.0));
+        assert!(mix[7..3224].iter().all(|v| (*v - 0.25).abs() < 0.0001));
+        assert!(mix[3224..].iter().all(|v| *v == 0.0));
         drop(rt);
         std::fs::remove_dir_all(root).unwrap();
     }

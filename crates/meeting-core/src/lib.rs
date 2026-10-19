@@ -7,3 +7,10 @@ pub mod state;
 pub mod audio_clock;
 
 pub mod capture;
+
+pub mod summary;
+
+pub mod audio_processing;
+
+pub mod echo;
+pub mod product;

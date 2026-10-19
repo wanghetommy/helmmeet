@@ -1,7 +1,7 @@
 use crate::{
     analysis, asr, audio,
     db::{err, id, now, Runtime},
-    models,
+    enhancement, models,
 };
 use rusqlite::params;
 use serde::Deserialize;
@@ -15,12 +15,106 @@ use std::{
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
+    ProductPreferences,
+    SaveProductPreferences {
+        analysis_paused: bool,
+        default_source_mask: i32,
+        default_input_device: u32,
+    },
+    SavePreparation {
+        meeting_id: String,
+        expected_version: u64,
+        title: String,
+        assistant_id: String,
+        source_mask: i32,
+        context: Value,
+    },
+    FollowUp {
+        meeting_id: String,
+    },
+    FinishMeeting {
+        meeting_id: String,
+        expected_version: u64,
+        capture_epoch: String,
+    },
+    ConfirmArtifact {
+        meeting_id: String,
+        artifact_id: String,
+        expected_version: u32,
+    },
+    KnowledgeList {
+        #[serde(default)]
+        include_archived: bool,
+    },
+    KnowledgeGet {
+        set_id: String,
+        version: Option<u32>,
+    },
+    KnowledgeImport,
+    KnowledgeReindex,
+    KnowledgeSave {
+        collection: crate::knowledge::Save,
+    },
+    KnowledgeArchive {
+        set_id: String,
+        expected_version: u32,
+        archived: bool,
+    },
+    BindKnowledge {
+        meeting_id: String,
+        expected_version: u64,
+        bindings: Vec<crate::knowledge::Binding>,
+    },
+    PreviewNormalization {
+        meeting_id: String,
+    },
+    ApplyNormalization {
+        meeting_id: String,
+        changes: Vec<crate::knowledge::Correction>,
+    },
+    UndoNormalization {
+        meeting_id: String,
+        event_id: String,
+    },
     List,
     Create {
         title: String,
         assistant_id: String,
     },
     Detail {
+        meeting_id: String,
+    },
+    ReadTranscriptSnapshot {
+        meeting_id: String,
+        source: String,
+        timestamps: bool,
+    },
+    CopyTranscript {
+        meeting_id: String,
+        source: String,
+        timestamps: bool,
+        expected_hash: String,
+    },
+    CopyArtifact {
+        meeting_id: String,
+        artifact_id: String,
+    },
+    SetSummarySchedule {
+        meeting_id: String,
+        expected_version: u64,
+        enabled: bool,
+        mode: String,
+    },
+    ContextConsent {
+        meeting_id: String,
+        expected_version: u64,
+        enabled: bool,
+    },
+    CancelJob {
+        meeting_id: String,
+        job_id: String,
+    },
+    ClearConversation {
         meeting_id: String,
     },
     Record {
@@ -43,6 +137,18 @@ pub enum Request {
         revision: u32,
     },
     Settings,
+    SetAudioEnhancementDefault {
+        mode: String,
+    },
+    SetAudioEnhancement {
+        meeting_id: String,
+        mode: String,
+        #[serde(default)]
+        echo_cancellation: Option<bool>,
+    },
+    RetryAudioEnhancement {
+        meeting_id: String,
+    },
     SaveAsrSettings {
         language: String,
     },
@@ -149,6 +255,10 @@ pub enum Request {
     Playback {
         meeting_id: String,
         start_ms: u64,
+        #[serde(default = "raw_variant")]
+        audio_variant: String,
+        #[serde(default)]
+        end_ms: Option<u64>,
     },
     EditArtifact {
         meeting_id: String,
@@ -156,6 +266,9 @@ pub enum Request {
         expected_version: u32,
         text: String,
     },
+}
+fn raw_variant() -> String {
+    "raw".into()
 }
 fn valid_text(text: &str, max: usize) -> Result<(), String> {
     if text.trim().is_empty() || text.len() > max {
@@ -165,7 +278,85 @@ fn valid_text(text: &str, max: usize) -> Result<(), String> {
     }
 }
 pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
+    rt.ensure_running()?;
     match request {
+        Request::ProductPreferences => crate::product::preferences(&rt),
+        Request::SaveProductPreferences {
+            analysis_paused,
+            default_source_mask,
+            default_input_device,
+        } => crate::product::set_preferences(
+            &rt,
+            analysis_paused,
+            default_source_mask,
+            default_input_device,
+        ),
+        Request::SavePreparation {
+            meeting_id,
+            expected_version,
+            title,
+            assistant_id,
+            source_mask,
+            context,
+        } => crate::product::preparation(
+            &rt,
+            &meeting_id,
+            expected_version,
+            &title,
+            &assistant_id,
+            source_mask,
+            context,
+        ),
+        Request::FollowUp { meeting_id } => crate::product::follow_up(&rt, &meeting_id),
+        Request::FinishMeeting {
+            meeting_id,
+            expected_version,
+            capture_epoch,
+        } => {
+            audio::finish_confirmed(&rt, &meeting_id, expected_version, &capture_epoch)?;
+            rt.detail(&meeting_id)
+        }
+        Request::ConfirmArtifact {
+            meeting_id,
+            artifact_id,
+            expected_version,
+        } => crate::product::confirm_artifact(&rt, &meeting_id, &artifact_id, expected_version),
+        Request::KnowledgeReindex => {
+            rt.db()?
+                .execute(
+                    "INSERT INTO knowledge_search(knowledge_search) VALUES ('rebuild')",
+                    [],
+                )
+                .map_err(err)?;
+            Ok(json!({"rebuilt":true}))
+        }
+        Request::KnowledgeList { include_archived } => {
+            crate::knowledge::list(&rt, include_archived)
+        }
+        Request::KnowledgeGet { set_id, version } => crate::knowledge::get(&rt, &set_id, version),
+        Request::KnowledgeImport => crate::knowledge::import(),
+        Request::KnowledgeSave { collection } => crate::knowledge::save(&rt, collection),
+        Request::KnowledgeArchive {
+            set_id,
+            expected_version,
+            archived,
+        } => crate::knowledge::archive(&rt, &set_id, expected_version, archived),
+        Request::BindKnowledge {
+            meeting_id,
+            expected_version,
+            bindings,
+        } => crate::knowledge::bind(&rt, &meeting_id, expected_version, bindings),
+        Request::PreviewNormalization { meeting_id } => {
+            crate::knowledge::preview_normalization(&rt, &meeting_id)
+        }
+        Request::ApplyNormalization {
+            meeting_id,
+            changes,
+        } => crate::knowledge::apply_normalization(&rt, &meeting_id, changes),
+        Request::UndoNormalization {
+            meeting_id,
+            event_id,
+        } => crate::knowledge::undo_normalization(&rt, &meeting_id, &event_id),
         Request::List => rt.list(),
         Request::Create {
             title,
@@ -179,6 +370,9 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             input_device,
             confirm_microphone,
         } => {
+            if action == "stop" {
+                return Err("请通过结束确认操作结束会议".into());
+            }
             if action == "start" || action == "resume" {
                 audio::start(
                     rt.clone(),
@@ -211,10 +405,19 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             rt.check_id(&meeting_id)?;
             rt.db()?.query_row("SELECT r.text,s.start_ms,s.end_ms FROM transcript_revisions r JOIN transcript_segments s ON s.id=r.segment_id WHERE r.meeting_id=? AND r.segment_id=? AND r.revision=?",params![meeting_id,segment_id,revision],|r|Ok(json!({"text":r.get::<_,String>(0)?,"start_ms":r.get::<_,u64>(1)?,"end_ms":r.get::<_,u64>(2)?,"revision":revision}))).map_err(err)
         }
+        Request::SetAudioEnhancementDefault { mode } => enhancement::set_default(&rt, &mode),
+        Request::SetAudioEnhancement {
+            meeting_id,
+            mode,
+            echo_cancellation,
+        } => enhancement::configure_options(&rt, &meeting_id, &mode, echo_cancellation),
+        Request::RetryAudioEnhancement { meeting_id } => enhancement::retry(&rt, &meeting_id),
         Request::Settings => {
+            let enhancement_default = enhancement::default_mode(&rt)?;
+            let product = crate::product::preferences(&rt)?;
             let cfg = rt.config.lock().map_err(|_| "配置锁异常")?;
             Ok(
-                json!({"model_file":std::path::Path::new(&cfg.asr.model_path).file_name().and_then(|s|s.to_str()),"asr_configured":std::path::Path::new(&cfg.asr.model_path).is_file(),"language":cfg.asr.language,"startup_warning":rt.transient.lock().map_err(|_|"状态锁异常")?["startup_warning"]}),
+                json!({"product":product,"data_directory":rt.root.to_string_lossy(),"app_version":env!("CARGO_PKG_VERSION"),"audio_enhancement_available":enhancement::AVAILABLE,"audio_enhancement_default":enhancement_default,"model_file":std::path::Path::new(&cfg.asr.model_path).file_name().and_then(|s|s.to_str()),"asr_configured":std::path::Path::new(&cfg.asr.model_path).is_file(),"language":cfg.asr.language,"startup_warning":rt.transient.lock().map_err(|_|"状态锁异常")?["startup_warning"]}),
             )
         }
         Request::SaveAsrSettings { language } => {
@@ -228,6 +431,7 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
         }
         Request::ModelProfiles => models::list(&rt),
         Request::RetryModelImport => {
+            crate::credentials::migrate(&rt, true)?;
             models::bootstrap(&rt)?;
             rt.transient.lock().map_err(|_| "状态锁异常")?["startup_warning"] = Value::Null;
             Ok(json!({"imported":true}))
@@ -309,6 +513,109 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
                 .ok_or("默认配置不可用")?;
             models::test(&rt, p, v as u32)
         }
+        Request::ReadTranscriptSnapshot {
+            meeting_id,
+            source,
+            timestamps,
+        } => crate::workspace::transcript(&rt, &meeting_id, &source, timestamps),
+        Request::CopyTranscript {
+            meeting_id,
+            source,
+            timestamps,
+            expected_hash,
+        } => crate::workspace::copy(&rt, &meeting_id, &source, timestamps, &expected_hash),
+        Request::CopyArtifact {
+            meeting_id,
+            artifact_id,
+        } => {
+            rt.check_id(&meeting_id)?;
+            let text: String = rt
+                .db()?
+                .query_row(
+                    "SELECT content_json FROM artifacts WHERE meeting_id=? AND id=?",
+                    params![meeting_id, artifact_id],
+                    |r| r.get(0),
+                )
+                .map_err(err)?;
+            let v: Value = serde_json::from_str(&text).map_err(err)?;
+            let text = v["manual_text"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    v["summary"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|s| s["text"].as_str())
+                        .chain(
+                            v["actions"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|s| s["task"].as_str()),
+                        )
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                });
+            crate::workspace::write_clipboard(&text)?;
+            Ok(json!({"copied":true}))
+        }
+        Request::SetSummarySchedule {
+            meeting_id,
+            expected_version,
+            enabled,
+            mode,
+        } => crate::workspace::set_schedule(&rt, &meeting_id, expected_version, enabled, &mode),
+        Request::ContextConsent {
+            meeting_id,
+            expected_version,
+            enabled,
+        } => {
+            rt.check_id(&meeting_id)?;
+            let mut db = rt.db()?;
+            let tx = db.transaction().map_err(err)?;
+            if enabled
+                && tx
+                    .query_row(
+                        "SELECT analysis_mode='transcript_only' FROM meetings WHERE id=?",
+                        [&meeting_id],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .map_err(err)?
+            {
+                return Err("请先启用本场模型分析".into());
+            }
+            if tx.execute("UPDATE meetings SET context_consent=?,consent_version=consent_version+1,version=version+1,generation=generation+1 WHERE id=? AND version=?",params![enabled,meeting_id,expected_version]).map_err(err)?!=1 {return Err("会议版本已变化，请刷新重试".into());}
+            tx.execute("INSERT INTO meeting_configs SELECT meeting_id,version+1,assistant_snapshot,model_snapshot,? FROM meeting_configs WHERE meeting_id=? ORDER BY version DESC LIMIT 1",params![json!({"summary_context":enabled,"chat_context":enabled,"scope":"confirmed_text_context_actions"}).to_string(),meeting_id]).map_err(err)?;
+            tx.execute("UPDATE analysis_jobs SET state='cancelled' WHERE meeting_id=? AND state IN('pending','running')",[&meeting_id]).map_err(err)?;
+            if !enabled {
+                tx.execute(
+                    "UPDATE summary_schedules SET enabled=0,version=version+1 WHERE meeting_id=?",
+                    [&meeting_id],
+                )
+                .map_err(err)?;
+            }
+            tx.commit().map_err(err)?;
+            Ok(json!({"saved":true}))
+        }
+        Request::CancelJob { meeting_id, job_id } => {
+            rt.check_id(&meeting_id)?;
+            rt.db()?.execute("UPDATE analysis_jobs SET state='cancelled' WHERE meeting_id=? AND id=? AND state IN('pending','running')",params![meeting_id,job_id]).map_err(err)?;
+            Ok(json!({"cancelled":true}))
+        }
+        Request::ClearConversation { meeting_id } => {
+            rt.check_id(&meeting_id)?;
+            let mut db = rt.db()?;
+            let tx = db.transaction().map_err(err)?;
+            tx.execute(
+                "UPDATE meetings SET chat_epoch=chat_epoch+1 WHERE id=?",
+                [&meeting_id],
+            )
+            .map_err(err)?;
+            tx.execute("UPDATE analysis_jobs SET state='cancelled' WHERE meeting_id=? AND type='qa' AND state IN('pending','running')",[&meeting_id]).map_err(err)?;
+            tx.commit().map_err(err)?;
+            Ok(json!({"cleared":true}))
+        }
         Request::Templates => {
             let db = rt.db()?;
             let mut s = db
@@ -330,12 +637,7 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             let mut db = rt.db()?;
             let tx = db.transaction().map_err(err)?;
             tx.execute("INSERT INTO assistant_templates VALUES (?,1,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,instructions=excluded.instructions,version=version+1",params![template,name,instructions]).map_err(err)?;
-            tx.execute(
-                "UPDATE meetings SET generation=generation+1 WHERE assistant_id=?",
-                [&template],
-            )
-            .map_err(err)?;
-            tx.execute("UPDATE artifacts SET status='stale' WHERE meeting_id IN (SELECT id FROM meetings WHERE assistant_id=?)",[&template]).map_err(err)?;
+            tx.execute("INSERT INTO template_versions SELECT id,version,name,instructions FROM assistant_templates WHERE id=?",[&template]).map_err(err)?;
             tx.commit().map_err(err)?;
             Ok(json!({"id":template}))
         }
@@ -469,7 +771,12 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             if count != 1 {
                 return Err("助手不存在".into());
             }
-            tx.execute("UPDATE meetings SET assistant_id=?,context_json=?,generation=generation+1 WHERE id=?",params![assistant_id,json!({"goal":goal,"agenda":agenda,"participants":participants,"terms":terms}).to_string(),meeting_id]).map_err(err)?;
+            tx.execute("UPDATE meetings SET template_source='selected',assistant_id=?,template_version=(SELECT version FROM assistant_templates WHERE id=?),context_json=?,generation=generation+1,version=version+1 WHERE id=?",params![assistant_id,assistant_id,json!({"goal":goal,"agenda":agenda,"participants":participants,"terms":terms}).to_string(),meeting_id]).map_err(err)?;
+            tx.execute(
+                "UPDATE artifacts SET status='stale' WHERE meeting_id=?",
+                [&meeting_id],
+            )
+            .map_err(err)?;
             tx.commit().map_err(err)?;
             Ok(json!({"saved":true}))
         }
@@ -529,6 +836,8 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
         Request::Playback {
             meeting_id,
             start_ms,
+            audio_variant,
+            end_ms,
         } => {
             rt.check_id(&meeting_id)?;
             let duration: u64 = rt
@@ -539,11 +848,18 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
                     |r| r.get(0),
                 )
                 .map_err(err)?;
-            let end = (start_ms + 30000).min(duration);
+            let end = start_ms
+                .saturating_add(30000)
+                .min(duration)
+                .min(end_ms.unwrap_or(duration));
             if end <= start_ms {
                 return Err("录音位置超出范围".into());
             }
-            let pcm = asr::mix(&rt, &meeting_id, start_ms, end)?;
+            let pcm = match audio_variant.as_str() {
+                "raw" => asr::mix(&rt, &meeting_id, start_ms, end)?,
+                "enhanced" => enhancement::mix(&rt, &meeting_id, start_ms, end, false)?,
+                _ => return Err("回听音轨无效".into()),
+            };
             Ok(
                 json!({"samples":pcm.iter().map(|s|(s.clamp(-1.0,1.0)*32767.0) as i16).collect::<Vec<_>>(),"start_ms":start_ms,"end_ms":end}),
             )
@@ -554,6 +870,13 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             artifact_id,
         } => {
             let mut detail = rt.detail(&meeting_id)?;
+            if detail["state"] == "ready"
+                || (detail["capabilities"]["has_audio"] != true
+                    && detail["capabilities"]["has_confirmed_text"] != true
+                    && detail["capabilities"]["has_minutes"] != true)
+            {
+                return Err("本场尚无可导出的内容".into());
+            }
             if let Some(artifact) = artifact_id {
                 let selected = detail["artifacts"]
                     .as_array()
@@ -566,10 +889,23 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
                 let rows=q.query_map(params![artifact,meeting_id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"revision":r.get::<_,u32>(1)?,"text":r.get::<_,String>(2)?,"start_ms":r.get::<_,u64>(3)?}))).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
                 detail["export_evidence"] = json!(rows);
             }
-            if !["md", "txt", "csv", "wav", "wav_microphone", "wav_system"]
-                .contains(&format.as_str())
+            if ![
+                "md",
+                "txt",
+                "csv",
+                "wav",
+                "wav_microphone",
+                "wav_system",
+                "wav_enhanced",
+                "wav_enhanced_microphone",
+            ]
+            .contains(&format.as_str())
             {
                 return Err("导出格式无效".into());
+            }
+            let enhanced = format.starts_with("wav_enhanced");
+            if enhanced {
+                enhancement::require_export(&rt, &meeting_id)?;
             }
             let Some(path) = rfd::FileDialog::new()
                 .set_file_name(format!(
@@ -586,27 +922,46 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             };
             if format.starts_with("wav") {
                 let temp = path.with_extension(format!("{}.pending", id()));
-                let mut file = audio::WavFile::create(&temp)?;
-                let duration = detail["duration_ms"].as_u64().unwrap_or(0);
-                let mut start = 0;
-                while start < duration {
-                    let end = (start + 8000).min(duration);
-                    file.write(&asr::mix_source(
-                        &rt,
-                        &meeting_id,
-                        start,
-                        end,
-                        match format.as_str() {
-                            "wav_microphone" => Some("microphone"),
-                            "wav_system" => Some("system"),
-                            _ => None,
-                        },
-                    )?)?;
-                    start = end;
+                let result = (|| -> Result<(), String> {
+                    let mut file = audio::WavFile::create(&temp)?;
+                    let duration = detail["duration_ms"].as_u64().unwrap_or(0);
+                    let mut start = 0;
+                    while start < duration {
+                        let end = (start + 8000).min(duration);
+                        let pcm = if enhanced {
+                            enhancement::require_export(&rt, &meeting_id)?;
+                            enhancement::mix(
+                                &rt,
+                                &meeting_id,
+                                start,
+                                end,
+                                format == "wav_enhanced_microphone",
+                            )?
+                        } else {
+                            asr::mix_source(
+                                &rt,
+                                &meeting_id,
+                                start,
+                                end,
+                                match format.as_str() {
+                                    "wav_microphone" => Some("microphone"),
+                                    "wav_system" => Some("system"),
+                                    _ => None,
+                                },
+                            )?
+                        };
+                        file.write(&pcm)?;
+                        start = end;
+                    }
+                    file.sync()?;
+                    drop(file);
+                    std::fs::rename(&temp, path).map_err(err)?;
+                    Ok(())
+                })();
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&temp);
                 }
-                file.sync()?;
-                drop(file);
-                std::fs::rename(temp, path).map_err(err)?;
+                result?;
             } else {
                 let output = export_text(&detail, &format);
                 let mut file = std::fs::File::create(path).map_err(err)?;
@@ -680,6 +1035,15 @@ fn csv(value: &str) -> String {
     format!("\"{}\"", safe.replace('"', "\"\""))
 }
 pub fn export_text(detail: &Value, format: &str) -> String {
+    if format == "txt" {
+        return crate::workspace::format_transcript(
+            detail["segments"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            true,
+        );
+    }
     if format == "csv" {
         let mut out = "\u{feff}事项,负责人,截止时间,确认状态,执行状态\r\n".to_string();
         for a in detail["actions"].as_array().unwrap_or(&vec![]) {
@@ -718,8 +1082,50 @@ pub fn export_text(detail: &Value, format: &str) -> String {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .unwrap_or_else(|| {
-                    serde_json::to_string_pretty(&artifact["content"]).unwrap_or_default()
+                    artifact["content"]["summary"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|fact| {
+                            let refs = fact["evidence"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|r| {
+                                    format!(
+                                        "{} r{}",
+                                        r["segment_id"].as_str().unwrap_or(""),
+                                        r["revision"]
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("、");
+                            format!(
+                                "{}\n{}\n",
+                                fact["text"].as_str().unwrap_or(""),
+                                if refs.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("\n> 原文依据：{refs}\n")
+                                }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 });
+            if let Some(bindings) = artifact["coverage"]["knowledge_manifest"]
+                .as_array()
+                .filter(|v| !v.is_empty())
+            {
+                out += "\n\n### 背景参考资料（不代表会上共识）\n\n";
+                for b in bindings {
+                    out += &format!(
+                        "- {} · v{}\n",
+                        b["name"].as_str().unwrap_or("资料"),
+                        b["version"]
+                    );
+                }
+            }
             out += "\n\n";
         }
         out += "## 待办\n\n";
@@ -764,6 +1170,16 @@ pub fn export_text(detail: &Value, format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn markdown_export_keeps_selected_human_version_and_background_provenance() {
+        let data = json!({"title":"合成会议","artifacts":[{"type":"minutes","version":4,"status":"confirmed","content":{"manual_text":"人工核对的纪要"},"coverage":{"knowledge_manifest":[{"name":"项目词库","version":2}]}}],"segments":[],"actions":[],"export_evidence":[{"id":"s1","revision":1,"text":"当时原文","start_ms":0}]});
+        let md = export_text(&data, "md");
+        assert!(md.contains("人工核对的纪要"));
+        assert!(md.contains("项目词库 · v2"));
+        assert!(md.contains("不代表会上共识"));
+        assert!(md.contains("s1 r1: 当时原文"));
+        assert!(!md.contains("manual_text"));
+    }
     #[test]
     fn csv_formula_and_quotes() {
         assert!(csv("\t=1+1").starts_with("\"'"));

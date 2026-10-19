@@ -82,7 +82,7 @@ class ModelProfileMigrations(unittest.TestCase):
         self.db.close()
 
     def test_latest_schema_and_immutable_model_versions(self):
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 6)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 10)
         for statement in ("UPDATE model_configs SET config_json='{}'", 'DELETE FROM model_configs'):
             with self.assertRaises(sqlite3.IntegrityError):
                 self.db.execute(statement)
@@ -94,6 +94,23 @@ class ModelProfileMigrations(unittest.TestCase):
         self.db.execute("INSERT INTO meeting_model_bindings VALUES ('m','p',1)")
         self.db.execute("UPDATE model_profiles SET archived=1 WHERE id='p'")
         self.assertEqual(self.db.execute('SELECT config_version FROM meeting_model_bindings').fetchone()[0], 1)
+
+    def test_summary_manifest_is_bound_to_same_meeting_revision(self):
+        self.db.execute("INSERT INTO transcript_segments VALUES ('s','m',0,1000,'mixed',1,'final')")
+        self.db.execute("INSERT INTO transcript_revisions VALUES ('s',1,'m','fixture','asr','now')")
+        self.db.execute("INSERT INTO summary_coverage VALUES ('m','s',1)")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("UPDATE summary_coverage SET revision=2")
+        self.db.execute("DELETE FROM meetings WHERE id='m'")
+        self.assertEqual(self.db.execute('SELECT count(*) FROM summary_coverage').fetchone()[0], 0)
+
+    def test_template_versions_and_stage_coalescence(self):
+        self.db.execute("INSERT INTO template_versions VALUES ('weekly',1,'Weekly','fixture')")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("UPDATE template_versions SET instructions='changed'")
+        self.db.execute("INSERT INTO analysis_jobs VALUES ('j','m','key','stage','{}',1,'pending',0,NULL)")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("INSERT INTO analysis_jobs VALUES ('j2','m','key2','stage','{}',1,'pending',0,NULL)")
 
     def test_source_states_and_meeting_deletion_preserve_model_history(self):
         self.db.execute("INSERT INTO recording_sources(meeting_id,source,state) VALUES ('m','microphone','disabled')")
@@ -108,3 +125,95 @@ class ModelProfileMigrations(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class AudioEnhancementMigration(unittest.TestCase):
+    def test_v7_upgrade_preserves_meetings_off_and_constraints_cascade(self):
+        db = sqlite3.connect(':memory:')
+        db.execute('PRAGMA foreign_keys=ON')
+        for migration in sorted(MIGRATION.parent.glob('*.sql')):
+            if migration.name.startswith('0008'):
+                db.execute("INSERT INTO meetings(id,title,timezone,created_at) VALUES('old','旧会议','Asia/Shanghai','x')")
+                db.commit()
+            db.executescript(migration.read_text())
+        self.assertEqual(db.execute("SELECT mode FROM audio_enhancement WHERE meeting_id='old'").fetchone()[0], 'off')
+        db.execute("UPDATE audio_enhancement SET mode='low' WHERE meeting_id='old'")
+        db.execute("INSERT INTO audio_chunks VALUES('raw','old','microphone','a.wav',0,10,160,'sealed')")
+        db.execute("INSERT INTO enhanced_chunks SELECT 'raw','old','ns.wav',160,engine FROM audio_enhancement WHERE meeting_id='old'")
+        db.execute("UPDATE meetings SET state='recording' WHERE id='old'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.execute("UPDATE audio_enhancement SET mode='moderate' WHERE meeting_id='old'")
+        db.execute("INSERT INTO meetings(id,title,timezone,created_at) VALUES('other','另一场','Asia/Shanghai','x')")
+        db.execute("INSERT INTO audio_enhancement(meeting_id,mode) VALUES('other','low')")
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.execute("INSERT INTO enhanced_chunks SELECT 'raw','other','cross.wav',160,engine FROM audio_enhancement WHERE meeting_id='other'")
+        db.execute("DELETE FROM meetings WHERE id='old'")
+        self.assertEqual(db.execute('SELECT count(*) FROM enhanced_chunks').fetchone()[0], 0)
+        self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(), [])
+        db.close()
+
+class EchoMigration(unittest.TestCase):
+    def test_v8_upgrade_retains_ns_freezes_echo_and_rejects_cross_meeting_timing(self):
+        db = sqlite3.connect(':memory:')
+        db.execute('PRAGMA foreign_keys=ON')
+        for migration in sorted(MIGRATION.parent.glob('*.sql')):
+            if migration.name.startswith('0009'):
+                break
+            db.executescript(migration.read_text())
+        db.execute("INSERT INTO meetings(id,title,timezone,created_at) VALUES('old','旧会议','Asia/Shanghai','x')")
+        db.execute("INSERT INTO audio_enhancement(meeting_id,mode) VALUES('old','low')")
+        db.commit()
+        db.executescript((MIGRATION.parent / '0009_echo_cancellation.sql').read_text())
+        self.assertEqual(db.execute('SELECT mode,echo_cancellation FROM audio_enhancement').fetchone(), ('low', 0))
+        self.assertEqual(db.execute('SELECT count(*) FROM audio_chunk_timing').fetchone()[0], 0)
+        db.execute("INSERT INTO meetings(id,title,timezone,created_at) VALUES('other','另一场','Asia/Shanghai','x')")
+        for epoch, meeting in [('e1', 'old'), ('e2', 'other')]:
+            db.execute("INSERT INTO recording_epochs(id,meeting_id,recording_start_ms,wall_start,reason) VALUES(?,?,0,'x','recording')", (epoch, meeting))
+        db.execute("INSERT INTO audio_chunks VALUES('raw','old','microphone','raw.wav',0,10,160,'sealed')")
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.execute("INSERT INTO audio_chunk_timing VALUES('raw','old','e2',5,1000)")
+        db.execute("INSERT INTO audio_chunk_timing VALUES('raw','old','e1',5,1000)")
+        db.execute("INSERT INTO enhanced_chunks SELECT 'raw','old','ns.wav',160,engine FROM audio_enhancement")
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.execute("INSERT INTO aec_intervals VALUES('raw',4,160,'bypass','timing_unavailable',NULL)")
+        db.execute("INSERT INTO aec_intervals VALUES('raw',5,165,'bypass','reference_missing',NULL)")
+        db.execute("UPDATE meetings SET state='recording' WHERE id='old'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.execute("UPDATE audio_enhancement SET echo_cancellation=1 WHERE meeting_id='old'")
+        db.execute("DELETE FROM meetings WHERE id='old'")
+        self.assertEqual(db.execute('SELECT count(*) FROM audio_chunk_timing').fetchone()[0], 0)
+        self.assertEqual(db.execute('SELECT count(*) FROM aec_intervals').fetchone()[0], 0)
+        self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(), [])
+        db.close()
+
+
+class ProductWorkspaceMigration(unittest.TestCase):
+    def setUp(self):
+        self.db = sqlite3.connect(':memory:')
+        self.db.execute('PRAGMA foreign_keys=ON')
+        for migration in sorted(MIGRATION.parent.glob('*.sql')):
+            if migration.name < '0010':
+                self.db.executescript(migration.read_text())
+        self.db.execute("INSERT INTO meetings(id,title,timezone,created_at,analysis_mode,context_consent) VALUES ('old','old','Asia/Shanghai','now','transcript_only',0)")
+        self.db.executescript((MIGRATION.parent/'0010_product_workspace.sql').read_text())
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_upgrade_keeps_existing_explicit_analysis_off(self):
+        self.assertEqual(self.db.execute("SELECT analysis_mode,context_consent,analysis_choice FROM meetings WHERE id='old'").fetchone(), ('transcript_only', 0, 'legacy'))
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 10)
+        self.assertEqual(self.db.execute('PRAGMA foreign_key_check').fetchall(), [])
+
+    def test_bound_knowledge_versions_are_retained_and_references_are_real(self):
+        self.db.execute("INSERT INTO knowledge_sets VALUES ('k','词库','terms',1,0,'now')")
+        self.db.execute("INSERT INTO knowledge_versions VALUES ('k',1,'词库','{}','now')")
+        self.db.execute("INSERT INTO meeting_knowledge_bindings VALUES ('old','k',1)")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("UPDATE meeting_knowledge_bindings SET version=2")
+        for sql in ('DELETE FROM knowledge_versions', "UPDATE knowledge_versions SET payload_json='{}'"):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.db.execute(sql)
+        self.db.execute("DELETE FROM meetings WHERE id='old'")
+        self.assertEqual(self.db.execute('SELECT count(*) FROM meeting_knowledge_bindings').fetchone()[0], 0)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM knowledge_versions').fetchone()[0], 1)
+        self.assertEqual(self.db.execute('PRAGMA foreign_key_check').fetchall(), [])

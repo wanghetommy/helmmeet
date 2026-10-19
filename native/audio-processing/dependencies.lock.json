@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "target": "arm64-apple-macos14.0",
+  "sources": [
+    {
+      "name": "webrtc-audio-processing", "version": "2.1",
+      "archive": "webrtc-audio-processing-2.1.tar.xz",
+      "directory": "webrtc-audio-processing-2.1",
+      "url": "https://gstreamer.freedesktop.org/data/src/mirror/webrtc-audio-processing/webrtc-audio-processing-2.1.tar.xz",
+      "sha256": "ae9302824b2038d394f10213cab05312c564a038434269f11dbf68f511f9f9fe"
+    },
+    {
+      "name": "abseil-cpp", "version": "20240722.1",
+      "archive": "abseil-cpp-20240722.1.tar.gz",
+      "directory": "abseil-cpp-20240722.1",
+      "url": "https://codeload.github.com/abseil/abseil-cpp/tar.gz/refs/tags/20240722.1",
+      "sha256": "40cee67604060a7c8794d931538cb55f4d444073e556980c88b6c49bb9b19bb7"
+    },
+    {
+      "name": "pkgconf", "version": "2.3.0", "build_tool_only": true,
+      "archive": "pkgconf-2.3.0.tar.xz", "directory": "pkgconf-2.3.0",
+      "url": "https://distfiles.dereferenced.org/pkgconf/pkgconf-2.3.0.tar.xz",
+      "sha256": "3a9080ac51d03615e7c1910a0a2a8df08424892b5f13b0628a204d3fcce0ea8b"
+    }
+  ],
+  "tools": {"meson": "1.7.2", "ninja": "1.11.1.3", "cmake": "4.4.4"}
+}
