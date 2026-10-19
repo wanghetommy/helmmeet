@@ -27,16 +27,36 @@ jobs:
       - run: cargo test -p meeting-core
       - run: cargo clippy -p meeting-core --all-targets -- -D warnings
   desktop-and-swift:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
     runs-on: macos-latest
+    env:
+      HELMMEET_BUILD_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
-      - run: npm ci
+        with:
+          targets: ${{ matrix.target }}
+      - run: npm run bootstrap
+      - run: .tools/python/bin/python3 -m pip install --require-hashes -r native/audio-processing/build-requirements.txt
+      - run: .tools/python/bin/python3 native/audio-processing/build.py --target ${{ matrix.target }} --download
       - run: npm run build
-      - run: cargo test --workspace
-      - run: npm run desktop:build
-      - run: swift build --package-path native/macos-audio
+      - name: Compile target tests (cross builds do not execute)
+        run: sh scripts/with-toolchain.sh cargo check --workspace --tests --locked --target ${{ matrix.target }}
+      - name: Run tests only on native architecture
+        shell: bash
+        run: |
+          if [ "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}" ]; then
+            sh scripts/with-toolchain.sh cargo test --workspace --locked --target "${{ matrix.target }}"
+            swift test --package-path native/macos-audio
+          fi
+      - run: npm run desktop:build -- --target ${{ matrix.target }} --bundles app

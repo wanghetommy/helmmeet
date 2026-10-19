@@ -16,6 +16,8 @@ const artifact=(id,type,version)=>({id,type,version,status:'draft',content:{summ
 const details={};let defaultNS='off';
 for(const [id,title,state] of [[a,'合成会议 A','recording'],[b,'合成会议 B','completed']]) details[id]={id,title,state,enhancement:{available:true,mode:'low',echo_cancellation:true,aec_applied_ms:44000,aec_bypass_ms:16000,aec_status:{state:'applied',reason:'reference_valid',delay_ms:0},state:state==='completed'?'complete':'processing',processed_ms:60000,total_ms:60000,playable_through_ms:60000,error:null,generation:1,engine:'fixture-v1'},duration_ms:60000,created_at:'2026-10-18T00:00:00Z',last_error:null,version:1,consent_version:1,model_profile:null,sources:[],context:{},proposals:[],segments:[{id:'s1',start_ms:0,end_ms:30000,revision:2,text:'人工修订的测试文字。',state:'edited'},{id:'s2',start_ms:30000,end_ms:60000,revision:1,text:'第二段测试文字。',state:'final'}],artifacts:[artifact('summary','stage',3),artifact('minute2','minutes',2),artifact('minute1','minutes',1)],actions:[{id:'todo',task:'核对采集方案',version:1,owner_text:null,due_text:null,confirmation_state:'pending',execution_state:'todo'}],notes:[],jobs:[],analysis_mode:'local',auto_summary_minutes:0,assistant_id:'review',source_mask:1,transient:{},coverage:[],template:{id:'review',name:'方案评审',version:1,instructions:'目标与约束、方案权衡、风险和验证条件'},schedule:{enabled:false,mode:'realtime',version:1,failures:0,paused_reason:null},context_consent:true,conversation:[],legacy_answer_ids:[],summary_pending_segments:1};
 const c='33333333-3333-4333-8333-333333333333';details[c]={...structuredClone(details[b]),id:c,title:'合成准备 C',state:'ready',duration_ms:0,segments:[],artifacts:[],enhancement:{...details[b].enhancement,mode:'off',echo_cancellation:false,aec_applied_ms:0,aec_bypass_ms:0,aec_status:{state:'waiting',reason:'waiting_for_audio',delay_ms:null},state:'queued',processed_ms:0,total_ms:0,playable_through_ms:0}};
+details[a].jobs=[{id:'new-success',type:'stage',state:'succeeded',error:null},{id:'old-json-failure',type:'stage',state:'failed',error:'模型结构化结果无效'}];
+details[b].jobs=[{id:'latest-json-failure',type:'final_map',state:'failed',error:'模型结构化结果无效'}];
 window.testCalls=[];
 window.testAudioStarts=[];
 const NativeAudioContext=window.AudioContext;
@@ -67,7 +69,7 @@ window.__TAURI_INTERNALS__={transformCallback:()=>1,unregisterCallback:()=>{},in
  case 'evidence':result={text:'合成历史依据原文',revision:op.revision,start_ms:0};break;
  case 'preview_normalization':result={changes:[],conflicts:[],events:[],notice:'隔离测试中没有需要修订的词条'};break;
 
- case 'analyze':d.jobs.push({id:'fixture-job',type:'qa',state:'succeeded',error:null});d.conversation.push({job_id:'fixture-job',question:op.question,scope:op.scope,artifact_id:null,state:'succeeded',error:null});result={job_id:'fixture-job'};break;
+ case 'analyze':{const type=op.analysis_type==='stage'?'stage':op.analysis_type==='minutes'?'final_map':'qa';const id=crypto.randomUUID();d.jobs.unshift({id,type,state:'succeeded',error:null});if(op.analysis_type==='answer')d.conversation.push({job_id:id,question:op.question,scope:op.scope,artifact_id:null,state:'succeeded',error:null});else d.artifacts.unshift(artifact(id,op.analysis_type,4));result={job_id:id};break;}
  default:throw Error('Unexpected operation '+op.kind);
  }
  return structuredClone(result);

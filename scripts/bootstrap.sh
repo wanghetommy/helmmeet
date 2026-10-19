@@ -2,10 +2,14 @@
 set -eu
 TASK_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$TASK_ROOT"
-case "$(uname -s)-$(uname -m)" in Darwin-arm64) ;; *) echo '首期构建仅支持 Apple Silicon macOS。'; exit 1;; esac
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) TASK_HOST_TARGET=aarch64-apple-darwin ;;
+  Darwin-x86_64) TASK_HOST_TARGET=x86_64-apple-darwin ;;
+  *) echo '桌面构建支持 macOS arm64 / x86_64。'; exit 1 ;;
+esac
 mkdir -p .tools
 if ! command -v cargo >/dev/null 2>&1 && [ ! -x .tools/cargo/bin/cargo ]; then
-  curl --fail --location https://static.rust-lang.org/rustup/dist/aarch64-apple-darwin/rustup-init -o .tools/rustup-init
+  curl --fail --location "https://static.rust-lang.org/rustup/dist/$TASK_HOST_TARGET/rustup-init" -o .tools/rustup-init
   chmod +x .tools/rustup-init
   CARGO_HOME="$TASK_ROOT/.tools/cargo" RUSTUP_HOME="$TASK_ROOT/.tools/rustup" .tools/rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.99.1
   sh scripts/with-toolchain.sh rustup component add rustfmt clippy

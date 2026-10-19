@@ -42,6 +42,9 @@
 build/
 Build/
 build-*/
+# Checked-in Meson target descriptions are source, not generated build output.
+!native/audio-processing/build-support/
+!native/audio-processing/build-support/*.ini
 
 # CMake generated files
 CMakeFiles/

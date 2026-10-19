@@ -1,6 +1,6 @@
 # 独立音频处理组件（AP02/AP03a）
 
-固定 WebRTC Audio Processing 2.1 + Abseil 20240722.1，目标为 macOS 14+ arm64。窄 C ABI 提供实例创建、16kHz 单声道 160 样本（10ms）处理、参考输入、重置和销毁。AP03a已通过磁盘Worker生成独立麦克风增强轨，带设置/回听/导出；ASR仍走原轨，AP03b外放AEC实验版已接入，真人/设备质量待验收。
+固定 WebRTC Audio Processing 2.1 + Abseil 20240722.1，构建目标为 macOS 14+ arm64 / x86_64，Intel真人设备验收待完成。窄 C ABI 提供实例创建、16kHz 单声道 160 样本（10ms）处理、参考输入、重置和销毁。AP03a已通过磁盘Worker生成独立麦克风增强轨，带设置/回听/导出；ASR仍走原轨，AP03b外放AEC实验版已接入，真人/设备质量待验收。
 
 ## 构建
 
@@ -15,13 +15,13 @@ python3 native/audio-processing/build.py --download
 
 ```sh
 python3 native/audio-processing/build.py
-.tools/audio-processing/bin/apm-probe --self-test
-.tools/audio-processing/bin/apm-probe --benchmark /private/tmp/helmmeet-apm-synthetic 6000
+.tools/audio-processing/targets/aarch64-apple-darwin/bin/apm-probe --self-test
+.tools/audio-processing/targets/aarch64-apple-darwin/bin/apm-probe --benchmark /private/tmp/helmmeet-apm-synthetic 6000
 ```
 
 `--download` 仅允许获取 lock 中的 HTTPS 源码，并在解压前验证 SHA-256；不是自动更新。Meson 禁止依赖回退下载，使用项目编译的 pkgconf，Abseil 修补版本替换上游未修补的默认 fallback。源码和所有构建产物均在 Git 忽略目录；第三方许可正文保存在 `licenses/`。
 
-输出为含 APM、Abseil 和桥接代码的单个 `.a`，及可执行实验工具。归档体积包含未链接使用的对象，不能当作最终应用增量。显式 arm64 配置防止构建机架构检测与编译器目标不一致；NEON启用，CoreFoundation显式链接。此处没有引入完整RTC网络栈。
+输出为含 APM、Abseil 和桥接代码的单个 `.a`，及可执行实验工具。归档体积包含未链接使用的对象，不能当作最终应用增量。`--target x86_64-apple-darwin`选择Intel，省略则选择宿主；目标静态库/探针位于`targets/<Rust target>/`，pkgconf按宿主架构独立构建。显式Meson配置区分ARM NEON与x86 SSE/运行时AVX2，CoreFoundation显式链接。此处没有引入完整RTC网络栈。完整步骤见[Intel说明](../../docs/Intel_Mac构建与验收.md)。
 
 ## 应用与 Rust 验证
 

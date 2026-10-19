@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
-  "target": "arm64-apple-macos14.0",
+  "targets": ["aarch64-apple-darwin", "x86_64-apple-darwin"],
+  "minimum_macos": "14.0",
   "sources": [
     {
       "name": "webrtc-audio-processing", "version": "2.1",

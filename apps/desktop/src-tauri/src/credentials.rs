@@ -77,8 +77,16 @@ impl FileStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|_| "无法设置凭据配置权限")?;
+            if f.metadata()
+                .map_err(|_| "无法检查凭据配置权限")?
+                .permissions()
+                .mode()
+                & 0o777
+                != 0o600
+            {
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|_| "无法设置凭据配置权限")?;
+            }
         }
         let mut bytes = vec![];
         Read::by_ref(&mut f)

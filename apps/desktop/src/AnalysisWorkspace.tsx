@@ -16,6 +16,7 @@ export function AnalysisWorkspace({ detail, tab, setTab, question, setQuestion, 
   artifactId: string; setArtifactId: (s: string) => void; notify: (s: string) => void; fail: (s: string) => void;
 }) {
   const questionRef = useRef(question); questionRef.current = question;
+  const [supersededFailures, setSupersededFailures] = useState<string[]>([]);
   const [pending, setPending] = useState<Record<string, boolean>>({});
   const [summaryId, setSummaryId] = useState(preferences.get(detail.id)?.summaryId ?? ''); const [minutesTab, setMinutesTab] = useState(preferences.get(detail.id)?.minutesTab ?? '纪要正文');
   preferences.set(detail.id, { ...preferences.get(detail.id), summaryId, minutesTab });
@@ -24,7 +25,7 @@ export function AnalysisWorkspace({ detail, tab, setTab, question, setQuestion, 
   const work = async (name: string, operation: Record<string, unknown>) => {
     if (pending[name] || (operation.kind === 'analyze' && !enabled)) return;
     setPending(p => ({ ...p, [name]: true }));
-    try { await call({ ...operation, meeting_id: detail.id }); return true; } catch (e) { fail(String(e)); return false; } finally { setPending(p => ({ ...p, [name]: false })); }
+    try { await call({ ...operation, meeting_id: detail.id }); if (operation.kind === 'analyze') { const type = operation.analysis_type === 'stage' ? 'stage' : operation.analysis_type === 'minutes' ? 'final_map' : 'qa'; const old = detail.jobs.find(j => j.type === type && j.state === 'failed'); if (old) setSupersededFailures(ids => [...ids, old.id]); } return true; } catch (e) { fail(String(e)); return false; } finally { setPending(p => ({ ...p, [name]: false })); }
   };
   const after = meetingPhase(detail) === 'after';
   const tabs = after ? ['会议纪要', '行动事项', '会议助手', ...(tab === '会议总结' ? ['会议总结'] : [])] : ['会议总结', '会议纪要', '会议助手'];
@@ -45,7 +46,7 @@ export function AnalysisWorkspace({ detail, tab, setTab, question, setQuestion, 
     {detail.capabilities?.analysis_paused && <div className="banner">全局分析已暂停，可在设置中恢复。</div>}
     {!detail.segments.length && <p className="empty-note">已确认的转写文字出现后即可分析。</p>}
     {running.map(j => <div role="status" className="banner" key={j.id}>{labels[j.state]} · 录音与转写继续<button onClick={() => void work(j.id, { kind: 'cancel_job', job_id: j.id })}>取消本次</button></div>)}
-    {detail.jobs.filter(j => j.type === jobType).slice(0, 1).filter(j => j.state === 'failed' && !pending.stage && !pending.minutes && !pending.answer).map(j => <details className="job-error" key={j.id}><summary>最近一次生成失败</summary><p>{j.error ?? '分析失败，请检查服务后手动重试。'}</p></details>)}
+    {detail.jobs.filter(j => j.type === jobType).slice(0, 1).filter(j => j.state === 'failed' && !supersededFailures.includes(j.id) && !pending.stage && !pending.minutes && !pending.answer).map(j => <details className="job-error" key={j.id}><summary>最近一次生成失败</summary><p>{j.error ?? '分析失败，请检查服务后手动重试。'}</p></details>)}
     <div id="panel-会议总结" role="tabpanel" aria-labelledby="tab-会议总结" hidden={tab !== '会议总结'}>
       <div className="summary-settings"><label className="inline-check"><input type="checkbox" checked={schedule.enabled} disabled={pending.schedule || ((!modelReady || detail.capabilities?.analysis_paused || after) && !schedule.enabled)} onChange={e => void setSchedule(e.target.checked, schedule.mode)} />自动总结</label>
         <select aria-label="自动总结频率" value={schedule.mode} disabled={pending.schedule} onChange={e => void setSchedule(schedule.enabled, e.target.value)}>{schedule.mode.startsWith('legacy') && <option value={schedule.mode}>沿用旧间隔 {schedule.mode === 'legacy_5' ? '5' : '10'} 分钟</option>}<option value="realtime">实时 · 60 字或 15 秒</option><option value="minute">1 分钟</option><option value="three_minutes">3 分钟</option></select>

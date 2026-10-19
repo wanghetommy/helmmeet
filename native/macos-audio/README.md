@@ -1,6 +1,6 @@
 # macOS 音频桥接
 
-已实现 AVAudioEngine 麦克风与 ScreenCaptureKit 系统声音，最低 macOS 14，arm64。Rust 通过 swift-rs 构建并静态链接。支持设备枚举、显式设备选择、双源启动回滚、16kHz 单声道转换和带主时钟时间的帧回调。
+已实现 AVAudioEngine 麦克风与 ScreenCaptureKit 系统声音，最低 macOS 14。arm64已有本机验证，x86_64独立包配置已接入、Intel设备待验收。Rust原生构建通过swift-rs静态链接，交叉构建使用显式Swift目标triple。支持设备枚举、显式设备选择、双源启动回滚、16kHz 单声道转换和带主时钟时间的帧回调。
 
 麦克风回调使用预分配缓冲池，转换在独立队列执行；Rust 有界通道进入独立持久化线程。停止时先取消音源、排空原生回调队列，再释放回调与转换器。队列不足、设备配置改变和系统睡眠产生中断信号，不静默切换输入。
 

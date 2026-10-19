@@ -11,6 +11,13 @@ use std::io::Read;
 use std::{sync::Arc, time::Duration};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+pub fn context_parameters() -> WhisperContextParameters<'static> {
+    let mut params = WhisperContextParameters::default();
+    // Intel packages use the CPU backend, including diagnostic entry points.
+    params.use_gpu(cfg!(all(target_os = "macos", target_arch = "aarch64")));
+    params
+}
+
 pub fn recover(rt: &Runtime) -> Result<(), String> {
     let rows = {
         let db = rt.db()?;
@@ -272,8 +279,7 @@ pub fn spawn(rt: Arc<Runtime>) -> Worker {
                         continue;
                     }
                 }
-                let mut params = WhisperContextParameters::default();
-                params.use_gpu(true);
+                let params = context_parameters();
                 match WhisperContext::new_with_params(&config.model_path, params) {
                     Ok(c) => {
                         context = Some(c);

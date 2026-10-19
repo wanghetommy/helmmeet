@@ -160,8 +160,7 @@ fn main() {
         );
         if let Some(path) = std::env::var_os("HELMMEET_TEST_WAV") {
             let cfg = rt.config.lock().unwrap().clone();
-            let mut params = whisper_rs::WhisperContextParameters::default();
-            params.use_gpu(true);
+            let params = asr::context_parameters();
             let ctx = whisper_rs::WhisperContext::new_with_params(&cfg.asr.model_path, params)
                 .expect("model load");
             let pcm = audio::read_wav(&std::path::PathBuf::from(path)).expect("synthetic wav");

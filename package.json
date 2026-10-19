@@ -17,6 +17,8 @@
     "build": "npm run build -w @helmmeet/desktop",
     "desktop:dev": "sh scripts/with-toolchain.sh npm run tauri -w @helmmeet/desktop -- dev",
     "desktop:build": "sh scripts/build-desktop.sh",
+    "desktop:build:intel": "sh scripts/build-desktop.sh --target x86_64-apple-darwin",
+    "desktop:build:arm64": "sh scripts/build-desktop.sh --target aarch64-apple-darwin",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/contracts/*.test.ts",
     "test:storage": "python3 -m unittest discover -s tests/integration -p 'test_*.py' -v",
@@ -25,7 +27,9 @@
     "doctor": "python3 scripts/doctor.py",
     "verify": "npm run typecheck && npm test && npm run test:storage && npm run check:docs && npm run build",
     "bootstrap": "sh scripts/bootstrap.sh",
-    "desktop:run": "sh scripts/run-desktop.sh"
+    "desktop:run": "sh scripts/run-desktop.sh",
+    "desktop:run:intel": "sh scripts/run-desktop.sh --target x86_64-apple-darwin",
+    "desktop:run:arm64": "sh scripts/run-desktop.sh --target aarch64-apple-darwin"
   },
   "devDependencies": {
     "@tauri-apps/cli": "2.12.3",

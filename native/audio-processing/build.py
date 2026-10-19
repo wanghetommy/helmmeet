@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import shutil
 import subprocess
@@ -14,7 +15,14 @@ import tarfile
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 CACHE = ROOT / '.tools/audio-processing'
-PREFIX = CACHE / 'prefix'
+TARGETS = {'aarch64-apple-darwin': 'arm64', 'x86_64-apple-darwin': 'x86_64'}
+
+
+def native_target():
+    arch = platform.machine()
+    if sys.platform != 'darwin' or arch not in ('arm64', 'x86_64'):
+        raise RuntimeError('Build requires macOS arm64 / x86_64')
+    return 'aarch64-apple-darwin' if arch == 'arm64' else 'x86_64-apple-darwin'
 
 
 def run(args, *, cwd=ROOT, env=None):
@@ -68,10 +76,20 @@ def main():
     parser.add_argument('--download', action='store_true')
     parser.add_argument('--jobs', type=int, default=6)
     parser.add_argument('--upstream-only', action='store_true')
+    parser.add_argument('--target', choices=TARGETS, default=None)
     args = parser.parse_args()
     if sys.platform != 'darwin' or not 1 <= args.jobs <= 32:
-        parser.error('This locked build targets macOS arm64; jobs must be 1..32')
+        parser.error('This locked build targets macOS arm64 / x86_64; jobs must be 1..32')
+    host_arch = TARGETS[native_target()]
+    target = args.target or native_target()
+    arch = TARGETS[target]
+    target_cache = CACHE / 'targets' / target
+    prefix = target_cache / 'prefix'
+    # pkgconf runs on the BUILD host; libraries and the probe target the requested Mac.
+    host_prefix = CACHE / 'host' / host_arch
     lock = json.loads((HERE / 'dependencies.lock.json').read_text())
+    if target not in lock['targets']:
+        raise RuntimeError('Target is not allowed by dependencies.lock.json')
     python = ROOT / '.tools/python/bin/python3'
     if not python.exists():
         raise RuntimeError('Run npm run bootstrap first (project-local Python/toolchain)')
@@ -80,35 +98,37 @@ def main():
         raise RuntimeError('Install pinned tools in .tools/python using build-requirements.txt')
     sources = {item['name']: prepare_source(item, args.download) for item in lock['sources']}
     env = os.environ.copy()
-    env.update(PATH=f'{PREFIX}/bin:{ROOT}/.tools/python/bin:' + env['PATH'],
-               MACOSX_DEPLOYMENT_TARGET='14.0', PKG_CONFIG=str(PREFIX / 'bin/pkgconf'),
-               PKG_CONFIG_LIBDIR=str(PREFIX / 'lib/pkgconfig'),
+    env.update(PATH=f'{host_prefix}/bin:{ROOT}/.tools/python/bin:' + env['PATH'],
+               MACOSX_DEPLOYMENT_TARGET='14.0', PKG_CONFIG=str(host_prefix / 'bin/pkgconf'),
+               PKG_CONFIG_LIBDIR=str(prefix / 'lib/pkgconfig'), PKG_CONFIG_PATH='',
                PKG_CONFIG_ALLOW_SYSTEM_CFLAGS='1', PKG_CONFIG_ALLOW_SYSTEM_LIBS='1')
-    build = CACHE / 'build'
-    build.mkdir(exist_ok=True)
-    if not (PREFIX / 'bin/pkgconf').exists():
-        directory = build / 'pkgconf'
-        directory.mkdir(exist_ok=True)
-        tool_env = env | {'CFLAGS': '-O2 -arch arm64 -mmacosx-version-min=14.0'}
-        run([sources['pkgconf'] / 'configure', f'--prefix={PREFIX}', '--disable-shared', '--enable-static'], cwd=directory, env=tool_env)
+    build = target_cache / 'build'
+    build.mkdir(parents=True, exist_ok=True)
+    if not (host_prefix / 'bin/pkgconf').exists():
+        directory = host_prefix / 'build'
+        directory.mkdir(parents=True, exist_ok=True)
+        tool_env = env | {'CFLAGS': f'-O2 -arch {host_arch} -mmacosx-version-min=14.0'}
+        run([sources['pkgconf'] / 'configure', f'--prefix={host_prefix}', '--disable-shared', '--enable-static'], cwd=directory, env=tool_env)
         run(['make', f'-j{args.jobs}'], cwd=directory, env=tool_env)
         run(['make', 'install'], cwd=directory, env=tool_env)
     cmake = ROOT / '.tools/python/bin/cmake'
     run([cmake, '-S', sources['abseil-cpp'], '-B', build / 'abseil', '-G', 'Ninja',
-         f'-DCMAKE_INSTALL_PREFIX={PREFIX}', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CXX_STANDARD=17',
-         '-DCMAKE_OSX_ARCHITECTURES=arm64', '-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0',
+         f'-DCMAKE_INSTALL_PREFIX={prefix}', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CXX_STANDARD=17',
+         f'-DCMAKE_OSX_ARCHITECTURES={arch}', '-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0',
+         '-DCMAKE_SYSTEM_NAME=Darwin', f'-DCMAKE_SYSTEM_PROCESSOR={arch}',
          '-DCMAKE_POSITION_INDEPENDENT_CODE=ON', '-DABSL_BUILD_TESTING=OFF', '-DABSL_ENABLE_INSTALL=ON',
          '-DABSL_PROPAGATE_CXX_STD=ON', '-DBUILD_SHARED_LIBS=OFF'], env=env)
     run([cmake, '--build', build / 'abseil', '--parallel', str(args.jobs)], env=env)
     run([cmake, '--install', build / 'abseil'], env=env)
     meson = ROOT / '.tools/python/bin/meson'
-    directory = build / 'apm-arm64'
-    signature = digest(HERE / 'build-support/arm64.ini') + digest(HERE / 'dependencies.lock.json')
+    directory = build / 'apm'
+    cross_file = HERE / 'build-support' / f'{arch}.ini'
+    signature = digest(cross_file) + digest(HERE / 'dependencies.lock.json')
     stamp = directory / '.helmmeet-config'
     configured = (directory / 'build.ninja').exists()
     setup = (['--reconfigure'] if stamp.exists() and stamp.read_text() == signature else ['--wipe']) if configured else []
     run([meson, 'setup', *setup, directory, sources['webrtc-audio-processing'],
-         f'--cross-file={HERE}/build-support/arm64.ini', f'--prefix={PREFIX}', '--libdir=lib',
+         f'--cross-file={cross_file}', f'--prefix={prefix}', '--libdir=lib',
          '--buildtype=release', '--default-library=static', '--wrap-mode=nofallback',
          '-Db_staticpic=true', '-Db_ndebug=true'], env=env)
     stamp.write_text(signature)
@@ -116,30 +136,30 @@ def main():
     if args.upstream_only:
         print('Locked upstream static build complete')
         return
-    output = CACHE / 'lib'
+    output = target_cache / 'lib'
     output.mkdir(exist_ok=True)
     wrapper = output / 'helmmeet_apm.o'
-    flags = ['-arch', 'arm64', '-mmacosx-version-min=14.0', '-std=c++17', '-O3', '-DNDEBUG',
+    flags = ['-arch', arch, '-mmacosx-version-min=14.0', '-std=c++17', '-O3', '-DNDEBUG',
              '-fvisibility=hidden', '-DWEBRTC_MAC', '-DWEBRTC_POSIX',
-             f'-I{HERE}/include', f'-I{sources["webrtc-audio-processing"]}/webrtc', f'-I{PREFIX}/include']
+             f'-I{HERE}/include', f'-I{sources["webrtc-audio-processing"]}/webrtc', f'-I{prefix}/include']
     run(['xcrun', 'clang++', *flags, '-c', HERE / 'src/helmmeet_apm.cpp', '-o', wrapper], env=env)
-    archives = sorted(directory.rglob('*.a')) + sorted((PREFIX / 'lib').glob('libabsl_*.a'))
+    archives = sorted(directory.rglob('*.a')) + sorted((prefix / 'lib').glob('libabsl_*.a'))
     bundle = output / 'libhelmmeet_apm.a'
     pending_bundle = output / 'libhelmmeet_apm.pending.a'
     run(['xcrun', 'libtool', '-static', '-o', pending_bundle, wrapper, *archives], env=env)
     pending_bundle.replace(bundle)
-    probe = CACHE / 'bin/apm-probe'
+    probe = target_cache / 'bin/apm-probe'
     probe.parent.mkdir(exist_ok=True)
     pending_probe = probe.with_suffix('.pending')
     run(['xcrun', 'clang++', *flags, '-Wall', '-Wextra', '-Werror', HERE / 'tests/probe.cpp', bundle,
          '-framework', 'Foundation', '-framework', 'CoreFoundation', '-Wl,-dead_strip', '-o', pending_probe], env=env)
     pending_probe.replace(probe)
     # Required redistribution notices are in source control and in feature builds.
-    sizes = {'target': lock['target'], 'apm_archives_bytes': sum(p.stat().st_size for p in directory.rglob('*.a')),
-             'abseil_archives_bytes': sum(p.stat().st_size for p in (PREFIX / 'lib').glob('libabsl_*.a')),
+    sizes = {'target': target, 'minimum_macos': '14.0', 'apm_archives_bytes': sum(p.stat().st_size for p in directory.rglob('*.a')),
+             'abseil_archives_bytes': sum(p.stat().st_size for p in (prefix / 'lib').glob('libabsl_*.a')),
              'bundle_bytes': bundle.stat().st_size, 'probe_bytes': probe.stat().st_size,
              'bundle_sha256': digest(bundle), 'dependencies_lock_sha256': digest(HERE / 'dependencies.lock.json')}
-    (CACHE / 'build-manifest.json').write_text(json.dumps(sizes, indent=2) + '\n')
+    (target_cache / 'build-manifest.json').write_text(json.dumps(sizes, indent=2) + '\n')
     print(json.dumps(sizes, indent=2))
 
 
