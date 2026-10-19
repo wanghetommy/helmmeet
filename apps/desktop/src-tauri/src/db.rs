@@ -24,6 +24,7 @@ pub struct Runtime {
     pub conn: Mutex<Connection>,
     pub config: Mutex<Config>,
     pub capture: Mutex<Option<CaptureSession>>,
+    pub voice: crate::voice::Hub,
     pub llm_gate: Mutex<()>,
     pub analysis_waiting: Mutex<Vec<(String, u8)>>,
     pub analysis_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -62,10 +63,10 @@ impl Runtime {
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(err)?;
-        if version > 10 {
+        if version > 11 {
             return Err("数据库版本较新，请使用匹配的应用版本".into());
         }
-        if version > 0 && version < 10 {
+        if version > 0 && version < 11 {
             let mut backup = Connection::open(root.join("before-migration.sqlite")).map_err(err)?;
             rusqlite::backup::Backup::new(&conn, &mut backup)
                 .map_err(err)?
@@ -126,6 +127,13 @@ impl Runtime {
             ))
             .map_err(err)?;
         }
+        if version < 11 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0011_duozhou_assistant.sql"
+            ))
+            .map_err(err)?;
+        }
+        conn.execute("UPDATE assistant_turns SET state='failed',error='应用退出中断了本次问答，可重新提问' WHERE state IN ('pending','running')", []).map_err(err)?;
         for template in [
             include_str!("../../../../templates/general.json"),
             include_str!("../../../../templates/project.json"),
@@ -154,6 +162,7 @@ impl Runtime {
             conn: Mutex::new(conn),
             config: Mutex::new(config),
             capture: Mutex::new(None),
+            voice: crate::voice::Hub::default(),
             llm_gate: Mutex::new(()),
             analysis_waiting: Mutex::new(vec![]),
             analysis_threads: Mutex::new(vec![]),
@@ -210,10 +219,29 @@ impl Runtime {
     }
     pub fn create(&self, title: &str, assistant: &str) -> Result<Value, String> {
         let meeting = id();
+        self.create_with_id(&meeting, title, assistant)
+    }
+    pub(crate) fn create_with_id(
+        &self,
+        meeting: &str,
+        title: &str,
+        assistant: &str,
+    ) -> Result<Value, String> {
+        uuid::Uuid::parse_str(meeting).map_err(|_| "会议ID无效")?;
         if title.trim().is_empty() || title.len() > 500 {
             return Err("请输入不超过 500 字节的会议名称".into());
         }
         let db = self.db()?;
+        if db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM meetings WHERE id=?)",
+                [meeting],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(err)?
+        {
+            return Ok(json!({"id":meeting}));
+        }
         let valid: u32 = db
             .query_row(
                 "SELECT count(*) FROM assistant_templates WHERE id=?",
@@ -237,7 +265,7 @@ impl Runtime {
         tx.execute("INSERT INTO audio_enhancement(meeting_id,mode) SELECT ?,value FROM app_preferences WHERE key='audio_enhancement_default'", [&meeting]).map_err(err)?;
         tx.commit().map_err(err)?;
         drop(db);
-        crate::product::initialize_analysis(self, &meeting)?;
+        crate::product::initialize_analysis(self, meeting)?;
         Ok(json!({"id":meeting}))
     }
     pub fn detail(&self, meeting: &str) -> Result<Value, String> {
@@ -452,7 +480,7 @@ mod recovery_tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                 .unwrap(),
-            10
+            11
         );
         assert!(root.join("before-migration.sqlite").is_file());
         drop(rt);

@@ -85,8 +85,52 @@ fn request_inner(
     config: &ModelConfig,
     messages: Value,
     check: &dyn Fn() -> Result<(), String>,
-    mut json_output: bool,
+    json_output: bool,
 ) -> Result<String, String> {
+    completion(&request_exchange(
+        rt,
+        config,
+        messages,
+        check,
+        json_output,
+        None,
+    )?)
+}
+pub fn request_agent(
+    rt: &Runtime,
+    config: &ModelConfig,
+    messages: Value,
+    tools: &Value,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, String> {
+    let data = request_exchange(rt, config, messages, check, false, Some(tools))?;
+    let choice = &data["choices"][0];
+    match choice["finish_reason"].as_str() {
+        Some("tool_calls") => {
+            if choice["message"]["tool_calls"]
+                .as_array()
+                .is_none_or(|a| a.is_empty() || a.len() > 5)
+            {
+                return Err("模型工具调用格式无效".into());
+            }
+        }
+        Some("stop") | None => {
+            completion(&data)?;
+        }
+        _ => {
+            completion(&data)?;
+        }
+    }
+    Ok(choice["message"].clone())
+}
+fn request_exchange(
+    rt: &Runtime,
+    config: &ModelConfig,
+    messages: Value,
+    check: &dyn Fn() -> Result<(), String>,
+    mut json_output: bool,
+    tools: Option<&Value>,
+) -> Result<Value, String> {
     let (endpoint, _) = config.endpoint()?;
     // Conservative byte budget; an unavailable tokenizer must not imply unlimited context.
     if messages.to_string().len()
@@ -107,10 +151,18 @@ fn request_inner(
         check()?;
         let key = models::secret(rt, config)?;
         check()?;
-        let mut request =
-            client
-                .post(endpoint.clone())
-                .json(&request_body(config, &messages, json_output));
+        let mut body = request_body(config, &messages, json_output);
+        if let Some(tools) = tools {
+            body["tools"] = tools.clone();
+        }
+        if body.to_string().len()
+            > config
+                .context_tokens
+                .saturating_sub(config.max_output_tokens) as usize
+        {
+            return Err("工具与会话超过上下文预算，请开始新对话或缩小范围".into());
+        }
+        let mut request = client.post(endpoint.clone()).json(&body);
         if let Some(key) = key {
             request = request.bearer_auth(key);
         }
@@ -156,7 +208,7 @@ fn request_inner(
         match response {
             Ok((code, _, Some(data))) if (200..300).contains(&code) => {
                 let data = data.map_err(str::to_string)?;
-                return completion(&data);
+                return Ok(data);
             }
             Ok((code, _, Some(Ok(body))))
                 if json_output && format_unsupported(code, &body) && attempt < 2 =>
@@ -204,7 +256,7 @@ fn cancellable_wait(
 
 use crate::meeting_prompts::RULES;
 
-fn parse(text: &str) -> Result<Value, String> {
+pub(crate) fn parse(text: &str) -> Result<Value, String> {
     let mut text = text.trim().trim_start_matches('\u{feff}').trim();
     if text.starts_with("<think>") {
         text = text
@@ -334,9 +386,16 @@ fn checked_request(
     rt: &Runtime,
     check: &dyn Fn() -> Result<(), String>,
     config: &ModelConfig,
-    input: Value,
+    mut input: Value,
     known: &HashSet<(String, u64)>,
 ) -> Result<Value, String> {
+    // Keep request task type distinct from summary item classification, including
+    // legacy callers and reduce requests. Never reinterpret invalid output as fact.
+    if let Some(object) = input.as_object_mut() {
+        if let Some(kind) = object.remove("kind") {
+            object.insert("task_type".into(), kind);
+        }
+    }
     let messages =
         json!([{"role":"system","content":RULES},{"role":"user","content":input.to_string()}]);
     let output = request(rt, config, messages.clone(), check)?;
@@ -354,7 +413,7 @@ fn checked_request(
     check()?;
     // Regenerate from the original evidence instead of doubling context with a malformed reply.
     let mut repair = messages;
-    repair.as_array_mut().unwrap().push(json!({"role":"user","content":format!("上次结果未通过校验：{reason}。请依据同一输入重新生成一个完整JSON对象，必须含summary和actions数组。summary每项须有text、kind、section、evidence，引用只能来自输入。没有依据不增加事实，缺失的行动负责人/日期用null。不要Markdown或说明文字。") }));
+    repair.as_array_mut().unwrap().push(json!({"role":"user","content":format!("上次结果未通过校验：{reason}。请依据同一输入重新生成一个完整JSON对象，必须含summary和actions数组。summary每项须有text、kind、section、evidence。kind只能是discussion、decision、risk、question、suggestion、unanswered之一，不能使用任务类型stage/minutes/answer或章节名；section只能是topic、outline、progress、open、minutes、answer之一。引用只能来自输入。没有依据不增加事实，缺失的行动负责人/日期用null。不要Markdown或说明文字。") }));
     let value = parse(&request(rt, config, repair, check)?)
         .map_err(|e| format!("重新生成后仍未得到有效结构：{e}"))?;
     validate(&value, known)?;
@@ -554,6 +613,20 @@ fn submit_inner(
             } else if let Some(id) = scope.strip_prefix("selection:") {
                 segments.retain(|s| s["id"].as_str() == Some(id));
             }
+            for segment in &mut segments {
+                let overlap = segment["state"] != "edited"
+                    && crate::voice::playback_overlap(
+                        &rt,
+                        &mid,
+                        segment["start_ms"].as_u64().unwrap_or(0),
+                        segment["end_ms"].as_u64().unwrap_or(0),
+                    )?;
+                segment["assistant_playback_overlap"] = json!(overlap);
+            }
+            let assistant_overlap = segments
+                .iter()
+                .filter(|s| s["assistant_playback_overlap"] == true)
+                .count();
             let context_allowed = detail["context_consent"] == true;
             let previous = if output_kind == "stage" && context_allowed {
                 detail["artifacts"]
@@ -620,8 +693,12 @@ fn submit_inner(
                     .collect::<Vec<_>>()
                     .join(" ")
             );
-            let knowledge = crate::knowledge::retrieve(&rt, &mid, &retrieval_query)?;
-            let task_context = json!({"kind":output_kind,"template":instructions,"question":input["question"],"meeting_context":detail["context"],"existing_actions":detail["actions"],"previous_summary":previous.as_ref().map(|a|&a["content"]),"chat_history":history,"selected_background":knowledge});
+            let knowledge = if context_allowed {
+                crate::knowledge::retrieve(&rt, &mid, &retrieval_query)?
+            } else {
+                json!({"bindings":[],"excerpts":[],"terms":[]})
+            };
+            let task_context = json!({"kind":output_kind,"template":instructions,"question":input["question"],"meeting_context":if context_allowed {detail["context"].clone()} else {Value::Null},"existing_actions":detail["actions"],"previous_summary":previous.as_ref().map(|a|&a["content"]),"chat_history":history,"selected_background":knowledge});
             let manifest = segments
                 .iter()
                 .map(|s| json!({"segment_id":s["id"],"revision":s["revision"]}))
@@ -631,6 +708,7 @@ fn submit_inner(
             rt.db()?.execute("UPDATE analysis_jobs SET idempotency_key=?,input_snapshot=?,state='running',attempts=attempts+1 WHERE id=?",params![frozen_key,snapshot.to_string(),task]).map_err(err)?;
             let known: HashSet<_> = segments
                 .iter()
+                .filter(|s| s["assistant_playback_overlap"] != true)
                 .map(|s| {
                     (
                         s["id"].as_str().unwrap_or("").into(),
@@ -661,7 +739,7 @@ fn submit_inner(
                     batches.push(std::mem::take(&mut current));
                     size = 0;
                 }
-                current.push(json!({"segment_id":seg["id"],"revision":seg["revision"],"text":seg["text"],"start_ms":seg["start_ms"]}));
+                current.push(json!({"segment_id":seg["id"],"revision":seg["revision"],"text":seg["text"],"start_ms":seg["start_ms"],"assistant_playback_overlap":seg["assistant_playback_overlap"]}));
                 size += n;
             }
             if !current.is_empty() {
@@ -744,10 +822,10 @@ fn submit_inner(
                 .flatten()
                 .filter(|c| c["state"] == "missing" || c["state"] == "failed")
                 .count();
-            let incomplete = covered < duration || gaps > 0;
+            let incomplete = covered < duration || gaps > 0 || assistant_overlap > 0;
             let version:u32=tx.query_row("SELECT coalesce(max(version),0)+1 FROM artifacts WHERE meeting_id=? AND type=?",params![mid,output_kind],|r|r.get(0)).map_err(err)?;
             let artifact = id();
-            let coverage = json!({"from_ms":0,"to_ms":duration,"processed_ms":covered,"incomplete":incomplete,"model":config.model,"profile_id":config.profile_id,"config_version":config.config_version,"profile_name":config.display_name,"base_url":config.base_url,"question":input["question"],"generated_at":now(),"assistant_id":assistant_id,"template_version":detail["template"]["version"],"manifest":manifest,"knowledge_manifest":knowledge["bindings"],"background_excerpts":knowledge["excerpts"],"incremental":previous.is_some()});
+            let coverage = json!({"from_ms":0,"to_ms":duration,"processed_ms":covered,"assistant_playback_overlap_segments":assistant_overlap,"incomplete":incomplete,"model":config.model,"profile_id":config.profile_id,"config_version":config.config_version,"profile_name":config.display_name,"base_url":config.base_url,"question":input["question"],"generated_at":now(),"assistant_id":assistant_id,"template_version":detail["template"]["version"],"manifest":manifest,"knowledge_manifest":knowledge["bindings"],"background_excerpts":knowledge["excerpts"],"incremental":previous.is_some()});
             tx.execute(
                 "INSERT INTO artifacts VALUES (?,?,?,?,?,?,?, 'model')",
                 params![
@@ -1072,6 +1150,42 @@ mod tests {
             .all(|r| r["response_format"]["type"] == "json_object"));
         assert!(!seen[1].to_string().contains("MALFORMED-REPLY"));
         assert!(seen[1].to_string().contains("合成原文"));
+    }
+    #[test]
+    fn minutes_task_type_is_separate_from_item_kind_and_invalid_kind_is_repaired() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (_root, rt, c) = fixture(&format!("http://{}", listener.local_addr().unwrap()));
+        let mut invalid = fact();
+        invalid["summary"][0]["kind"] = json!("minutes");
+        invalid["summary"][0]["section"] = json!("minutes");
+        let known = HashSet::from([("s1".into(), 1)]);
+        assert!(validate(&invalid, &known).unwrap_err().contains("分类"));
+        let mut valid = invalid.clone();
+        valid["summary"][0]["kind"] = json!("discussion");
+        let expected = valid.clone();
+        let server = thread::spawn(move || {
+            let mut seen = vec![];
+            for output in [invalid, valid] {
+                let (mut socket, _) = listener.accept().unwrap();
+                seen.push(receive(&mut socket));
+                respond(&mut socket, 200, reply(&output.to_string()));
+            }
+            seen
+        });
+        let output = checked_request(&rt, &|| Ok(()), &c,
+            json!({"kind":"minutes","transcript":[{"segment_id":"s1","revision":1,"text":"合成原文"}]}), &known).unwrap();
+        assert_eq!(output, expected);
+        let seen = server.join().unwrap();
+        for body in &seen {
+            let input: Value =
+                serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(input["task_type"], "minutes");
+            assert!(input.get("kind").is_none());
+        }
+        assert!(seen[1]["messages"][2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("不能使用任务类型"));
     }
     #[test]
     fn compatibility_fallback_only_follows_explicit_unsupported_json_error() {

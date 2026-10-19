@@ -15,6 +15,40 @@ use std::{
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
+    AssistantOpen {
+        meeting_id: Option<String>,
+        #[serde(default)]
+        general: bool,
+    },
+    AssistantList,
+    AssistantDetail {
+        conversation_id: String,
+    },
+    AssistantSubmit {
+        conversation_id: String,
+        question: String,
+        #[serde(default = "text_source")]
+        source: String,
+        utterance_id: Option<String>,
+        scope: Option<String>,
+    },
+    AssistantCancel {
+        turn_id: String,
+    },
+    AssistantClear {
+        conversation_id: String,
+    },
+    AssistantSettings,
+    AssistantVoiceStatus,
+    AssistantVoiceCommand {
+        action: String,
+    },
+    AssistantAccept {
+        proposal_id: String,
+    },
+    SaveAssistantSettings {
+        settings: Value,
+    },
     ProductPreferences,
     SaveProductPreferences {
         analysis_paused: bool,
@@ -270,6 +304,9 @@ pub enum Request {
 fn raw_variant() -> String {
     "raw".into()
 }
+fn text_source() -> String {
+    "text".into()
+}
 fn valid_text(text: &str, max: usize) -> Result<(), String> {
     if text.trim().is_empty() || text.len() > max {
         Err("文本为空或超过长度限制".into())
@@ -280,6 +317,39 @@ fn valid_text(text: &str, max: usize) -> Result<(), String> {
 pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
     rt.ensure_running()?;
     match request {
+        Request::AssistantOpen {
+            meeting_id,
+            general,
+        } => crate::assistant::open(&rt, meeting_id, general),
+        Request::AssistantList => crate::assistant::list(&rt),
+        Request::AssistantDetail { conversation_id } => {
+            crate::assistant::detail(&rt, &conversation_id)
+        }
+        Request::AssistantSubmit {
+            conversation_id,
+            question,
+            source,
+            utterance_id,
+            scope,
+        } => crate::assistant::submit_scoped(
+            rt,
+            &conversation_id,
+            &question,
+            &source,
+            utterance_id,
+            scope.as_deref().unwrap_or("all"),
+        ),
+        Request::AssistantCancel { turn_id } => crate::assistant::cancel(&rt, &turn_id),
+        Request::AssistantClear { conversation_id } => {
+            crate::assistant::clear(&rt, &conversation_id)
+        }
+        Request::AssistantVoiceStatus => crate::voice::status(&rt),
+        Request::AssistantVoiceCommand { action } => crate::voice::command(&rt, &action),
+        Request::AssistantSettings => crate::assistant::settings(&rt),
+        Request::AssistantAccept { proposal_id } => crate::assistant::accept(&rt, &proposal_id),
+        Request::SaveAssistantSettings { settings } => {
+            crate::assistant::save_settings(&rt, settings)
+        }
         Request::ProductPreferences => crate::product::preferences(&rt),
         Request::SaveProductPreferences {
             analysis_paused,

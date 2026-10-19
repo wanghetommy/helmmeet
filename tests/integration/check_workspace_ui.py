@@ -18,6 +18,8 @@ for(const [id,title,state] of [[a,'合成会议 A','recording'],[b,'合成会议
 const c='33333333-3333-4333-8333-333333333333';details[c]={...structuredClone(details[b]),id:c,title:'合成准备 C',state:'ready',duration_ms:0,segments:[],artifacts:[],enhancement:{...details[b].enhancement,mode:'off',echo_cancellation:false,aec_applied_ms:0,aec_bypass_ms:0,aec_status:{state:'waiting',reason:'waiting_for_audio',delay_ms:null},state:'queued',processed_ms:0,total_ms:0,playable_through_ms:0}};
 details[a].jobs=[{id:'new-success',type:'stage',state:'succeeded',error:null},{id:'old-json-failure',type:'stage',state:'failed',error:'模型结构化结果无效'}];
 details[b].jobs=[{id:'latest-json-failure',type:'final_map',state:'failed',error:'模型结构化结果无效'}];
+const assistantConversations={};let assistantPreferences={voice_enabled:false,wake_word:'小舵同学',silence_ms:1200,speak_answers:true,collections:[]};let voiceState={state:'off',meeting_id:a,can_enable:true,reason:'disabled',message:'语音唤醒未开启'};
+const assistantOpen=(mid,general)=>{mid=general?null:mid??Object.values(details).find(m=>['recording','paused','interrupted'].includes(m.state))?.id;const key=mid??'general';if(!assistantConversations[key])assistantConversations[key]={id:mid??'general-chat',meeting_id:mid??null,title:mid?details[mid].title:'与小舵聊一聊',turns:[],proposals:[]};return assistantConversations[key]};
 window.testCalls=[];
 window.testAudioStarts=[];
 const NativeAudioContext=window.AudioContext;
@@ -48,6 +50,16 @@ window.__TAURI_INTERNALS__={transformCallback:()=>1,unregisterCallback:()=>{},in
  case 'playback':{const end=Math.min(op.start_ms+30000,d.duration_ms);result={start_ms:op.start_ms,end_ms:end,samples:Array.from({length:(end-op.start_ms)*16},(_,i)=>Math.round(2000*Math.sin(2*Math.PI*440*(op.start_ms*16+i)/16000)))};break;}
  case 'copy_transcript':result={meeting_id:d.id,title:d.title,through_ms:60000,segments:d.segments};break;
  case 'set_summary_schedule':Object.assign(d.schedule,{enabled:op.enabled,mode:op.mode,version:d.schedule.version+1});result={saved:true};break;
+ case 'assistant_open':result=assistantOpen(op.meeting_id,op.general);break;
+ case 'assistant_list':result=[...Object.values(details).filter(d=>d.state!=='ready').map(d=>({id:d.id,meeting_id:d.id,title:d.title})),...Object.values(assistantConversations).filter(c=>!c.meeting_id).map(c=>({id:c.id,meeting_id:null,title:c.title}))];break;
+ case 'assistant_detail':result=Object.values(assistantConversations).find(c=>c.id===op.conversation_id);if(!result)throw Error('合成会话不存在');break;
+ case 'assistant_submit':{const c=Object.values(assistantConversations).find(c=>c.id===op.conversation_id);const id=crypto.randomUUID();c.turns.push({id,question:op.question,source:op.source,state:'succeeded',model_name:'合成假模型',answer:{blocks:[{kind:'suggestion',text:'建议先澄清目标的验收条件，再讨论行动。',sources:['method:duozhou-v1']}],evidence:[{source_id:'method:duozhou-v1',kind:'method',name:'小舵会议方法 v1',text:'目标需核对指标、基线和验收条件。'}]}});result={turn_id:id};break;}
+ case 'assistant_clear':Object.values(assistantConversations).find(c=>c.id===op.conversation_id).turns=[];result={cleared:true};break;
+ case 'assistant_cancel':result={cancelled:true};break;
+ case 'assistant_settings':result=assistantPreferences;break;
+ case 'save_assistant_settings':assistantPreferences=op.settings;voiceState=op.settings.voice_enabled?{state:'standby',meeting_id:a,wake_word:op.settings.wake_word,message:'待唤醒'}:{state:'off',meeting_id:a,can_enable:true,reason:'disabled',message:'语音唤醒未开启'};result=assistantPreferences;break;
+ case 'assistant_voice_status':result=voiceState;break;
+ case 'assistant_voice_command':if(op.action==='listen')voiceState={state:'listening',meeting_id:a,message:'合成输入：请说话，停顿后自动提交'};else if(op.action==='cancel')voiceState={state:'standby',meeting_id:a,message:'合成输入已取消'};else if(op.action==='submit'){const c=assistantOpen(a);c.turns.push({id:crypto.randomUUID(),source:'voice',question:'合成语音问题：目前目标是什么？',state:'succeeded',answer:{blocks:[{kind:'suggestion',text:'建议先澄清验收条件。',sources:[]}],evidence:[]}});voiceState={state:'standby',meeting_id:a,message:'合成语音回合已写入聊天'};}result={accepted:true};break;
  case 'record':if(op.action==='stop')throw Error('结束必须确认');d.state=op.action==='pause'?'paused':'recording';d.version++;if(op.action!=='pause')d.capture_epoch+='-new';d.capabilities=capabilities(d);result=d;break;
  case 'finish_meeting':if(op.expected_version!==d.version||op.capture_epoch!==d.capture_epoch)throw Error('录制会话已变化');d.state='finalizing';d.version++;d.capabilities=capabilities(d);result=d;break;
  case 'save_product_preferences':prefs={analysis_paused:op.analysis_paused,default_source_mask:op.default_source_mask,default_input_device:op.default_input_device};result={saved:true};break;
@@ -80,13 +92,30 @@ window.__TAURI_INTERNALS__={transformCallback:()=>1,unregisterCallback:()=>{},in
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port',type=int,default=1421)
+    parser.add_argument('--scenario',choices=['normal','voice-lifecycle','render-recovery'],default='normal')
     args=parser.parse_args()
     dist=ROOT/'apps/desktop/dist'
+    scenario = ""
+    if args.scenario == 'voice-lifecycle':
+        scenario = """
+const syntheticChat=assistantOpen(a);
+syntheticChat.turns=[
+{id:'old-failed',source:'voice',question:'合成失败问题',state:'failed',error:'合成服务失败',answer:{evidence:null}},
+{id:'old-cancelled',source:'voice',question:'合成取消问题',state:'cancelled',answer:null},
+{id:'old-success',source:'voice',question:'合成已完成问题',state:'succeeded',answer:{blocks:[{kind:'suggestion',text:'合成建议仍可阅读。',sources:[]}],evidence:[]}},
+{id:'pending-voice',source:'voice',question:'合成正在处理的问题',state:'pending',answer:null}];
+let syntheticPolls=0;
+const syntheticInvoke=window.__TAURI_INTERNALS__.invoke;
+window.__TAURI_INTERNALS__.invoke=async(cmd,args)=>{if(cmd==='dispatch'&&args.operation.kind==='assistant_detail'){syntheticPolls++;const t=syntheticChat.turns.at(-1);if(syntheticPolls>5){t.state='failed';t.error='合成超时，界面保持可操作';t.answer={evidence:null};}else if(syntheticPolls>2)t.state='running';}return syntheticInvoke(cmd,args)};
+"""
+    elif args.scenario == 'render-recovery':
+        scenario = "details[a].segments[0].text={synthetic_render_fault:true};"
+
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self,*a,**kw):super().__init__(*a,directory=str(dist),**kw)
         def do_GET(self):
             if self.path in ('/','/?test=product'):
-                body=(dist/'index.html').read_text().replace('<head>','<head><script>'+BOOT+'</script>').encode();self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+                body=(dist/'index.html').read_text().replace('<head>','<head><script>'+BOOT+scenario+'</script>').encode();self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
             else:super().do_GET()
         def log_message(self,*_):pass
     server=ThreadingHTTPServer(('127.0.0.1',args.port),Handler)

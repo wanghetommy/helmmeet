@@ -82,7 +82,7 @@ class ModelProfileMigrations(unittest.TestCase):
         self.db.close()
 
     def test_latest_schema_and_immutable_model_versions(self):
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 10)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 11)
         for statement in ("UPDATE model_configs SET config_json='{}'", 'DELETE FROM model_configs'):
             with self.assertRaises(sqlite3.IntegrityError):
                 self.db.execute(statement)
@@ -217,3 +217,28 @@ class ProductWorkspaceMigration(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT count(*) FROM meeting_knowledge_bindings').fetchone()[0], 0)
         self.assertEqual(self.db.execute('SELECT count(*) FROM knowledge_versions').fetchone()[0], 1)
         self.assertEqual(self.db.execute('PRAGMA foreign_key_check').fetchall(), [])
+
+class DuozhouMigration(unittest.TestCase):
+    def setUp(self):
+        self.db=sqlite3.connect(':memory:'); self.db.execute('PRAGMA foreign_keys=ON')
+        for migration in sorted(MIGRATION.parent.glob('*.sql')):
+            if migration.name<'0011': self.db.executescript(migration.read_text())
+        self.db.execute("INSERT INTO meetings(id,title,timezone,created_at) VALUES ('m','旧会议','Asia/Shanghai','now')")
+        self.db.execute("INSERT INTO analysis_jobs(id,meeting_id,idempotency_key,type,input_snapshot,generation,state,attempts) VALUES ('j','m','legacy','qa','{}',1,'succeeded',1)")
+        self.db.execute("INSERT INTO conversation_turns(job_id,meeting_id,epoch,question,scope,created_at) VALUES ('j','m',0,'旧问题','all','now')")
+        self.db.executescript((MIGRATION.parent/'0011_duozhou_assistant.sql').read_text())
+    def tearDown(self): self.db.close()
+    def test_old_qa_migrates_without_regranting_permissions(self):
+        self.assertEqual(self.db.execute("SELECT conversation_id,question,source,state,legacy_job_id FROM assistant_turns").fetchone(),('m','旧问题','text','succeeded','j'))
+        self.assertEqual(self.db.execute("SELECT analysis_mode FROM meetings WHERE id='m'").fetchone()[0],'transcript_only')
+        self.assertFalse(__import__('json').loads(self.db.execute("SELECT value FROM app_preferences WHERE key='assistant_settings'").fetchone()[0])['voice_enabled'])
+    def test_source_dedup_active_turn_and_cascade(self):
+        self.db.execute("INSERT INTO assistant_turns(id,conversation_id,epoch,question,source,utterance_id,state,created_at) VALUES ('a','m',0,'问题','voice','u','running','now')")
+        for sql in ["INSERT INTO assistant_turns(id,conversation_id,epoch,question,source,state,created_at) VALUES ('b','m',0,'问题2','text','pending','now')", "INSERT INTO assistant_turns(id,conversation_id,epoch,question,source,utterance_id,state,created_at) VALUES ('b','m',0,'问题2','voice','u','succeeded','now')"]:
+            with self.assertRaises(sqlite3.IntegrityError): self.db.execute(sql)
+        self.db.execute("INSERT INTO assistant_proposals(id,turn_id,payload_json) VALUES ('p','a','{}')")
+        self.db.execute("INSERT INTO assistant_playback_events(id,meeting_id,turn_id,text,start_host_ns) VALUES ('e','m','a','播报',0)")
+        self.db.execute("DELETE FROM meetings WHERE id='m'")
+        for table in ['assistant_conversations','assistant_turns','assistant_proposals','assistant_playback_events']:
+            self.assertEqual(self.db.execute('SELECT count(*) FROM '+table).fetchone()[0],0)
+        self.assertEqual(self.db.execute('PRAGMA foreign_key_check').fetchall(),[])

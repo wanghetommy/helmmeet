@@ -2,6 +2,7 @@
 mod acoustic_probe;
 mod analysis;
 mod asr;
+mod assistant;
 mod audio;
 mod commands;
 mod config;
@@ -20,6 +21,7 @@ mod models;
 mod processing;
 mod product;
 mod routes;
+mod voice;
 mod workspace;
 
 use serde::Serialize;
@@ -308,6 +310,7 @@ fn main() {
             enhancement::recover(&rt).map_err(std::io::Error::other)?;
             app.manage(lifecycle::Shutdown::new(vec![
                 asr::spawn(rt.clone()),
+                voice::background(rt.clone()),
                 workspace::background(rt.clone()),
                 enhancement::background(rt.clone()),
             ]));

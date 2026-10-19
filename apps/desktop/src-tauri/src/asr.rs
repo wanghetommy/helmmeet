@@ -230,9 +230,20 @@ pub fn spawn(rt: Arc<Runtime>) -> Worker {
         let mut loaded = String::new();
         let mut context = None;
         'jobs: while stop.wait(Duration::from_millis(700)) {
-            let job = match work(&rt) {
-                Ok(Some(v)) => v,
-                _ => continue,
+            let voice_question = crate::voice::take_question(&rt);
+            if voice_question
+                .as_ref()
+                .is_some_and(|q| !crate::voice::valid_question(&rt, q))
+            {
+                continue;
+            }
+            let job = if let Some(q) = &voice_question {
+                (q.meeting.clone(), 0, 0, false)
+            } else {
+                match work(&rt) {
+                    Ok(Some(v)) => v,
+                    _ => continue,
+                }
             };
             let (meeting, start, end, _) = job;
             if stop.is_stopped() {
@@ -243,6 +254,10 @@ pub fn spawn(rt: Arc<Runtime>) -> Worker {
                 Err(_) => continue,
             };
             if config.model_path.is_empty() {
+                if let Some(q) = &voice_question {
+                    crate::voice::question_failed(&rt, q, "请先配置本地转写模型");
+                    continue;
+                }
                 rt.error(&meeting, "未选择转写模型，录音保留，可配置后重试");
                 if let Ok(db) = rt.db() {
                     let _=db.execute("UPDATE meetings SET state='needs_attention' WHERE id=? AND state='finalizing'",[&meeting]);
@@ -274,6 +289,10 @@ pub fn spawn(rt: Arc<Runtime>) -> Worker {
                         if stop.is_stopped() {
                             break 'jobs;
                         }
+                        if let Some(q) = &voice_question {
+                            crate::voice::question_failed(&rt, q, "转写模型校验失败");
+                            continue 'jobs;
+                        }
                         rt.error(&meeting, "模型 SHA-256 不匹配或文件不可读");
                         stop.wait(Duration::from_secs(5));
                         continue;
@@ -289,6 +308,10 @@ pub fn spawn(rt: Arc<Runtime>) -> Worker {
                         if stop.is_stopped() {
                             break;
                         }
+                        if let Some(q) = &voice_question {
+                            crate::voice::question_failed(&rt, q, "转写模型加载失败");
+                            continue;
+                        }
                         rt.error(&meeting, "模型加载失败，请检查模型文件");
                         stop.wait(Duration::from_secs(5));
                         continue;
@@ -297,6 +320,39 @@ pub fn spawn(rt: Arc<Runtime>) -> Worker {
             }
             if stop.is_stopped() {
                 break;
+            }
+            if let Some(question) = voice_question {
+                if !crate::voice::valid_question(&rt, &question) {
+                    continue;
+                }
+                let lexicon =
+                    crate::knowledge::asr_context(&rt, &meeting).unwrap_or(json!({"prompt":""}));
+                let result = decode_with_partial(
+                    context.as_ref().unwrap(),
+                    &question.pcm,
+                    &config.language,
+                    None,
+                    Some(stop.clone()),
+                    lexicon["prompt"].as_str().unwrap_or(""),
+                );
+                match result {
+                    Ok(parts) if !stop.is_stopped() => crate::voice::recognized(
+                        rt.clone(),
+                        question,
+                        parts
+                            .into_iter()
+                            .map(|(_, _, t)| t)
+                            .collect::<Vec<_>>()
+                            .join(""),
+                    ),
+                    Err(_) => crate::voice::question_failed(
+                        &rt,
+                        &question,
+                        "问题识别失败，请重新提问或输入文字",
+                    ),
+                    _ => (),
+                }
+                continue;
             }
             let began = std::time::Instant::now();
             let lo = start.saturating_sub(750);

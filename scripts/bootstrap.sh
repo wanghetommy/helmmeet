@@ -22,4 +22,6 @@ if ! command -v cmake >/dev/null 2>&1 && [ ! -x .tools/python/bin/cmake ]; then
 fi
 npm ci
 sh scripts/with-toolchain.sh cargo fetch --locked
-printf '%s\n' '基础构建环境已准备。首次还需按 README 准备固定 APM 缓存，再运行 npm run desktop:dev 或 npm run desktop:build。'
+node scripts/prepare-agent.mjs --download
+python3 scripts/prepare-voice.py --download
+printf '%s\n' '基础与小舵运行时已准备。首次还需按 README 准备固定 APM 缓存，再运行 npm run desktop:dev 或 npm run desktop:build。'

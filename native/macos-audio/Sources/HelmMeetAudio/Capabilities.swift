@@ -28,7 +28,7 @@ private final class BufferPool {
 // conversion call. Never lend a tap's pooled buffer: it is refilled as soon as
 // deliver() returns. Keep the last loan alive until the converter requests more
 // input, and supply only the requested number of frames.
-private final class PacketConverter {
+final class PacketConverter {
     let converter: AVAudioConverter
     var loan: AVAudioPCMBuffer?
     init?(_ input: AVAudioFormat, _ output: AVAudioFormat) {

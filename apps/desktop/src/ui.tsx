@@ -6,6 +6,7 @@ export const modelName = (p: Pick<ModelProfile, 'display_name' | 'model'>) => p.
 export const typeName = (id: string, name?: string | null) => id === 'general' ? '通用会议' : name ?? '会议';
 export function Icon({ name, size = 18 }: { name: string; size?: number }) {
   const paths: Record<string, ReactNode> = {
+    chat: <><path d="M4 4h16v12H9l-5 4z" /><path d="M8 8h8m-8 4h6" /></>,
     meetings: <><rect x="3" y="4" width="18" height="17" rx="3" /><path d="M7 2v4m10-4v4M3 10h18m-13 5h3m3 0h2" /></>,
     library: <><path d="M4 4h6v16H4zm6 0h5v16h-5zm6 1 4-1 3 15-4 1z" /></>,
     settings: <><path d="m9 3-.5 2-2 1-2-.5-2 3 1.5 1.5v3L3 14.5l2 3 2-.5 2 1 .5 2h4l.5-2 2-1 2 .5 2-3-1.5-1.5v-3L20 8.5l-2-3-2 .5-2-1-.5-2z" /><circle cx="11.5" cy="11.5" r="3" /></>,

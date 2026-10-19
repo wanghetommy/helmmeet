@@ -1,21 +1,14 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { call, meetingPhase, type Action, type Artifact, type Detail } from './bridge';
+import { AssistantChat } from './AssistantChat';
 import { modelName } from './ui';
 const labels: Record<string, string> = { stage: '会议总结', minutes: '会议纪要', draft: '草稿', confirmed: '已确认', incomplete: '覆盖不完整', stale: '原文已更新', pending: '排队', running: '生成中', succeeded: '已完成', failed: '失败', cancelled: '已取消', todo: '未开始', doing: '进行中', done: '已完成', ignored: '已忽略' };
 const preferences = new Map<string, { summaryId: string; minutesTab: string; scrollTop?: number }>();
-const quick: Record<string, string[]> = {
-  weekly: ['哪些目标和进度尚未澄清？', '目前识别到哪些卡点和依赖？', '下期安排有哪些缺口？'],
-  review: ['评审还缺哪些验证？', '方案的假设和风险是什么？', '通过条件明确了吗？'],
-  decision: ['有哪些选项和判断标准？', '哪些决定其实尚未成立？', '执行条件有哪些未明确？'],
-  retro: ['事实与归因有哪些混淆？', '有哪些可验证的改进实验？'],
-  brainstorm: ['想法可以如何归类？', '哪些方向值得进一步验证？'],
-};
-export function AnalysisWorkspace({ detail, tab, setTab, question, setQuestion, scope, setScope, focusSegment, artifactView, configure, editAction, artifactId, setArtifactId, notify, fail }: {
+export function AnalysisWorkspace({ detail, tab, setTab, artifactView, configure, editAction, artifactId, setArtifactId, notify, fail, scope, setScope, focusSegment }: {
   detail: Detail; tab: string; setTab: (t: string) => void; question: string; setQuestion: (t: string) => void; scope: string; setScope: (t: string) => void; focusSegment: string;
   artifactView: (a: Artifact) => ReactNode; configure: () => void; editAction: (a: Action, proposal?: string) => void;
   artifactId: string; setArtifactId: (s: string) => void; notify: (s: string) => void; fail: (s: string) => void;
 }) {
-  const questionRef = useRef(question); questionRef.current = question;
   const [supersededFailures, setSupersededFailures] = useState<string[]>([]);
   const [pending, setPending] = useState<Record<string, boolean>>({});
   const [summaryId, setSummaryId] = useState(preferences.get(detail.id)?.summaryId ?? ''); const [minutesTab, setMinutesTab] = useState(preferences.get(detail.id)?.minutesTab ?? '纪要正文');
@@ -44,7 +37,7 @@ export function AnalysisWorkspace({ detail, tab, setTab, question, setQuestion, 
     <div className="assistant-scroll" ref={scroller} onScroll={e => preferences.set(detail.id, { summaryId, minutesTab, scrollTop: e.currentTarget.scrollTop })}>
     {!modelReady && <div className="banner">配置文本模型后可生成纪要或提问。<button onClick={configure}>选择模型</button></div>}
     {detail.capabilities?.analysis_paused && <div className="banner">全局分析已暂停，可在设置中恢复。</div>}
-    {!detail.segments.length && <p className="empty-note">已确认的转写文字出现后即可分析。</p>}
+    {!detail.segments.length && tab !== '会议助手' && <p className="empty-note">已确认的转写文字出现后即可分析。</p>}
     {running.map(j => <div role="status" className="banner" key={j.id}>{labels[j.state]} · 录音与转写继续<button onClick={() => void work(j.id, { kind: 'cancel_job', job_id: j.id })}>取消本次</button></div>)}
     {detail.jobs.filter(j => j.type === jobType).slice(0, 1).filter(j => j.state === 'failed' && !supersededFailures.includes(j.id) && !pending.stage && !pending.minutes && !pending.answer).map(j => <details className="job-error" key={j.id}><summary>最近一次生成失败</summary><p>{j.error ?? '分析失败，请检查服务后手动重试。'}</p></details>)}
     <div id="panel-会议总结" role="tabpanel" aria-labelledby="tab-会议总结" hidden={tab !== '会议总结'}>
@@ -62,12 +55,7 @@ export function AnalysisWorkspace({ detail, tab, setTab, question, setQuestion, 
       {(after ? tab === '会议纪要' : minutesTab === '纪要正文') ? <>{minutes.length > 0 && <select aria-label="纪要版本" value={minute?.id ?? ''} onChange={e => setArtifactId(e.target.value)}>{minutes.map(a => <option value={a.id} key={a.id}>v{a.version} · {labels[a.status] ?? a.status}{a.content.manual_text ? ' · 人工版' : ''}</option>)}</select>}{minute ? artifactView(minute) : <div className="empty-note">按本场模板整理正式草稿。结束录制不会自动生成纪要。</div>}</> : <>{detail.actions.map(a => <article className="action-card" key={a.id}><div className="section-line"><strong>{a.task}</strong><span className="tag">{a.confirmation_state === 'pending' ? '待确认' : labels[a.confirmation_state] ?? '待确认'}</span></div><p>{a.owner_text || '负责人待确认'} · {a.due_text || '时间待确认'}</p><small>{labels[a.execution_state]}</small><button onClick={() => editAction(a)}>核对 / 编辑</button>{detail.proposals.filter(p => p.action_id === a.id).map(p => <div className="banner" key={p.id}>有新的字段建议<button onClick={() => editAction({ ...a, ...p.changes }, p.id)}>核对建议</button></div>)}</article>)}{!detail.actions.length && <p className="empty-note">共享行动候选将在分析后出现；不需要先生成纪要。</p>}</>}
     </div>
     <div id="panel-会议助手" role="tabpanel" aria-labelledby="tab-会议助手" hidden={tab !== '会议助手'}>
-      <div className="quick-questions">{(quick[detail.assistant_id] ?? ['目前有哪些目标未澄清？', '识别到哪些卡点和风险？', '请 review 讨论中的遗漏与未决事项。']).map(q => <button key={q} onClick={() => setQuestion(q)}>{q}</button>)}</div>
-      <p className="muted">{detail.context_consent ? '结合本场原文与最近 8 轮对话回答，可点击引用核对。' : '仅本次问题与所选原文，不携带历史对话。'}</p>
-      <button disabled={pending.clear} onClick={() => void work('clear', { kind: 'clear_conversation' })}>开始新对话</button>
-      {detail.legacy_answer_ids.length > 0 && <details><summary>旧版独立问答（{detail.legacy_answer_ids.length}）</summary>{detail.artifacts.filter(a => detail.legacy_answer_ids.includes(a.id)).slice().reverse().map(artifactView)}</details>}
-      <div className="answers">{detail.conversation.map(turn => <div key={turn.job_id}><p className="asked">{turn.question} <small>· {turn.scope === 'all' ? '整场' : turn.scope === 'recent' ? '最近10分钟' : '选中片段'}</small></p>{turn.artifact_id ? (() => { const a = detail.artifacts.find(a => a.id === turn.artifact_id); return a && artifactView(a); })() : <p className="muted">{labels[turn.state] ?? turn.state}{turn.error ? `：${turn.error}` : ''}</p>}</div>)}</div>
-      <form className="question-form" onSubmit={e => { e.preventDefault(); if (!enabled || pending.answer || !question.trim()) return; const q = question; void work('answer', { kind: 'analyze', analysis_type: 'answer', question: q, scope: scope === 'selection' ? `selection:${focusSegment}` : scope }).then(ok => { if (ok && questionRef.current === q) setQuestion(''); }); }}><select aria-label="问题范围" value={scope} onChange={e => setScope(e.target.value)}><option value="all">整场已确认内容</option><option value="recent">最近 10 分钟</option><option value="selection" disabled={!focusSegment}>选中的原文片段</option></select><textarea aria-label="会议问题" value={question} placeholder="提问或追问，请助手 review 本场讨论…" onChange={e => setQuestion(e.target.value)} /><button className="primary" disabled={!enabled || pending.answer || !question.trim()}>发送</button></form>
+      <AssistantChat scope={scope} setScope={setScope} focusSegment={focusSegment} meetingId={detail.id} embedded fail={fail} />
     </div>
     {tab === '会议总结' && summary && <button onClick={() => { void work('note', { kind: 'note', time_ms: Math.floor(summary.coverage.to_ms), text: (summary.content.summary ?? []).map(s => s.text).join('\n') }).then(ok => { if (ok) notify(`已另存「${detail.title}」总结笔记`); }); }}>另存为笔记</button>}
     <div className="button-row">{(tab === '会议总结' ? summary : tab === '会议纪要' ? minute : undefined) && <button onClick={() => { const a = tab === '会议总结' ? summary : minute; void work('copy', { kind: 'copy_artifact', artifact_id: a?.id }).then(ok => { if (ok) notify(`已复制「${detail.title}」${tab === '会议总结' ? '总结' : '纪要'}`); }); }}>复制{tab === '会议总结' ? '总结' : '纪要'}</button>}</div>

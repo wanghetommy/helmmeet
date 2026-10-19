@@ -6,16 +6,17 @@
   "description": "Local-first personal meeting assistant for macOS",
   "workspaces": [
     "apps/desktop",
-    "packages/contracts"
+    "packages/contracts",
+    "agent"
   ],
   "engines": {
-    "node": ">=22.18.0",
+    "node": ">=22.19.0",
     "npm": ">=10"
   },
   "scripts": {
     "dev": "npm run dev -w @helmmeet/desktop",
     "build": "npm run build -w @helmmeet/desktop",
-    "desktop:dev": "sh scripts/with-toolchain.sh npm run tauri -w @helmmeet/desktop -- dev",
+    "desktop:dev": "sh scripts/dev-desktop.sh",
     "desktop:build": "sh scripts/build-desktop.sh",
     "desktop:build:intel": "sh scripts/build-desktop.sh --target x86_64-apple-darwin",
     "desktop:build:arm64": "sh scripts/build-desktop.sh --target aarch64-apple-darwin",
@@ -25,11 +26,14 @@
     "test:core": "sh scripts/with-toolchain.sh cargo test --workspace",
     "check:docs": "python3 scripts/check_docs.py",
     "doctor": "python3 scripts/doctor.py",
-    "verify": "npm run typecheck && npm test && npm run test:storage && npm run check:docs && npm run build",
+    "verify": "npm run typecheck && npm test && npm run test:agent && npm run test:storage && npm run check:docs && npm run build",
     "bootstrap": "sh scripts/bootstrap.sh",
     "desktop:run": "sh scripts/run-desktop.sh",
     "desktop:run:intel": "sh scripts/run-desktop.sh --target x86_64-apple-darwin",
-    "desktop:run:arm64": "sh scripts/run-desktop.sh --target aarch64-apple-darwin"
+    "desktop:run:arm64": "sh scripts/run-desktop.sh --target aarch64-apple-darwin",
+    "test:agent": "node --test agent/tests/*.test.mjs",
+    "agent:prepare": "node scripts/prepare-agent.mjs",
+    "voice:prepare": "python3 scripts/prepare-voice.py"
   },
   "devDependencies": {
     "@tauri-apps/cli": "2.12.3",

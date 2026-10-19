@@ -4,7 +4,7 @@ import { call, desktop, meetingPhase, type Action, type Artifact, type Detail, t
 import { PcmPlayback, type PcmChunk } from './PcmPlayback';
 import type { PreparationInput } from './MeetingPreparation';
 import type { Selection } from './KnowledgeLibrary';
-export type View = 'meetings' | 'knowledge' | 'settings';
+export type View = 'meetings' | 'assistant' | 'knowledge' | 'settings';
 interface Draft { phase?: 'preparation' | 'live' | 'after'; question: string; note: string; scope: string; search: string; tab: string; transcriptTab: string; artifactId: string; scrollTop: number; follow: boolean }
 export function useMeetingController() {
   const [view, setView] = useState<View>('meetings'); const [selected, setSelected] = useState(''); const [detail, setDetail] = useState<Detail>(); const [meetings, setMeetings] = useState<Meeting[]>([]);

@@ -460,7 +460,7 @@ mod tests {
     }
     fn respond(s: &mut TcpStream, input: &Value, code: u16) {
         let r = &input["transcript"][0];
-        let section = match input["kind"].as_str() {
+        let section = match input["task_type"].as_str() {
             Some("stage") => "topic",
             Some("minutes") => "minutes",
             _ => "answer",
@@ -583,8 +583,8 @@ mod tests {
         let auto2 = analysis::submit_auto(rt.clone(), &a, 2).unwrap();
         wait(&rt, &a, &auto2);
         let seen = server.join().unwrap();
-        assert_eq!(seen[0]["kind"], "answer");
-        assert_eq!(seen[1]["kind"], "stage");
+        assert_eq!(seen[0]["task_type"], "answer");
+        assert_eq!(seen[1]["task_type"], "stage");
         assert_eq!(seen[1]["transcript"].as_array().unwrap().len(), 2);
         let ids = seen[2]["transcript"]
             .as_array()

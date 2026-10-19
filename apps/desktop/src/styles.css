@@ -18,3 +18,23 @@
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
 
 .sidebar{position:relative;padding-bottom:110px}.sidebar nav .settings-nav{position:absolute;bottom:62px;left:16px;right:16px;margin:0}.sidebar-footer{position:absolute;bottom:16px;left:20px;right:16px}.nav-collapsed .sidebar nav .settings-nav{left:14px;right:auto}.nav-collapsed .sidebar-footer{left:18px;right:auto}.background-sources{border-top:1px solid var(--line);padding-top:13px;margin-top:20px}.background-sources small{color:var(--muted);font-size:11px}.background-sources p{background:var(--hm-color-sidebar);padding:12px;border-radius:6px;font-size:12px;margin-top:12px;white-space:pre-wrap;overflow-wrap:anywhere}.background-sources summary{margin-bottom:10px}@media(max-width:900px){.sidebar nav .settings-nav,.nav-collapsed .sidebar nav .settings-nav{left:11px;right:auto}.sidebar-footer,.nav-collapsed .sidebar-footer{left:15px;right:auto}.sidebar{padding-bottom:110px}}@media(max-width:620px){.sidebar nav .settings-nav,.nav-collapsed .sidebar nav .settings-nav{left:8px}.sidebar-footer,.nav-collapsed .sidebar-footer{left:11px}.sidebar,.nav-collapsed .sidebar{padding-bottom:110px}}
+
+/* Duozhou: one conversation for typed and spoken questions. */
+.duozhou-chat{display:flex;flex-direction:column;min-height:0;flex:1;gap:14px;overflow:hidden}
+.duozhou-chat.page-pad{height:100%;max-width:1160px;width:100%;margin:0 auto}
+.duozhou-heading{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}
+.duozhou-heading h1{font-size:23px;margin:0 0 7px}.duozhou-heading .muted{margin:0}
+.duozhou-messages{flex:1;min-height:180px;overflow:auto;overscroll-behavior:contain;padding:8px 5px 14px}
+.duozhou-turn{margin-bottom:24px}.duozhou-user{margin-left:auto;max-width:85%;width:fit-content;background:var(--tint);padding:12px 16px;border-radius:12px}
+.duozhou-user p{margin:6px 0 0}.duozhou-answer{margin-top:14px;padding:16px;background:var(--surface);border:1px solid var(--line);border-radius:12px}
+.duozhou-answer>strong{color:var(--brand)}.duozhou-block{padding-top:12px}.duozhou-block p{line-height:1.8;margin:8px 0}
+.duozhou-citation{font-size:12px;color:var(--muted);padding:6px 0}.duozhou-citation summary{cursor:pointer;color:var(--brand)}
+.duozhou-proposal{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--subtle)}
+.duozhou-quick{display:flex;gap:7px;flex-wrap:wrap}.duozhou-quick button{font-size:12px}
+.duozhou-compose textarea{width:100%;min-height:74px;max-height:160px;resize:vertical}.duozhou-compose .section-line{margin-top:8px;gap:10px}
+.duozhou-compose .section-line .micro{flex:1}.embedded-chat{min-height:420px;height:100%;padding:8px 0}.embedded-chat .duozhou-heading h1{font-size:18px}
+#panel-会议助手{height:100%;min-height:450px}.error-text{color:var(--danger)}
+@media(max-width:800px){.duozhou-heading select{max-width:210px}.duozhou-chat.page-pad{padding:18px 14px}.duozhou-user{max-width:95%}.duozhou-compose .micro{display:none}.duozhou-heading h1{font-size:21px}}
+.assistant-voicebar{position:sticky;top:0;z-index:10;display:flex;gap:12px;align-items:center;justify-content:space-between;margin:12px 24px 0;padding:10px 14px;background:#edf3ff;border:1px solid #c8d7f5;border-radius:12px;box-shadow:0 4px 16px #0a32810a}.voice-summary{display:flex;align-items:center;gap:8px;background:transparent;border:0;text-align:left;min-width:0}.voice-summary span:last-child{font-size:12px;color:#395274}.voice-listening{border-color:#0a3281}.assistant-collections{display:flex;flex-direction:column;gap:8px;max-height:280px;overflow:auto}.duozhou-range{padding:0 0 8px}.duozhou-range label{display:flex;align-items:center;gap:8px;font-size:12px}.duozhou-range select{max-width:190px}.duozhou-chat .banner{margin-bottom:12px}
+@media(max-width:900px){.assistant-voicebar{margin:8px 12px 0;align-items:flex-start;flex-wrap:wrap}.assistant-voicebar .button-row{flex-wrap:wrap}.voice-summary{flex-wrap:wrap}}
+.duozhou-range label{flex-direction:row;justify-content:flex-start;margin:0}.embedded-chat .duozhou-heading .eyebrow{display:none}.embedded-chat .duozhou-heading h1{font-size:16px}.embedded-chat .duozhou-heading .muted{font-size:11px}

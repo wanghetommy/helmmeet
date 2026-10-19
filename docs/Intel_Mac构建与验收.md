@@ -2,6 +2,8 @@
 
 2026年10月19日 · R54/A54/TC-54 · 源码接入，Intel真人/设备验收待用户提供机器
 
+最新小舵首版双架构结果见[开发验证](./小舵全局助手开发验证.md)。下方“本轮工程结果”及ZIP校验值为小舵接入前的历史构建；当前新包以该开发验证中的.app与架构结果为准，旧ZIP不包含小舵功能。
+
 ## 支持范围
 
 - 独立`x86_64-apple-darwin`包和`aarch64-apple-darwin`包，最低macOS 14.0。不支持32位x86；本轮不合并Universal包，不降低系统版本要求。
@@ -11,7 +13,7 @@
 
 ## 在真实Intel Mac构建
 
-前提：macOS 14+、兼容的Xcode/Command Line Tools、Node.js 22.18+、npm 10+、Python 3.11+。不要复制其他架构的`.tools`或`target`缓存。
+前提：macOS 14+、兼容的Xcode/Command Line Tools、Node.js 22.19+、npm 10+、Python 3.11+。不要复制其他架构的`.tools`或`target`缓存。
 
 ```sh
 npm run bootstrap
@@ -29,6 +31,7 @@ npm run desktop:run:intel
 
 ```sh
 sh scripts/with-toolchain.sh rustup target add x86_64-apple-darwin
+node scripts/prepare-agent.mjs --download --target x86_64-apple-darwin
 npm run desktop:build:intel
 ```
 

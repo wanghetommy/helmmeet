@@ -44,3 +44,33 @@ export function parseSystemStatus(value: unknown): SystemStatus {
     capture_available: input.capture_available, asr_available: input.asr_available,
     analysis_available: input.analysis_available };
 }
+
+/** Global Duozhou assistant. No stored model secrets are exposed by these DTOs. */
+export type AssistantInputSource = 'text' | 'voice';
+export type AssistantVoiceState = 'off' | 'standby' | 'testing_wake' | 'listening' | 'transcribing' | 'thinking' | 'speaking' | 'error';
+export interface AssistantPreferences {
+  voice_enabled: boolean;
+  wake_word: string;
+  silence_ms: number;
+  speak_answers: boolean;
+  collections: { set_id: string; version: number }[];
+}
+export interface AssistantEvidence {
+  source_id: string;
+  kind: 'meeting' | 'knowledge' | 'method';
+  text: string;
+  name?: string;
+  meeting_id?: string;
+  segment_id?: string;
+  revision?: number;
+  start_ms?: number;
+  version?: number;
+  stale?: boolean;
+  assistant_playback_overlap?: boolean;
+}
+export interface AssistantAnswer {
+  blocks: { kind: 'meeting_fact' | 'knowledge' | 'suggestion' | 'unanswered' | 'legacy'; text: string; sources: string[] }[];
+  evidence: AssistantEvidence[];
+  legacy?: boolean;
+  coverage?: { scope: string; through_ms: number | null; transcript_returned: number; transcript_total: number };
+}

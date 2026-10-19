@@ -21,8 +21,19 @@ done
 if [ "$TASK_EXPECT_TARGET" = true ]; then echo '--target缺少值' >&2; exit 1; fi
 task_validate_target "$TASK_TARGET"
 export HELMMEET_BUILD_TARGET="$TASK_TARGET"
-sh scripts/with-toolchain.sh npm run tauri -w @helmmeet/desktop -- build "$@"
+TASK_AGENT_TARGET=$TASK_TARGET
+if [ -z "$TASK_AGENT_TARGET" ]; then
+  TASK_AGENT_TARGET=$(sh scripts/with-toolchain.sh rustc -vV | sed -n 's/^host: //p')
+fi
+export HELMMEET_BUILD_TARGET="$TASK_AGENT_TARGET"
+node scripts/prepare-agent.mjs --target "$TASK_AGENT_TARGET"
+python3 scripts/prepare-voice.py
+TASK_RESOURCE_CONFIG="$TASK_ROOT/.tools/bundle-config/$TASK_AGENT_TARGET.json"
+node scripts/agent-bundle-config.mjs --target "$TASK_AGENT_TARGET"
+sh scripts/with-toolchain.sh npm run tauri -w @helmmeet/desktop -- build --config "$TASK_RESOURCE_CONFIG" "$@"
 task_bundle_directory
+# Each executable is signed explicitly before the containing app.
+/usr/bin/codesign --force --sign - --identifier com.helmmeet.agent.node "$TASK_BUNDLE/Contents/Resources/agent-runtime/bin/node"
 # Ad-hoc signing binds Info.plist and resources for local development; not notarization.
 /usr/bin/codesign --force --deep --sign - --identifier com.helmmeet.desktop "$TASK_BUNDLE"
 /usr/bin/codesign --verify --deep --strict "$TASK_BUNDLE"

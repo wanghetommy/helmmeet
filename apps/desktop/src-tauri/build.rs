@@ -41,6 +41,46 @@ fn main() {
         println!("cargo:rustc-link-lib=c++");
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
     }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let voice = std::process::Command::new("python3")
+        .arg(root.join("native/voice-assistant/build.py"))
+        .args(["--target", &target])
+        .output()
+        .expect("voice wrapper build");
+    assert!(
+        voice.status.success(),
+        "Voice build failed: {}",
+        String::from_utf8_lossy(&voice.stderr)
+    );
+    println!("cargo:rerun-if-changed=../../../native/voice-assistant");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        root.join(".tools/voice/targets").join(&target).display()
+    );
+    println!("cargo:rustc-link-lib=static=helmmeet_voice");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        root.join(".tools/voice/vendor/sherpa-onnx-v1.13.8-osx-universal2-static-no-tts-lib/lib")
+            .display()
+    );
+    for library in [
+        "sherpa-onnx-c-api",
+        "sherpa-onnx-core",
+        "onnxruntime",
+        "kaldi-native-fbank-core",
+        "kissfft-float",
+        "sherpa-onnx-fst",
+        "sherpa-onnx-fstfar",
+        "sherpa-onnx-kaldifst-core",
+        "kaldi-decoder-core",
+        "ssentencepiece_core",
+    ] {
+        println!("cargo:rustc-link-lib=static={library}");
+    }
+    println!("cargo:rustc-link-lib=c++");
+    for framework in ["Accelerate", "CoreML", "Foundation"] {
+        println!("cargo:rustc-link-lib=framework={framework}");
+    }
     println!("cargo:rerun-if-changed=../../../native/macos-audio/Sources");
     if std::env::var("HOST").expect("Cargo host") == target {
         swift_rs::SwiftLinker::new("14.0")

@@ -767,6 +767,9 @@ impl Writer {
                         let target = frame.host.saturating_sub(origin) / 62500;
                         match track.frame(&owner, &mid, base, target, &frame.samples) {
                             Ok(correction) => {
+                                if frame.source == 0 {
+                                    crate::voice::feed(&owner, &mid, frame.host, &frame.samples);
+                                }
                                 maximum = maximum.max(track.position / 16);
                                 let rms = (frame.samples.iter().map(|v| v * v).sum::<f32>()
                                     / frame.samples.len() as f32)

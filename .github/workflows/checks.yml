@@ -49,6 +49,8 @@ jobs:
       - run: npm run bootstrap
       - run: .tools/python/bin/python3 -m pip install --require-hashes -r native/audio-processing/build-requirements.txt
       - run: .tools/python/bin/python3 native/audio-processing/build.py --target ${{ matrix.target }} --download
+      - run: node scripts/prepare-agent.mjs --download --target ${{ matrix.target }}
+      - run: python3 scripts/prepare-voice.py --download
       - run: npm run build
       - name: Compile target tests (cross builds do not execute)
         run: sh scripts/with-toolchain.sh cargo check --workspace --tests --locked --target ${{ matrix.target }}

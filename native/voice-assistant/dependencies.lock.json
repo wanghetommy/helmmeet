@@ -1,0 +1,37 @@
+{
+  "sherpa": "1.13.8",
+  "library": {
+    "archive": "sherpa-onnx-v1.13.8-osx-universal2-static-no-tts-lib.tar.bz2",
+    "asset_id": 555480799,
+    "sha256": "7bbaa4bf1c73a68cc9ea126967278873c86eeeb99774b544f3644e0a6200e993"
+  },
+  "kws": {
+    "archive": "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
+    "sha256": "68447f4fbc67e70eee3a93961f36e81e98f47aef73ce7e7ca00885c6cd3616a6",
+    "files": {
+      "encoder.onnx": {
+        "source": "encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx",
+        "sha256": "2ca84d6bfe73e1ea3c9c49f600f7cad1c9ddd423c53c906b8bfe802444dd78d5"
+      },
+      "decoder.onnx": {
+        "source": "decoder-epoch-13-avg-2-chunk-8-left-64.onnx",
+        "sha256": "63a22dd60f40fff082ac3e09afa507f6787da36df76ded2fbe145fa233e22c21"
+      },
+      "joiner.onnx": {
+        "source": "joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx",
+        "sha256": "190d4067b4cc20b72a42a1916e69d92052000fb7051a427ebb1bc72a69207dc1"
+      },
+      "tokens.txt": {
+        "source": "tokens.txt",
+        "sha256": "2d3f32311f9b692b964da3c90e830258d3e78e013cb0c992dbfb15cd5a1a71b0"
+      }
+    },
+    "asset_id": 331699066
+  },
+  "vad": {
+    "archive": "silero_vad.onnx",
+    "asset_id": 271935959,
+    "sha256": "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
+  },
+  "header_sha256": "2a1b95084be8fd1deb3228fcad2fd3f7f0258b64582f7402281ec174c7b7f4ce"
+}

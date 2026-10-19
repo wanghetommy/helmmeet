@@ -32,7 +32,7 @@ npm run desktop:run
 
 ## 从源码开发
 
-前提：Node.js 22.18+、npm 10+、Python 3.11+、Xcode Command Line Tools。隔离工具安装在 `.tools/`，不修改全局 PATH：
+前提：Node.js 22.19+、npm 10+、Python 3.11+、Xcode Command Line Tools。隔离工具安装在 `.tools/`，不修改全局 PATH：
 
 ```sh
 npm run bootstrap
@@ -126,3 +126,12 @@ scripts/                   隔离工具、运行、构建和检查
 正式界面已按准备、会中、会后三阶段组织，使用浅色品牌蓝与帆船。默认首页为会议列表，全局资料/词库按会议选用版本；模型可用的新会议无需重复允许，自动总结默认关闭。结束录制统一二次确认；会后手动生成/核对纪要，原文和录音按需展开。开发与验收记录见[整体产品改版开发验证](docs/整体产品改版开发验证.md)。
 
 结构化结果、DeepSeek输出模式和跨平台文件凭据的修复与迁移边界见[本次修复记录](docs/结构化输出与凭据文件修复.md)。
+
+
+## 小舵全局助手
+
+左侧“小舵助手”可通用聊天、自动围绕当前会议或选择历史会议；会议内助手面板共用相同消息。文字与语音都使用Pi1.3.0和用户已配置的文本模型，引用可回查，准备/笔记草稿需接受后生效。
+
+首次开发额外准备：`node scripts/prepare-agent.mjs --download`、`python3 scripts/prepare-voice.py --download`（bootstrap已包含）；Intel明确加`--target x86_64-apple-darwin`准备Node。普通dev/build只读已校验缓存，不隐式下载。打包应用携带Node和约5.8MiB KWS/VAD资源，用户不需安装SDK/CLI；Whisper仍使用本机所选GGML。
+
+“全局设置→小舵助手”开启会议中语音，默认唤醒“小舵同学”、回应“小舵在”。仅会议正在录制且麦克风开启时监听；其他时间只文字。可点击说话或Ctrl+Shift+Space，默认停顿1.2秒提交；语音问题与回答同时在聊天中。使用macOS本机中文TTS；停止播报保留文字，播报中可按钮打断。自动语音打断与真实房间指标尚待验收，详见[交付和验证](docs/小舵全局助手开发验证.md)。
