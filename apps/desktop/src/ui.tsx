@@ -1,6 +1,6 @@
 import type { ModelProfile } from './bridge';
 import { useLayoutEffect, useRef, type ReactNode } from 'react';
-export const labels: Record<string, string> = { ready: '准备中', recording: '录制中', paused: '已暂停', interrupted: '录制中断', finalizing: '整理中', completed: '已结束', needs_attention: '需要处理', draft: '模型草稿', confirmed: '已确认', incomplete: '覆盖不完整', stale: '原文已更新', pending: '待确认', ignored: '已忽略', todo: '未开始', doing: '进行中', done: '已完成', decision: '决定', discussion: '讨论', risk: '风险', question: '待解决', suggestion: '建议', unanswered: '未明确', stage: '会议总结', minutes: '会议纪要', answer: '回答' };
+export const labels: Record<string, string> = { ready: '准备中', recording: '录制中', paused: '已暂停', interrupted: '录制中断', finalizing: '整理中', completed: '已结束', needs_attention: '需要处理', draft: '待确认', confirmed: '已确认', incomplete: '覆盖不完整', stale: '需要重新确认', pending: '待确认', ignored: '已忽略', todo: '未开始', doing: '进行中', done: '已完成', decision: '决定', discussion: '讨论', risk: '风险', question: '待解决', suggestion: '建议', unanswered: '未明确', stage: '实时更新', minutes: '会议纪要', answer: '回答' };
 export const time = (ms: number) => `${Math.floor(ms / 60000).toString().padStart(2, '0')}:${Math.floor(ms / 1000 % 60).toString().padStart(2, '0')}`;
 export const modelName = (p: Pick<ModelProfile, 'display_name' | 'model'>) => p.display_name === '已迁移的文本模型' ? p.model : p.display_name;
 export const typeName = (id: string, name?: string | null) => id === 'general' ? '通用会议' : name ?? '会议';

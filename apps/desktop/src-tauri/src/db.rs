@@ -25,6 +25,8 @@ pub struct Runtime {
     pub config: Mutex<Config>,
     pub capture: Mutex<Option<CaptureSession>>,
     pub voice: crate::voice::Hub,
+    pub activity: crate::activity::Hub,
+    pub asr_preparation: crate::asr::Preparation,
     pub llm_gate: Mutex<()>,
     pub analysis_waiting: Mutex<Vec<(String, u8)>>,
     pub analysis_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -63,10 +65,10 @@ impl Runtime {
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(err)?;
-        if version > 11 {
+        if version > 18 {
             return Err("数据库版本较新，请使用匹配的应用版本".into());
         }
-        if version > 0 && version < 11 {
+        if version > 0 && version < 18 {
             let mut backup = Connection::open(root.join("before-migration.sqlite")).map_err(err)?;
             rusqlite::backup::Backup::new(&conn, &mut backup)
                 .map_err(err)?
@@ -133,6 +135,46 @@ impl Runtime {
             ))
             .map_err(err)?;
         }
+        if version < 12 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0012_summary_memory.sql"
+            ))
+            .map_err(err)?;
+        }
+        if version < 13 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0013_paragraph_activity.sql"
+            ))
+            .map_err(err)?;
+        }
+        if version < 14 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0014_assistant_review.sql"
+            ))
+            .map_err(err)?;
+        }
+        if version < 15 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0015_history_memory.sql"
+            ))
+            .map_err(err)?;
+        }
+        if version < 16 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0016_transcript_calibration.sql"
+            ))
+            .map_err(err)?;
+        }
+        if version < 17 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0017_calibration_runs.sql"
+            ))
+            .map_err(err)?;
+        }
+        if version < 18 {
+            conn.execute_batch(include_str!("../../../../migrations/0018_debug_mode.sql"))
+                .map_err(err)?;
+        }
         conn.execute("UPDATE assistant_turns SET state='failed',error='应用退出中断了本次问答，可重新提问' WHERE state IN ('pending','running')", []).map_err(err)?;
         for template in [
             include_str!("../../../../templates/general.json"),
@@ -156,6 +198,7 @@ impl Runtime {
         conn.execute("UPDATE meetings SET state='interrupted',last_error='应用退出导致采集中断，请恢复或结束会议' WHERE state IN ('recording','paused')", []).map_err(err)?;
         conn.execute("UPDATE recording_sources SET state='failed',reason='应用退出导致采集中断' WHERE state='active'",[]).map_err(err)?;
         conn.execute("UPDATE analysis_jobs SET state='failed',error_code='INTERRUPTED' WHERE state IN ('pending','running')", []).map_err(err)?;
+        conn.execute("UPDATE transcript_calibrations SET status='failed',error='应用退出中断了本次校准',updated_at=? WHERE status='pending'", [now()]).map_err(err)?;
         let config = Config::load(&root);
         let runtime = Arc::new(Self {
             root,
@@ -163,6 +206,8 @@ impl Runtime {
             config: Mutex::new(config),
             capture: Mutex::new(None),
             voice: crate::voice::Hub::default(),
+            activity: crate::activity::Hub::default(),
+            asr_preparation: crate::asr::Preparation::default(),
             llm_gate: Mutex::new(()),
             analysis_waiting: Mutex::new(vec![]),
             analysis_threads: Mutex::new(vec![]),
@@ -303,8 +348,20 @@ impl Runtime {
         data["sources"]=query!("SELECT source,state,device,gap_start_ms,reason FROM recording_sources WHERE meeting_id=? ORDER BY source",|r|Ok(json!({"source":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"device":r.get::<_,u32>(2)?,"gap_start_ms":r.get::<_,Option<u64>>(3)?,"reason":r.get::<_,Option<String>>(4)?})));
         data["legacy_answer_ids"]=query!("SELECT a.id FROM artifacts a WHERE a.meeting_id=? AND a.type='answer' AND NOT EXISTS(SELECT 1 FROM conversation_turns t WHERE t.artifact_id=a.id)",|r|Ok(json!(r.get::<_,String>(0)?)));
         data["conversation"]=query!("SELECT t.job_id,t.question,t.scope,t.artifact_id,j.state,j.error_code FROM conversation_turns t JOIN meetings m ON m.id=t.meeting_id JOIN analysis_jobs j ON j.id=t.job_id WHERE t.meeting_id=? AND t.epoch=m.chat_epoch ORDER BY t.rowid",|r|Ok(json!({"job_id":r.get::<_,String>(0)?,"question":r.get::<_,String>(1)?,"scope":r.get::<_,String>(2)?,"artifact_id":r.get::<_,Option<String>>(3)?,"state":r.get::<_,String>(4)?,"error":r.get::<_,Option<String>>(5)?})));
+        let projected = crate::paragraphs::project(
+            &db,
+            meeting,
+            data["segments"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            matches!(data["state"].as_str(), Some("recording" | "finalizing")),
+        )?;
+        data["paragraphs"] = json!(crate::calibration::decorate(&db, meeting, projected)?);
+        data["calibration"] = crate::calibration::detail(&db, meeting)?;
         data["summary_pending_segments"]=json!(db.query_row("SELECT count(*) FROM transcript_segments s LEFT JOIN summary_coverage c ON c.meeting_id=s.meeting_id AND c.segment_id=s.id WHERE s.meeting_id=? AND (c.revision IS NULL OR c.revision!=s.current_revision)",[meeting],|r|r.get::<_,u64>(0)).map_err(err)?);
-        data["schedule"] = db.query_row("SELECT enabled,mode,version,failures,paused_reason FROM summary_schedules WHERE meeting_id=?", [meeting], |r| Ok(json!({"enabled":r.get::<_,bool>(0)?,"mode":r.get::<_,String>(1)?,"version":r.get::<_,u64>(2)?,"failures":r.get::<_,u32>(3)?,"paused_reason":r.get::<_,Option<String>>(4)?}))).map_err(err)?;
+        data["summary_pending_bytes"]=json!(db.query_row("SELECT coalesce(sum(length(CAST(r.text AS BLOB))),0) FROM transcript_segments s JOIN transcript_revisions r ON r.segment_id=s.id AND r.revision=s.current_revision LEFT JOIN summary_coverage c ON c.meeting_id=s.meeting_id AND c.segment_id=s.id WHERE s.meeting_id=? AND s.state IN('final','edited') AND (c.revision IS NULL OR c.revision!=s.current_revision)",[meeting],|r|r.get::<_,u64>(0)).map_err(err)?);
+        data["schedule"] = db.query_row("SELECT enabled,mode,version,failures,paused_reason,migration_notice FROM summary_schedules WHERE meeting_id=?", [meeting], |r| Ok(json!({"enabled":r.get::<_,bool>(0)?,"mode":r.get::<_,String>(1)?,"version":r.get::<_,u64>(2)?,"failures":r.get::<_,u32>(3)?,"paused_reason":r.get::<_,Option<String>>(4)?,"migration_notice":r.get::<_,Option<String>>(5)?}))).map_err(err)?;
         data["context_consent"] = json!(db
             .query_row(
                 "SELECT context_consent FROM meetings WHERE id=?",
@@ -443,6 +500,7 @@ mod tests {
         drop(rt);
         std::fs::remove_dir_all(root).unwrap();
     }
+
     #[test]
     fn restart_marks_recording_interrupted() {
         let root = std::env::temp_dir().join(format!("helmmeet-{}", id()));
@@ -480,7 +538,7 @@ mod recovery_tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                 .unwrap(),
-            11
+            18
         );
         assert!(root.join("before-migration.sqlite").is_file());
         drop(rt);

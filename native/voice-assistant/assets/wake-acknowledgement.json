@@ -1,0 +1,12 @@
+{
+  "text": "我在",
+  "source_name": "sound.m4a",
+  "source_sha256": "4a9ede09affb640f362fa40398534bdcf0b29f16d5952ea0b2ca0e496801ee31",
+  "asset": "wake-acknowledgement.wav",
+  "asset_sha256": "b4e566b2406f793c5fe6b1f68e80a8a09b9bf66f61651e4488fe6abf6535fbf5",
+  "sample_rate": 16000,
+  "channels": 1,
+  "bits_per_sample": 16,
+  "sample_count": 16384,
+  "duration_ms": 1024.0
+}

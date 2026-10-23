@@ -12,3 +12,11 @@ int32_t hm_kws_accept(void *handle, const float *samples, int32_t count, int32_t
 #ifdef __cplusplus
 }
 #endif
+// Standalone meeting VAD: accept via hm_kws_accept(...,0), destroy via hm_kws_destroy.
+#ifdef __cplusplus
+extern "C" {
+#endif
+void *hm_meeting_vad_create(const char *directory);
+#ifdef __cplusplus
+}
+#endif

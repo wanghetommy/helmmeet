@@ -4,4 +4,9 @@
 <key>NSMicrophoneUsageDescription</key><string>HelmMeet 需要麦克风来录制你主动开始的会议。音频保存在本机。</string>
 <key>NSAudioCaptureUsageDescription</key><string>HelmMeet 在你选择电脑声音时采集会议播放音频，不保存屏幕视频。</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>CFBundleURLTypes</key><array><dict>
+<key>CFBundleURLName</key><string>com.helmmeet.desktop</string>
+<key>CFBundleTypeRole</key><string>Editor</string>
+<key>CFBundleURLSchemes</key><array><string>helmmeet</string></array>
+</dict></array>
 </dict></plist>

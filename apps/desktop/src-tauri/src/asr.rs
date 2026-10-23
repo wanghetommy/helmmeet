@@ -8,14 +8,207 @@ use rusqlite::params;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::{sync::Arc, time::Duration};
+use std::{process::Command, sync::Arc, time::Duration};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+// The ASR worker alone owns the cached Whisper context. Preparation sends a
+// bounded request to that worker; it never loads a second context on an IPC thread.
+#[derive(Default)]
+pub struct Preparation {
+    pending:
+        std::sync::Mutex<std::collections::VecDeque<std::sync::mpsc::Sender<Result<bool, String>>>>,
+}
+pub fn prepare(rt: &Runtime) -> Result<serde_json::Value, String> {
+    rt.ensure_running()?;
+    if rt
+        .config
+        .lock()
+        .map_err(|_| "配置锁异常")?
+        .asr
+        .model_path
+        .is_empty()
+    {
+        return Err("请先在全局设置选择本地转写模型".into());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let mut pending = rt
+            .asr_preparation
+            .pending
+            .lock()
+            .map_err(|_| "转写准备锁异常")?;
+        if pending.len() >= 4 {
+            return Err("正在准备转写模型，请稍后重试".into());
+        }
+        pending.push_back(tx);
+    }
+    let until = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        rt.ensure_running()?;
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => {
+                let loaded = result?;
+                return Ok(json!({"ready":true,"cached":!loaded}));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("转写服务已停止，请重启应用".into())
+            }
+            Err(_) if std::time::Instant::now() >= until => {
+                return Err("转写模型准备超时，请检查模型后重试".into())
+            }
+            Err(_) => {}
+        }
+    }
+}
+fn load_context(
+    config: &crate::config::AsrConfig,
+    stop: &StopToken,
+    loaded: &mut String,
+    context: &mut Option<WhisperContext>,
+    backend: &mut Option<bool>,
+) -> Result<bool, String> {
+    if config.model_path.is_empty() {
+        return Err("请先选择本地转写模型".into());
+    }
+    // Include the checksum in the cache identity; changing the selected model
+    // during preparation must not silently reuse an incompatible context.
+    let key = format!(
+        "{}:{}",
+        config.model_path,
+        config.model_sha256.as_deref().unwrap_or("")
+    );
+    if *loaded == key && context.is_some() {
+        return Ok(false);
+    }
+    if *loaded != key {
+        *backend = None;
+    }
+    if let Some(expected) = &config.model_sha256 {
+        let mut file = std::fs::File::open(&config.model_path).map_err(|_| "模型文件不可读")?;
+        let mut hash = Sha256::new();
+        let mut bytes = [0u8; 1024 * 1024];
+        loop {
+            if stop.is_stopped() {
+                return Err("转写已取消".into());
+            }
+            let n = file.read(&mut bytes).map_err(|_| "模型文件不可读")?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&bytes[..n]);
+        }
+        if format!("{:x}", hash.finalize()) != *expected {
+            return Err("模型 SHA-256 不匹配".into());
+        }
+    }
+    if stop.is_stopped() {
+        return Err("转写已取消".into());
+    }
+    let use_gpu = *backend.get_or_insert_with(|| probe_metal(&config.model_path));
+    let next = match WhisperContext::new_with_params(
+        &config.model_path,
+        context_parameters_for_gpu(use_gpu),
+    ) {
+        Ok(context) => context,
+        Err(_) if use_gpu => {
+            // A successful child probe can still race with a driver/resource
+            // change. Retry once on CPU so a recoverable Metal load error does
+            // not make ASR unavailable.
+            *backend = Some(false);
+            WhisperContext::new_with_params(&config.model_path, context_parameters_for_gpu(false))
+                .map_err(|_| "模型加载失败，请检查模型文件")?
+        }
+        Err(_) => return Err("模型加载失败，请检查模型文件".into()),
+    };
+    if stop.is_stopped() {
+        return Err("转写已取消".into());
+    }
+    *context = Some(next);
+    *loaded = key;
+    Ok(true)
+}
+
 pub fn context_parameters() -> WhisperContextParameters<'static> {
+    context_parameters_for_gpu(false)
+}
+
+fn context_parameters_for_gpu(use_gpu: bool) -> WhisperContextParameters<'static> {
     let mut params = WhisperContextParameters::default();
-    // Intel packages use the CPU backend, including diagnostic entry points.
-    params.use_gpu(cfg!(all(target_os = "macos", target_arch = "aarch64")));
+    params.use_gpu(use_gpu);
     params
+}
+
+pub(crate) fn context_parameters_for_probe() -> WhisperContextParameters<'static> {
+    context_parameters_for_gpu(true)
+}
+
+/// Probe Metal in a child process. whisper.cpp's Metal allocator can raise a
+/// native SIGSEGV on this machine, which Rust cannot catch with `Result` or
+/// `catch_unwind`. Isolating the probe keeps the main application alive and
+/// lets it select CPU only when Metal is actually unavailable.
+fn probe_metal(model_path: &str) -> bool {
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    Command::new(executable)
+        .arg("--probe-whisper-metal")
+        .arg(model_path)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    fn fixture() -> (tempfile::TempDir, Arc<Runtime>) {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = Runtime::open_with_vault(
+            dir.path().into(),
+            Arc::new(crate::models::tests::MemoryVault::default()),
+        )
+        .unwrap();
+        rt.config.lock().unwrap().asr.model_path.clear();
+        (dir, rt)
+    }
+    #[test]
+    fn missing_or_invalid_model_never_creates_a_meeting_or_starts_capture() {
+        let (_dir, rt) = fixture();
+        assert!(prepare(&rt).unwrap_err().contains("选择"));
+        let mut worker = spawn(rt.clone());
+        rt.config.lock().unwrap().asr.model_path = "/nonexistent/helmmeet-test.bin".into();
+        rt.config.lock().unwrap().asr.model_sha256 = Some("invalid".into());
+        assert!(prepare(&rt).unwrap_err().contains("不可读"));
+        assert!(rt.capture.lock().unwrap().is_none());
+        assert_eq!(
+            rt.db()
+                .unwrap()
+                .query_row("SELECT count(*) FROM meetings", [], |r| r
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+        worker.join().unwrap();
+    }
+    #[test]
+    #[ignore = "explicit HELMMEET_TEST_MODEL; local model preparation only, no audio hardware or HTTP"]
+    fn local_model_preparation_reuses_worker_context_without_capture() {
+        let (_dir, rt) = fixture();
+        rt.config.lock().unwrap().asr.model_path = std::env::var("HELMMEET_TEST_MODEL").unwrap();
+        rt.config.lock().unwrap().asr.model_sha256 = None;
+        let mut worker = spawn(rt.clone());
+        assert_eq!(prepare(&rt).unwrap(), json!({"ready":true,"cached":false}));
+        assert_eq!(prepare(&rt).unwrap(), json!({"ready":true,"cached":true}));
+        assert!(rt.capture.lock().unwrap().is_none());
+        assert_eq!(
+            rt.db()
+                .unwrap()
+                .query_row("SELECT count(*) FROM audio_chunks", [], |r| r
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+        worker.join().unwrap();
+    }
 }
 
 pub fn recover(rt: &Runtime) -> Result<(), String> {
@@ -156,6 +349,128 @@ pub fn decode(
 ) -> Result<Vec<(u64, u64, String)>, String> {
     decode_with_partial(context, pcm, language, None, None, "")
 }
+
+fn whisper_language(language: &str) -> Option<&'static str> {
+    match language {
+        "auto" => None,
+        // Whisper uses one Chinese language token; the selected script is
+        // applied to its UTF-8 output below.
+        "zh" | "zh-Hans" | "zh-Hant" => Some("zh"),
+        _ => Some("en"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn convert_script(text: &str, language: &str) -> String {
+    use std::{ffi::c_void, ptr};
+    const UTF8: u32 = 0x0800_0100;
+    #[allow(non_camel_case_types)]
+    type CFIndex = isize;
+    #[allow(non_camel_case_types)]
+    type CFStringRef = *const c_void;
+    #[allow(non_camel_case_types)]
+    type CFMutableStringRef = *mut c_void;
+    #[repr(C)]
+    struct CFRange {
+        location: CFIndex,
+        length: CFIndex,
+    }
+    #[allow(non_snake_case)]
+    extern "C" {
+        fn CFStringCreateWithBytes(
+            alloc: *const c_void,
+            bytes: *const u8,
+            num_bytes: CFIndex,
+            encoding: u32,
+            is_external_representation: u8,
+        ) -> CFStringRef;
+        fn CFStringCreateMutableCopy(
+            alloc: *const c_void,
+            max_length: CFIndex,
+            string: CFStringRef,
+        ) -> CFMutableStringRef;
+        fn CFStringGetLength(string: CFStringRef) -> CFIndex;
+        fn CFStringGetMaximumSizeForEncoding(length: CFIndex, encoding: u32) -> CFIndex;
+        fn CFStringGetCString(
+            string: CFStringRef,
+            buffer: *mut i8,
+            buffer_size: CFIndex,
+            encoding: u32,
+        ) -> u8;
+        fn CFStringTransform(
+            string: CFMutableStringRef,
+            range: *mut CFRange,
+            transform: CFStringRef,
+            reverse: u8,
+        ) -> u8;
+        fn CFRelease(value: CFStringRef);
+    }
+    let transform_name = match language {
+        "zh-Hans" => "Traditional-Simplified",
+        "zh-Hant" | "zh" => "Simplified-Traditional",
+        _ => return text.to_owned(),
+    };
+    let bytes = text.as_bytes();
+    let input = unsafe {
+        CFStringCreateWithBytes(ptr::null(), bytes.as_ptr(), bytes.len() as CFIndex, UTF8, 0)
+    };
+    if input.is_null() {
+        return text.to_owned();
+    }
+    let transform_bytes = transform_name.as_bytes();
+    let transform = unsafe {
+        CFStringCreateWithBytes(
+            ptr::null(),
+            transform_bytes.as_ptr(),
+            transform_bytes.len() as CFIndex,
+            UTF8,
+            0,
+        )
+    };
+    if transform.is_null() {
+        unsafe { CFRelease(input) };
+        return text.to_owned();
+    }
+    let mutable = unsafe { CFStringCreateMutableCopy(ptr::null(), 0, input) };
+    if mutable.is_null() {
+        unsafe {
+            CFRelease(transform);
+            CFRelease(input);
+        }
+        return text.to_owned();
+    }
+    let mut range = CFRange {
+        location: 0,
+        length: unsafe { CFStringGetLength(mutable) },
+    };
+    let transformed = unsafe { CFStringTransform(mutable, &mut range, transform, 0) } != 0;
+    let max = unsafe { CFStringGetMaximumSizeForEncoding(range.length, UTF8) };
+    let mut output = vec![0i8; max.max(1) as usize + 1];
+    let ok = transformed
+        && unsafe {
+            CFStringGetCString(mutable, output.as_mut_ptr(), output.len() as CFIndex, UTF8) != 0
+        };
+    let result = if ok {
+        let bytes =
+            unsafe { std::slice::from_raw_parts(output.as_ptr().cast::<u8>(), output.len()) };
+        let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+        String::from_utf8(bytes[..end].to_vec()).unwrap_or_else(|_| text.to_owned())
+    } else {
+        text.to_owned()
+    };
+    unsafe {
+        CFRelease(transform);
+        CFRelease(mutable);
+        CFRelease(input);
+    }
+    result
+}
+
+#[cfg(not(target_os = "macos"))]
+fn convert_script(text: &str, _language: &str) -> String {
+    text.to_owned()
+}
+
 fn decode_with_partial(
     context: &WhisperContext,
     pcm: &[f32],
@@ -191,11 +506,7 @@ fn decode_with_partial(
     p.set_segment_callback_safe_lossy::<_, Box<dyn FnMut(whisper_rs::SegmentCallbackData)>>(
         partial,
     );
-    p.set_language(if language == "auto" {
-        None
-    } else {
-        Some(language)
-    });
+    p.set_language(whisper_language(language));
     p.set_n_threads(4);
     p.set_print_realtime(false);
     p.set_print_progress(false);
@@ -215,6 +526,7 @@ fn decode_with_partial(
             .map_err(|_| "识别文本编码异常")?
             .trim()
             .to_string();
+        let text = convert_script(&text, language);
         if !text.is_empty() {
             output.push((
                 (seg.start_timestamp().max(0) as u64) * 10,
@@ -229,7 +541,26 @@ pub fn spawn(rt: Arc<Runtime>) -> Worker {
     Worker::spawn(move |stop| {
         let mut loaded = String::new();
         let mut context = None;
-        'jobs: while stop.wait(Duration::from_millis(700)) {
+        let mut backend = None;
+        while stop.wait(Duration::from_millis(100)) {
+            let preparation = rt
+                .asr_preparation
+                .pending
+                .lock()
+                .ok()
+                .and_then(|mut q| q.pop_front());
+            if let Some(reply) = preparation {
+                let result = rt
+                    .config
+                    .lock()
+                    .map(|c| c.asr.clone())
+                    .map_err(|_| "配置锁异常".to_string())
+                    .and_then(|config| {
+                        load_context(&config, &stop, &mut loaded, &mut context, &mut backend)
+                    });
+                let _ = reply.send(result);
+                continue;
+            }
             let voice_question = crate::voice::take_question(&rt);
             if voice_question
                 .as_ref()
@@ -264,58 +595,28 @@ pub fn spawn(rt: Arc<Runtime>) -> Worker {
                 }
                 continue;
             }
-            if loaded != config.model_path {
+            let key = format!(
+                "{}:{}",
+                config.model_path,
+                config.model_sha256.as_deref().unwrap_or("")
+            );
+            if loaded != key {
                 if let Ok(mut t) = rt.transient.lock() {
                     t[&meeting]["asr_state"] = json!("loading");
                 }
-                if let Some(expected) = &config.model_sha256 {
-                    let check = (|| -> Result<String, String> {
-                        let mut f = std::fs::File::open(&config.model_path).map_err(err)?;
-                        let mut hash = Sha256::new();
-                        let mut bytes = [0u8; 1024 * 1024];
-                        loop {
-                            if stop.is_stopped() {
-                                return Err("转写已取消".into());
-                            }
-                            let n = f.read(&mut bytes).map_err(err)?;
-                            if n == 0 {
-                                break;
-                            }
-                            hash.update(&bytes[..n]);
-                        }
-                        Ok(format!("{:x}", hash.finalize()))
-                    })();
-                    if check.as_deref() != Ok(expected.as_str()) {
-                        if stop.is_stopped() {
-                            break 'jobs;
-                        }
-                        if let Some(q) = &voice_question {
-                            crate::voice::question_failed(&rt, q, "转写模型校验失败");
-                            continue 'jobs;
-                        }
-                        rt.error(&meeting, "模型 SHA-256 不匹配或文件不可读");
+                if let Err(e) =
+                    load_context(&config, &stop, &mut loaded, &mut context, &mut backend)
+                {
+                    if stop.is_stopped() {
+                        break;
+                    }
+                    if let Some(q) = &voice_question {
+                        crate::voice::question_failed(&rt, q, &e);
+                    } else {
+                        rt.error(&meeting, &e);
                         stop.wait(Duration::from_secs(5));
-                        continue;
                     }
-                }
-                let params = context_parameters();
-                match WhisperContext::new_with_params(&config.model_path, params) {
-                    Ok(c) => {
-                        context = Some(c);
-                        loaded = config.model_path.clone();
-                    }
-                    Err(_) => {
-                        if stop.is_stopped() {
-                            break;
-                        }
-                        if let Some(q) = &voice_question {
-                            crate::voice::question_failed(&rt, q, "转写模型加载失败");
-                            continue;
-                        }
-                        rt.error(&meeting, "模型加载失败，请检查模型文件");
-                        stop.wait(Duration::from_secs(5));
-                        continue;
-                    }
+                    continue;
                 }
             }
             if stop.is_stopped() {
@@ -327,13 +628,18 @@ pub fn spawn(rt: Arc<Runtime>) -> Worker {
                 }
                 let lexicon =
                     crate::knowledge::asr_context(&rt, &meeting).unwrap_or(json!({"prompt":""}));
+                let voice_prompt = format!(
+                    "{} {}",
+                    lexicon["prompt"].as_str().unwrap_or(""),
+                    question.wake
+                );
                 let result = decode_with_partial(
                     context.as_ref().unwrap(),
                     &question.pcm,
                     &config.language,
                     None,
                     Some(stop.clone()),
-                    lexicon["prompt"].as_str().unwrap_or(""),
+                    &voice_prompt,
                 );
                 match result {
                     Ok(parts) if !stop.is_stopped() => crate::voice::recognized(
@@ -361,9 +667,11 @@ pub fn spawn(rt: Arc<Runtime>) -> Worker {
             }
             let partial_rt = rt.clone();
             let partial_mid = meeting.clone();
+            let partial_language = config.language.clone();
             let callback = Box::new(move |segment: whisper_rs::SegmentCallbackData| {
                 if let Ok(mut t) = partial_rt.transient.lock() {
-                    t[&partial_mid]["partial"] = json!(segment.text);
+                    t[&partial_mid]["partial"] =
+                        json!(convert_script(&segment.text, &partial_language));
                 }
             });
             let lexicon = match crate::knowledge::asr_context(&rt, &meeting) {

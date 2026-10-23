@@ -10,7 +10,9 @@ pub struct AsrConfig {
     pub language: String,
 }
 fn default_language() -> String {
-    "zh".into()
+    // Keep the existing output as the default while making the selected
+    // Chinese script explicit. Legacy `zh` settings remain accepted.
+    "zh-Hant".into()
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ModelConfig {

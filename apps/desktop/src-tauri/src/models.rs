@@ -206,7 +206,7 @@ fn save_internal(rt: &Runtime, input: ProfileInput, importing: bool) -> Result<V
         return Err("请填写有效配置名称、服务地址与模型名称".into());
     }
     if !(1024..=2_000_000).contains(&input.context_tokens)
-        || !(128..=65536).contains(&input.max_output_tokens)
+        || !(128..=131072).contains(&input.max_output_tokens)
         || input.max_output_tokens >= input.context_tokens
         || !(10..=180).contains(&input.timeout_seconds)
     {
@@ -329,7 +329,8 @@ fn save_internal(rt: &Runtime, input: ProfileInput, importing: bool) -> Result<V
     dto(rt, &c, c.config_version, false)
 }
 pub fn set_default(rt: &Runtime, profile: &str) -> Result<Value, String> {
-    let db = rt.db()?;
+    let _gate = rt.model_gate.lock().map_err(|_| "模型目录锁异常")?;
+    let mut db = rt.db()?;
     let n: u32 = db
         .query_row(
             "SELECT count(*) FROM model_profiles WHERE id=? AND archived=0",
@@ -340,8 +341,93 @@ pub fn set_default(rt: &Runtime, profile: &str) -> Result<Value, String> {
     if n != 1 {
         return Err("默认配置不可用".into());
     }
-    db.execute("INSERT INTO app_preferences VALUES ('default_profile',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[profile]).map_err(err)?;
-    Ok(json!({"saved":true}))
+    let c = config_at(
+        &db,
+        profile,
+        db.query_row(
+            "SELECT current_version FROM model_profiles WHERE id=? AND archived=0",
+            [profile],
+            |r| r.get::<_, u32>(0),
+        )
+        .map_err(err)?,
+    )?;
+    active(&db, &c)?;
+    let (_, local) = c.endpoint()?;
+    let mode = if local { "local" } else { "remote" };
+    let target = analysis::target(&c);
+    let tx = db.transaction().map_err(err)?;
+    tx.execute(
+        "INSERT INTO app_preferences VALUES ('default_profile',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [profile],
+    )
+    .map_err(err)?;
+
+    let mut active_meetings = tx
+        .prepare(
+            "SELECT m.id,m.analysis_mode,b.profile_id,b.config_version
+             FROM meetings m JOIN meeting_model_bindings b ON b.meeting_id=m.id
+             WHERE m.state IN ('recording','paused','interrupted')",
+        )
+        .map_err(err)?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, u32>(3)?,
+            ))
+        })
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    for (meeting, analysis_mode, old_profile, old_version) in active_meetings.drain(..) {
+        if old_profile == c.profile_id && old_version == c.config_version {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO meeting_model_bindings VALUES (?,?,?)
+             ON CONFLICT(meeting_id) DO UPDATE SET profile_id=excluded.profile_id,config_version=excluded.config_version",
+            params![meeting, c.profile_id, c.config_version],
+        )
+        .map_err(err)?;
+        let version: u64 = tx
+            .query_row(
+                "SELECT coalesce(max(version),0)+1 FROM meeting_configs WHERE meeting_id=?",
+                [&meeting],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        tx.execute(
+            "INSERT INTO meeting_configs VALUES (?,?, '{}', ?, ?)",
+            params![
+                meeting,
+                version,
+                serde_json::to_string(&c).map_err(err)?,
+                json!({"mode":if analysis_mode == "transcript_only" {"transcript_only"} else {mode},"target":if analysis_mode == "transcript_only" {Value::Null} else {json!(target)},"scope":"confirmed_text_context_actions","automatic_minutes":0}).to_string()
+            ],
+        )
+        .map_err(err)?;
+        if analysis_mode == "transcript_only" {
+            tx.execute(
+                "UPDATE meetings SET version=version+1 WHERE id=? AND state!='deleting'",
+                [&meeting],
+            )
+            .map_err(err)?;
+        } else {
+            tx.execute(
+                "UPDATE meetings SET analysis_mode=?,consent_target=?,generation=generation+1,version=version+1,consent_version=consent_version+1 WHERE id=? AND state!='deleting'",
+                params![mode, target, meeting],
+            )
+            .map_err(err)?;
+            tx.execute(
+                "UPDATE analysis_jobs SET state='cancelled' WHERE meeting_id=? AND state IN ('pending','running')",
+                [&meeting],
+            )
+            .map_err(err)?;
+        }
+    }
+    tx.commit().map_err(err)?;
+    Ok(json!({"saved":true,"switched_active_meetings":true}))
 }
 pub fn archive(rt: &Runtime, profile: &str, expected: u32) -> Result<Value, String> {
     let _gate = rt.model_gate.lock().map_err(|_| "模型目录锁异常")?;
@@ -554,7 +640,8 @@ pub fn test(rt: &Runtime, profile: &str, version: u32) -> Result<Value, String> 
         load(rt, profile, version).map(|_| ())
     };
     analysis::test_structure(rt, &config, &check)?;
-    let result = json!({"ok":true,"streaming":false,"structured_output":"validated","tested_at":now(),"message":"连接、JSON结构及合成原文引用校验通过"});
+    analysis::test_tool_call(rt, &config, &check)?;
+    let result = json!({"ok":true,"streaming":false,"structured_output":"validated","tool_calls":"validated","tested_at":now(),"message":"连接、工具调用、JSON结构及合成原文引用校验通过"});
     rt.db()?.execute("INSERT INTO app_preferences VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![format!("test:{profile}:{version}"),result.to_string()]).map_err(err)?;
     Ok(result)
 }
@@ -679,14 +766,21 @@ pub mod tests {
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let mut seen = vec![];
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let (mut s, _) = listener.accept().unwrap();
-                seen.push(receive(&mut s));
-                respond(
-                    &mut s,
-                    200,
-                    r#"{"summary":[{"text":"连接测试","kind":"discussion","section":"topic","evidence":[{"segment_id":"connection-test","revision":1}]}],"actions":[]}"#,
-                );
+                let request = receive(&mut s);
+                let tool_probe = request.contains("helmmeet_tool_probe");
+                seen.push(request);
+                if tool_probe {
+                    let body = json!({"choices":[{"finish_reason":"tool_calls","message":{"content":null,"tool_calls":[{"id":"probe","type":"function","function":{"name":"helmmeet_tool_probe","arguments":"{}"}}]}}]}).to_string();
+                    write!(&mut s,"HTTP/1.1 200 Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                } else {
+                    respond(
+                        &mut s,
+                        200,
+                        r#"{"summary":[{"text":"连接测试","kind":"discussion","section":"topic","evidence":[{"segment_id":"connection-test","revision":1}]}],"actions":[]}"#,
+                    );
+                }
             }
             seen
         });
@@ -696,8 +790,12 @@ pub mod tests {
         test(&rt, a["profile_id"].as_str().unwrap(), 1).unwrap();
         test(&rt, b["profile_id"].as_str().unwrap(), 1).unwrap();
         let seen = server.join().unwrap();
-        assert!(seen[0].contains("Bearer fake-secret-one"));
-        assert!(seen[1].contains("Bearer fake-secret-two"));
+        assert!(seen
+            .iter()
+            .any(|request| request.contains("Bearer fake-secret-one")));
+        assert!(seen
+            .iter()
+            .any(|request| request.contains("Bearer fake-secret-two")));
         let directory = list(&rt).unwrap().to_string();
         assert!(!directory.contains("fake-secret"));
         assert!(!directory.contains("credential_ref"));
@@ -754,6 +852,43 @@ pub mod tests {
         assert_eq!(selected(&rt, &m).unwrap().config_version, 2);
         drop(rt);
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn changing_default_switches_only_active_meeting_bindings() {
+        let (root, rt, vault) = runtime();
+        let first = save(&rt, input("现场模型", "http://127.0.0.1:11434/v1", "")).unwrap();
+        let first_id = first["profile_id"].as_str().unwrap();
+        set_default(&rt, first_id).unwrap();
+        let active = mid(&rt);
+        let completed = mid(&rt);
+        select(&rt, &active, first_id, 1, true);
+        select(&rt, &completed, first_id, 1, true);
+        rt.db()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET state='recording' WHERE id=?",
+                [&active],
+            )
+            .unwrap();
+        rt.db()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET state='completed' WHERE id=?",
+                [&completed],
+            )
+            .unwrap();
+        let before = rt.detail(&active).unwrap()["generation"].as_u64().unwrap();
+        let second = save(&rt, input("默认新模型", "http://127.0.0.1:11435/v1", "")).unwrap();
+        set_default(&rt, second["profile_id"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            selected(&rt, &active).unwrap().profile_id,
+            second["profile_id"]
+        );
+        assert!(rt.detail(&active).unwrap()["generation"].as_u64().unwrap() > before);
+        assert_eq!(selected(&rt, &completed).unwrap().profile_id, first_id);
+        drop(rt);
+        std::fs::remove_dir_all(root).unwrap();
+        drop(vault);
     }
     #[test]
     fn rotation_and_archive_invalidate_only_referencing_meetings() {

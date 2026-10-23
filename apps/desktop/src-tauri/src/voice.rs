@@ -13,7 +13,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         mpsc::{self, SyncSender},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -24,10 +24,30 @@ extern "C" {
     fn hm_kws_accept(handle: *mut c_void, pcm: *const f32, count: i32, kws: i32) -> i32;
     fn hm_voice_pinyin(text: *const c_char, output: *mut c_char, capacity: i32) -> i32;
     fn hm_voice_speak(text: *const c_char) -> i32;
+    fn hm_voice_play_pcm(input: *const f32, count: i32) -> i32;
     fn hm_voice_stop();
     fn hm_voice_state() -> i32;
     #[cfg(feature = "audio-processing")]
     fn hm_voice_reference(host: u64, output: *mut f32, count: i32) -> i32;
+}
+const PRE_ROLL_SAMPLES: usize = 16000 * 2;
+const WAKE_RESPONSE_TEXT: &str = "我在";
+const WAKE_RESPONSE_WAV: &[u8] =
+    include_bytes!("../../../../native/voice-assistant/assets/wake-acknowledgement.wav");
+fn wake_pcm() -> Result<&'static [f32], &'static str> {
+    static PCM: OnceLock<Result<Vec<f32>, String>> = OnceLock::new();
+    PCM.get_or_init(|| crate::audio::read_wav_bytes(WAKE_RESPONSE_WAV))
+        .as_deref()
+        .map_err(|_| "唤醒提示音不可用")
+}
+fn acknowledge() -> bool {
+    wake_pcm().is_ok_and(|pcm| unsafe { hm_voice_play_pcm(pcm.as_ptr(), pcm.len() as i32) } == 0)
+}
+fn append_pre_roll(rolling: &mut VecDeque<f32>, pcm: &[f32]) {
+    rolling.extend(pcm.iter().copied());
+    while rolling.len() > PRE_ROLL_SAMPLES {
+        rolling.pop_front();
+    }
 }
 pub struct Frame {
     meeting: String,
@@ -46,6 +66,7 @@ pub struct Question {
 pub struct Hub {
     feed: Mutex<Option<SyncSender<Frame>>>,
     accepting: AtomicBool,
+    input_gap: AtomicBool,
     pub questions: Mutex<VecDeque<Question>>,
     state: Mutex<Value>,
     epoch: AtomicU64,
@@ -56,6 +77,7 @@ impl Default for Hub {
         Self {
             feed: Mutex::new(None),
             accepting: AtomicBool::new(false),
+            input_gap: AtomicBool::new(false),
             questions: Mutex::new(VecDeque::new()),
             state: Mutex::new(json!({"state":"off","message":"仅会议录制且麦克风开启时提供语音"})),
             epoch: AtomicU64::new(0),
@@ -87,7 +109,9 @@ pub fn feed(rt: &Runtime, meeting: &str, host: u64, pcm: &[f32]) {
                 })
                 .is_err()
             {
-                rt.voice.epoch.fetch_add(1, Ordering::AcqRel);
+                // A slow consumer must not cancel a TTS response or a question
+                // already submitted to ASR. Only the unfinished input is lost.
+                rt.voice.input_gap.store(true, Ordering::Release);
             }
         }
     }
@@ -159,7 +183,9 @@ pub fn recognized(rt: Arc<Runtime>, q: Question, text: String) {
         return;
     }
     let text = strip_wake(&text, &q.wake);
-    if text.chars().filter(|c| c.is_alphanumeric()).count() < 2 {
+    let response_only = !q.wake.is_empty()
+        && text.trim_matches(|c: char| !c.is_alphanumeric()) == WAKE_RESPONSE_TEXT;
+    if text.chars().filter(|c| c.is_alphanumeric()).count() < 2 || response_only {
         question_failed(&rt, &q, "没有识别到问题，请重新唤醒或输入文字");
         return;
     }
@@ -183,17 +209,33 @@ pub fn recognized(rt: Arc<Runtime>, q: Question, text: String) {
 }
 fn strip_wake(text: &str, wake: &str) -> String {
     let t = text.trim_start_matches(|c: char| !c.is_alphanumeric());
-    let t = t
-        .strip_prefix(wake)
-        .unwrap_or(t)
-        .trim_start_matches(|c: char| !c.is_alphanumeric());
+    let t = if !wake.is_empty() {
+        if let Some(rest) = t.strip_prefix(wake) {
+            rest
+        } else if let Some((at, _)) = t.match_indices(wake).find(|(at, _)| {
+            let before = t[..*at].chars().last();
+            let after = t[*at + wake.len()..].chars().next();
+            before.is_some_and(|c| "。！？!?；;\n".contains(c))
+                || after.is_some_and(|c| "，,：:。！？!?".contains(c))
+        }) {
+            &t[at + wake.len()..]
+        } else {
+            t
+        }
+    } else {
+        t
+    };
+    let t = t.trim_start_matches(|c: char| !c.is_alphanumeric());
+    // Legacy TTS acknowledgement only. Never strip “我在”: it can be part of
+    // the user's question (“我在想…”); echo is handled using playback PCM.
     let t = t
         .strip_prefix("小舵在")
         .unwrap_or(t)
         .trim_start_matches(|c: char| !c.is_alphanumeric());
     t.trim().into()
 }
-fn model_dir() -> PathBuf {
+
+pub(crate) fn model_dir() -> PathBuf {
     if let Some(p) = std::env::current_exe()
         .ok()
         .and_then(|p| {
@@ -284,14 +326,40 @@ struct Listening {
     epoch: u64,
     utterance: String,
     had_speech: bool,
+    pending_end: bool,
     after_wake: usize,
+    empty_since: Option<Instant>,
     manual: bool,
     capture_epoch: String,
+}
+impl Listening {
+    fn empty_timeout(&mut self, acknowledgement_active: bool, now: Instant) -> bool {
+        // Listening already owns the pre-roll and all prompt-overlapping audio.
+        // Only the empty-question deadline starts after actual playback ends.
+        if acknowledgement_active {
+            self.empty_since = None;
+            return false;
+        }
+        let since = *self.empty_since.get_or_insert(now);
+        !self.had_speech && now.saturating_duration_since(since) >= Duration::from_secs(5)
+    }
+    fn endpoint(&mut self, flags: i32, acknowledgement_active: bool) -> bool {
+        if flags & 2 != 0 {
+            self.had_speech = true;
+            self.pending_end = false;
+        }
+        if self.had_speech && flags & 4 != 0 {
+            self.pending_end = true;
+        }
+        // Keep an endpoint that arrives during the acknowledgement: dropping it
+        // would leave a short question waiting until the 30-second limit.
+        self.pending_end && !acknowledgement_active
+    }
 }
 fn speak(text: &str) -> bool {
     CString::new(text).is_ok_and(|s| unsafe { hm_voice_speak(s.as_ptr()) } == 0)
 }
-fn spoken_answer(answer: &Value) -> String {
+fn spoken_answer_chunks(answer: &Value) -> Vec<String> {
     let text = answer["blocks"]
         .as_array()
         .into_iter()
@@ -300,17 +368,57 @@ fn spoken_answer(answer: &Value) -> String {
         .filter_map(|b| b["text"].as_str())
         .collect::<Vec<_>>()
         .join("。");
-    if text.chars().count() <= 120 {
-        return text;
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let hard_end = (start + 560).min(chars.len());
+        let end = if hard_end < chars.len() {
+            chars[start..hard_end]
+                .iter()
+                .rposition(|c| "。！？.!?；;\n".contains(*c))
+                .map_or(hard_end, |offset| start + offset + 1)
+        } else {
+            hard_end
+        };
+        if end == start {
+            break;
+        }
+        chunks.push(chars[start..end].iter().collect::<String>());
+        start = end;
     }
-    let prefix = text.chars().take(120).collect::<String>();
-    if let Some((at, ch)) = prefix
-        .char_indices()
-        .rfind(|(_, c)| "。！？.!?；;\n".contains(*c))
-    {
-        return format!("{}详细内容请看聊天。", &prefix[..at + ch.len_utf8()]);
+    chunks
+}
+#[allow(clippy::too_many_arguments)]
+fn start_speech_chunk(
+    rt: &Runtime,
+    mid: &str,
+    turn: &str,
+    text: &str,
+    last_host: u64,
+    playback: &mut Option<String>,
+    playback_base: &mut u64,
+    playback_host: &mut u64,
+) -> bool {
+    if !speak(text) {
+        return false;
     }
-    "这段回答较长，请查看聊天中的完整内容。".into()
+    let pid = id();
+    *playback_base = rt
+        .detail(mid)
+        .ok()
+        .and_then(|d| d["duration_ms"].as_u64())
+        .unwrap_or(0);
+    *playback_host = last_host;
+    let _ = rt.db().and_then(|db| {
+        db.execute(
+            "INSERT INTO assistant_playback_events(id,meeting_id,turn_id,text,start_host_ns,start_ms) VALUES (?,?,?,?,?,?)",
+            params![pid, mid, turn, text, last_host, *playback_base],
+        )
+        .map_err(err)
+    });
+    *playback = Some(pid);
+    true
 }
 fn stop_speaker() {
     unsafe { hm_voice_stop() }
@@ -319,7 +427,11 @@ fn finish(rt: &Runtime, mid: &str, word: &str, l: Listening) {
     if l.epoch != rt.voice.epoch.load(Ordering::Acquire) {
         return;
     }
-    if !l.had_speech || l.after_wake < 3200 {
+    // A very short question may already be inside the pre-roll by the time
+    // KWS fires. After the bounded empty-input window, let local ASR inspect it
+    // rather than discarding it solely because VAD saw no post-wake speech.
+    let has_pre_roll = !l.manual && l.pcm.len() > l.after_wake;
+    if (!l.had_speech && !has_pre_roll) || l.after_wake < 3200 {
         state(
             rt,
             json!({"state":"standby","meeting_id":mid,"message":"未听到问题，请重新唤醒"}),
@@ -353,6 +465,9 @@ fn inactive_status(eligible_mid: &str, configured: bool, paused: bool, locked: b
 }
 pub fn background(rt: Arc<Runtime>) -> Worker {
     Worker::spawn(move |stop| {
+        // Decode the bundled prompt before accepting microphone frames. There
+        // is no runtime file lookup or TTS synthesis on the wake path.
+        let _ = wake_pcm();
         let (tx, rx) = mpsc::sync_channel(24);
         if let Ok(mut slot) = rt.voice.feed.lock() {
             *slot = Some(tx)
@@ -374,6 +489,8 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
         let mut reference_tail = 0u64;
         let mut speaking = false;
         let mut speaking_since = Instant::now();
+        let mut speech_queue = VecDeque::<String>::new();
+        let mut speaking_turn = String::new();
         let mut test_deadline: Option<Instant> = None;
         let mut playback: Option<String> = None;
         let mut playback_base = 0;
@@ -429,6 +546,8 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
                 detector = None;
                 stop_speaker();
                 speaking = false;
+                speech_queue.clear();
+                speaking_turn.clear();
                 if let Ok(mut q) = rt.voice.questions.lock() {
                     q.clear()
                 }
@@ -461,6 +580,29 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
                     playback = None;
                 }
             }
+            if rt.voice.input_gap.swap(false, Ordering::AcqRel) {
+                // Catch up without replaying discontinuous input to KWS/VAD.
+                while rx.try_recv().is_ok() {}
+                let lost_question = listening.take().is_some();
+                rolling.clear();
+                if let Some(d) = detector.as_mut() {
+                    d.reset();
+                }
+                #[cfg(feature = "audio-processing")]
+                {
+                    dsp_frames = meeting_core::audio_processing::Frames::with_delay(0);
+                    dsp_input = 0;
+                    if let Some(p) = apm.as_mut() {
+                        let _ = p.reset();
+                    }
+                }
+                if lost_question {
+                    state(
+                        &rt,
+                        json!({"state":"standby","meeting_id":mid,"message":"语音输入短暂中断，请等回应播完后重新唤醒"}),
+                    );
+                }
+            }
             let command = rt.voice.command.swap(0, Ordering::AcqRel);
             if command == 5 && !mid.is_empty() && detector.is_some() {
                 if let Some(d) = detector.as_mut() {
@@ -481,12 +623,14 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
                 );
             }
             if command == 3 {
+                speech_queue.clear();
                 invalidate(&rt);
                 continue;
             }
             if command == 4 {
                 stop_speaker();
                 speaking = false;
+                speech_queue.clear();
                 if !mid.is_empty() {
                     state(
                         &rt,
@@ -509,24 +653,31 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
                             let answer = answer
                                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
                                 .unwrap_or(Value::Null);
-                            let text = spoken_answer(&answer);
-                            speaking =
-                                prefs["speak_answers"].as_bool().unwrap_or(true) && speak(&text);
+                            speech_queue = spoken_answer_chunks(&answer).into_iter().collect();
+                            speaking_turn = turn.to_owned();
+                            let text = speech_queue.pop_front();
+                            speaking = prefs["speak_answers"].as_bool().unwrap_or(true)
+                                && text.as_deref().is_some_and(|text| {
+                                    start_speech_chunk(
+                                        &rt,
+                                        &mid,
+                                        turn,
+                                        text,
+                                        last_host,
+                                        &mut playback,
+                                        &mut playback_base,
+                                        &mut playback_host,
+                                    )
+                                });
+                            if !speaking {
+                                speech_queue.clear();
+                            }
                             if speaking {
                                 speaking_since = Instant::now();
-                                let pid = id();
-                                playback_base = rt
-                                    .detail(&mid)
-                                    .ok()
-                                    .and_then(|d| d["duration_ms"].as_u64())
-                                    .unwrap_or(0);
-                                playback_host = last_host;
-                                let _=rt.db().and_then(|db|db.execute("INSERT INTO assistant_playback_events(id,meeting_id,turn_id,text,start_host_ns,start_ms) VALUES (?,?,?,?,?,?)",params![pid,mid,turn,text,last_host,playback_base]).map_err(err));
-                                playback = Some(pid);
                             }
                             state(
                                 &rt,
-                                json!({"state":if speaking{"speaking"}else{"standby"},"meeting_id":mid,"turn_id":turn,"message":if speaking{"小舵正在播报 · 可点击打断"}else{"回答已保存在聊天中"}}),
+                                json!({"state":if speaking{"speaking"}else{"standby"},"meeting_id":mid,"turn_id":turn,"message":if speaking{"正在播报 · 可点击打断"}else{"回答已保存在聊天中"}}),
                             );
                         } else if ["failed", "cancelled"].contains(&state_name.as_str()) {
                             state(
@@ -541,25 +692,50 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
                 stop_speaker();
             }
             if speaking && unsafe { hm_voice_state() } <= 0 {
-                speaking = false;
-                reference_tail = last_host + 700_000_000;
-                state(
-                    &rt,
-                    json!({"state":"standby","meeting_id":mid,"message":"待唤醒"}),
-                );
-                if let Some(d) = detector.as_mut() {
-                    d.reset()
+                if let Some(text) = speech_queue.pop_front() {
+                    speaking = start_speech_chunk(
+                        &rt,
+                        &mid,
+                        &speaking_turn,
+                        &text,
+                        last_host,
+                        &mut playback,
+                        &mut playback_base,
+                        &mut playback_host,
+                    );
+                    if speaking {
+                        speaking_since = Instant::now();
+                        state(
+                            &rt,
+                            json!({"state":"speaking","meeting_id":mid,"turn_id":speaking_turn,"message":"正在继续播报 · 可点击打断"}),
+                        );
+                    }
+                }
+                if !speaking {
+                    speech_queue.clear();
+                    reference_tail = last_host + 700_000_000;
+                    state(
+                        &rt,
+                        json!({"state":"standby","meeting_id":mid,"message":"待唤醒"}),
+                    );
+                    if let Some(d) = detector.as_mut() {
+                        d.reset()
+                    }
                 }
             }
             if command == 1 && !mid.is_empty() && detector.is_some() {
                 stop_speaker();
                 speaking = false;
+                speech_queue.clear();
+                speaking_turn.clear();
                 listening = Some(Listening {
                     pcm: vec![],
                     epoch: revision,
                     utterance: id(),
                     had_speech: false,
+                    pending_end: false,
                     after_wake: 0,
+                    empty_since: None,
                     manual: true,
                     capture_epoch: crate::product::capture_epoch(&rt, &mid).unwrap_or_default(),
                 });
@@ -584,7 +760,7 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
                         && last_frame.elapsed() > Duration::from_secs(2)
                         && listening.is_some()
                     {
-                        invalidate(&rt);
+                        rt.voice.input_gap.store(true, Ordering::Release);
                     }
                     continue;
                 }
@@ -597,7 +773,7 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
             let Some(d) = detector.as_mut() else { continue };
             let pcm = frame.pcm;
             // Our app is excluded from ScreenCaptureKit audio. Use only the controlled TTS
-            // PCM here, never add a second copy of the system recording as a reference.
+            // PCM (bundled wake prompt or TTS) here, never add a second system reference.
             #[cfg(feature = "audio-processing")]
             let pcm = if let Some(p) = apm.as_mut() {
                 // Reanchor each hardware packet while retaining partial DSP
@@ -617,7 +793,7 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
                 }) {
                     Ok(v) => v,
                     Err(_) => {
-                        invalidate(&rt);
+                        rt.voice.input_gap.store(true, Ordering::Release);
                         continue;
                     }
                 }
@@ -630,13 +806,12 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
             if speaking {
                 continue;
             } // Explicit half-duplex while answer is spoken; button interrupt remains available.
-            if listening.is_none() && frame.host < reference_tail {
+            if listening.is_none()
+                && (frame.host < reference_tail || unsafe { hm_voice_state() } > 0)
+            {
                 continue;
             }
-            rolling.extend(pcm.iter().copied());
-            while rolling.len() > 32000 {
-                rolling.pop_front();
-            }
+            append_pre_roll(&mut rolling, &pcm);
             let st = status(&rt).unwrap_or(Value::Null);
             let standby = matches!(
                 st["state"].as_str(),
@@ -644,7 +819,7 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
             );
             let flags = d.accept(&pcm, listening.is_none() && standby);
             if flags < 0 {
-                invalidate(&rt);
+                rt.voice.input_gap.store(true, Ordering::Release);
                 continue;
             }
             if listening.is_none() && standby && flags & 1 != 0 {
@@ -657,16 +832,24 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
                     continue;
                 }
                 let buffer = rolling.iter().copied().collect();
-                listening = Some(Listening {
+                let next = Listening {
                     pcm: buffer,
                     epoch: revision,
                     utterance: id(),
                     had_speech: false,
+                    pending_end: false,
                     after_wake: 0,
+                    empty_since: None,
                     manual: false,
                     capture_epoch: crate::product::capture_epoch(&rt, &mid).unwrap_or_default(),
-                });
-                if speak("小舵在") {
+                };
+                // Own pre-roll and establish listening before starting output.
+                listening = Some(next);
+                state(
+                    &rt,
+                    json!({"state":"listening","meeting_id":mid,"message":"我在，请说","wake_word":prefs["wake_word"]}),
+                );
+                if acknowledge() {
                     let pid = id();
                     playback_base = rt
                         .detail(&mid)
@@ -674,23 +857,17 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
                         .and_then(|d| d["duration_ms"].as_u64())
                         .unwrap_or(0);
                     playback_host = last_host;
-                    let _=rt.db().and_then(|db|db.execute("INSERT INTO assistant_playback_events(id,meeting_id,text,start_host_ns,start_ms) VALUES (?,?,?,?,?)",params![pid,mid,"小舵在",last_host,playback_base]).map_err(err));
+                    let _=rt.db().and_then(|db|db.execute("INSERT INTO assistant_playback_events(id,meeting_id,text,start_host_ns,start_ms) VALUES (?,?,?,?,?)",params![pid,mid,WAKE_RESPONSE_TEXT,last_host,playback_base]).map_err(err));
                     playback = Some(pid);
                 }
-                state(
-                    &rt,
-                    json!({"state":"listening","meeting_id":mid,"message":"小舵在，请说","wake_word":prefs["wake_word"]}),
-                );
                 continue;
             }
             if let Some(l) = listening.as_mut() {
                 l.pcm.extend_from_slice(&pcm);
                 l.after_wake += pcm.len();
-                if flags & 2 != 0 {
-                    l.had_speech = true
-                }
-                let speech_end = l.had_speech && flags & 4 != 0;
-                let timeout = !l.had_speech && l.after_wake >= 80000;
+                let acknowledgement_active = unsafe { hm_voice_state() } > 0;
+                let speech_end = l.endpoint(flags, acknowledgement_active);
+                let timeout = l.empty_timeout(acknowledgement_active, Instant::now());
                 if l.after_wake >= 400000 {
                     state(
                         &rt,
@@ -723,6 +900,205 @@ pub fn background(rt: Arc<Runtime>) -> Worker {
 mod tests {
     use super::*;
     #[test]
+    fn bundled_wake_audio_matches_manifest_and_is_not_generated_speech() {
+        use sha2::{Digest, Sha256};
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../../../../native/voice-assistant/assets/wake-acknowledgement.json"
+        ))
+        .unwrap();
+        assert_eq!(manifest["text"], WAKE_RESPONSE_TEXT);
+        assert_eq!(
+            manifest["asset_sha256"],
+            format!("{:x}", Sha256::digest(WAKE_RESPONSE_WAV))
+        );
+        let pcm = wake_pcm().unwrap();
+        assert_eq!(pcm.len(), 16384);
+        assert_eq!(pcm.len() as u64, manifest["sample_count"].as_u64().unwrap());
+        assert!(pcm.iter().all(|x| x.is_finite() && x.abs() <= 1.));
+        assert!(pcm.iter().any(|x| x.abs() > 0.01));
+    }
+    #[test]
+    fn wake_or_acknowledgement_only_never_creates_a_model_conversation() {
+        let root = tempfile::tempdir().unwrap();
+        let rt = Runtime::open_with_vault(
+            root.path().into(),
+            Arc::new(crate::models::tests::MemoryVault::default()),
+        )
+        .unwrap();
+        let mid = rt.create("合成唤醒空问题", "general").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        rt.db()
+            .unwrap()
+            .execute("UPDATE meetings SET state='recording' WHERE id=?", [&mid])
+            .unwrap();
+        rt.db().unwrap().execute("INSERT INTO recording_sources(meeting_id,source,state,device) VALUES (?,'microphone','active',0)",[&mid]).unwrap();
+        for text in ["小舵同学", "小舵同学，我在。"] {
+            let q = Question {
+                meeting: mid.clone(),
+                pcm: vec![],
+                utterance: id(),
+                epoch: 0,
+                wake: "小舵同学".into(),
+                capture_epoch: String::new(),
+            };
+            recognized(rt.clone(), q, text.into());
+            assert_eq!(
+                status(&rt).unwrap()["message"],
+                "没有识别到问题，请重新唤醒或输入文字"
+            );
+        }
+        assert_eq!(
+            rt.db()
+                .unwrap()
+                .query_row("SELECT count(*) FROM assistant_conversations", [], |r| {
+                    r.get::<_, usize>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn pre_roll_handoff_keeps_last_two_seconds_and_does_not_drop_a_short_question() {
+        let root = tempfile::tempdir().unwrap();
+        let rt = Runtime::open_with_vault(
+            root.path().into(),
+            Arc::new(crate::models::tests::MemoryVault::default()),
+        )
+        .unwrap();
+        let input: Vec<f32> = (0..48000).map(|i| i as f32 / 100000.).collect();
+        let mut rolling = VecDeque::new();
+        for packet in input.chunks(683) {
+            append_pre_roll(&mut rolling, packet);
+        }
+        let mut pcm: Vec<f32> = rolling.iter().copied().collect();
+        assert_eq!(pcm, input[16000..]);
+        let tail = vec![0.; 80000]; // bounded empty-input window after activation
+        pcm.extend_from_slice(&tail);
+        let expected = pcm.clone();
+        finish(
+            &rt,
+            "synthetic",
+            "小舵同学",
+            Listening {
+                pcm,
+                epoch: 0,
+                utterance: id(),
+                had_speech: false,
+                pending_end: false,
+                after_wake: tail.len(),
+                empty_since: None,
+                manual: false,
+                capture_epoch: String::new(),
+            },
+        );
+        let question =
+            take_question(&rt).expect("pre-buffered short question still reaches local ASR");
+        assert_eq!(question.pcm, expected);
+        assert_eq!(question.wake, "小舵同学");
+        finish(
+            &rt,
+            "synthetic",
+            "",
+            Listening {
+                pcm: tail,
+                epoch: 0,
+                utterance: id(),
+                had_speech: false,
+                pending_end: false,
+                after_wake: 80000,
+                empty_since: None,
+                manual: true,
+                capture_epoch: String::new(),
+            },
+        );
+        assert!(take_question(&rt).is_none());
+        rolling.clear();
+        append_pre_roll(&mut rolling, &[0.25; 160]);
+        assert_eq!(rolling.len(), 160); // reset never borrows a previous meeting's pre-roll
+    }
+    #[test]
+    fn short_question_endpoint_waits_for_acknowledgement_without_being_lost() {
+        let mut l = Listening {
+            pcm: vec![],
+            epoch: 0,
+            utterance: id(),
+            had_speech: false,
+            pending_end: false,
+            after_wake: 0,
+            empty_since: None,
+            manual: false,
+            capture_epoch: String::new(),
+        };
+        assert!(!l.endpoint(2, true));
+        assert!(!l.endpoint(4, true));
+        assert!(!l.endpoint(0, true));
+        assert!(l.endpoint(0, false));
+        // A resumed question supersedes the old endpoint until it ends again.
+        assert!(!l.endpoint(2, false));
+        assert!(l.endpoint(4, false));
+    }
+    #[test]
+    fn empty_question_gets_five_full_seconds_after_prompt_not_after_wake() {
+        let mut l = Listening {
+            pcm: vec![],
+            epoch: 0,
+            utterance: id(),
+            had_speech: false,
+            pending_end: false,
+            after_wake: 0,
+            empty_since: None,
+            manual: false,
+            capture_epoch: String::new(),
+        };
+        let wake = Instant::now();
+        // Even an unusually long prompt must not consume the question window.
+        assert!(!l.empty_timeout(true, wake));
+        assert!(!l.empty_timeout(true, wake + Duration::from_secs(6)));
+        let ended = wake + Duration::from_secs(7);
+        assert!(!l.empty_timeout(false, ended));
+        assert!(!l.empty_timeout(false, ended + Duration::from_millis(4999)));
+        assert!(l.empty_timeout(false, ended + Duration::from_secs(5)));
+        // Speech during playback is retained; its endpoint, not empty timeout, wins.
+        l.had_speech = true;
+        assert!(!l.empty_timeout(false, ended + Duration::from_secs(6)));
+        // Button capture / failed prompt has no playback to wait for.
+        l.had_speech = false;
+        l.empty_since = None;
+        assert!(!l.empty_timeout(false, wake));
+        assert!(l.empty_timeout(false, wake + Duration::from_secs(5)));
+    }
+    #[test]
+    fn congested_input_does_not_invalidate_acknowledgement_or_submitted_question() {
+        let root = tempfile::tempdir().unwrap();
+        let rt = Runtime::open_with_vault(
+            root.path().into(),
+            Arc::new(crate::models::tests::MemoryVault::default()),
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        *rt.voice.feed.lock().unwrap() = Some(tx);
+        rt.voice.accepting.store(true, Ordering::Release);
+        let epoch = rt.voice.epoch.load(Ordering::Acquire);
+        state(&rt, json!({"state":"speaking","turn_id":"synthetic-turn"}));
+        rt.voice.questions.lock().unwrap().push_back(Question {
+            meeting: "synthetic".into(),
+            pcm: vec![],
+            utterance: id(),
+            epoch,
+            wake: String::new(),
+            capture_epoch: String::new(),
+        });
+        feed(&rt, "synthetic", 0, &[0.; 160]);
+        feed(&rt, "synthetic", 10_000_000, &[0.; 160]);
+        assert!(rt.voice.input_gap.load(Ordering::Acquire));
+        assert_eq!(rt.voice.epoch.load(Ordering::Acquire), epoch);
+        assert_eq!(status(&rt).unwrap()["state"], "speaking");
+        assert_eq!(take_question(&rt).unwrap().epoch, epoch);
+        assert_eq!(rx.try_recv().unwrap().pcm.len(), 160);
+    }
+    #[test]
     fn disabled_wake_is_visible_and_only_offer_enable_on_eligible_capture() {
         let s = inactive_status("synthetic-meeting", false, false, false);
         assert_eq!(s["state"], "off");
@@ -752,19 +1128,28 @@ mod tests {
             strip_wake("目标包括小舵同学的测试", "小舵同学"),
             "目标包括小舵同学的测试"
         );
+        assert_eq!(
+            strip_wake("先前的会议发言。小舵同学，帮我核对目标。", "小舵同学"),
+            "帮我核对目标。"
+        );
+        assert_eq!(
+            strip_wake("小舵同学，我在想目标是否明确？", "小舵同学"),
+            "我在想目标是否明确？"
+        );
+        assert_eq!(strip_wake("小舵同学", "小舵同学"), "");
     }
     #[test]
     fn speech_never_cuts_a_claim_halfway_or_calls_another_model() {
         let sentence = "先核对目标和验收条件。";
-        let answer = json!({"blocks":[{"text":format!("{sentence}{}","待核对".repeat(80))}]});
+        let answer = json!({"blocks":[{"text":format!("{sentence}{}","待核对".repeat(220))}]});
+        let chunks = spoken_answer_chunks(&answer);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.first().unwrap(), sentence);
         assert_eq!(
-            spoken_answer(&answer),
-            format!("{sentence}详细内容请看聊天。")
+            chunks.iter().map(String::len).sum::<usize>(),
+            answer["blocks"][0]["text"].as_str().unwrap().len()
         );
-        assert_eq!(
-            spoken_answer(&json!({"blocks":[{"text":"长句".repeat(100)}]})),
-            "这段回答较长，请查看聊天中的完整内容。"
-        );
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 560));
     }
     #[test]
     fn chinese_default_tokens() {

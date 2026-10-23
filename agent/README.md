@@ -4,7 +4,7 @@
 
 Pi 显式使用内存资源、设置、凭据接口、SessionManager与自定义 provider；没有编码工具、宿主目录发现、扩展或技能。真实 API Key、HTTP、数据库、版本栅栏和最终引用校验由 Rust 管理。工具只有 get_context、search_evidence、get_transcript、get_methods、propose_action。后者生成待接受的会议准备/笔记草稿，不自行开关录音、确认纪要或执行外部操作。
 
-macOS sidecar同时受 `sandbox-exec` 与 Node permission 约束：禁止网络、子进程、写文件，文件读取只开放打包运行时。无法启动隔离时明确失败，不降级为无沙箱运行。每回合最多8工具、2次检索、6模型调用、一次结构修复和60秒总截止；逐次请求加入全局优先队列，取消时终止 sidecar/HTTP。当前只支持 macOS14+，沙箱接口未来需随平台适配评估。
+macOS sidecar同时受 `sandbox-exec` 与 Node permission 约束：禁止网络、子进程、写文件，文件读取只开放打包运行时。无法启动隔离时明确失败，不降级为无沙箱运行。每个sidecar最多8工具、2次检索、6模型请求、一次结构修复和60秒截止；宿主每回合最多3批旧历史压缩，含最终问答的累计截止180秒；逐次请求加入全局优先队列，取消时终止 sidecar/HTTP。当前只支持 macOS14+，沙箱接口未来需随平台适配评估。
 
 首次准备（项目内缓存，不改全局工具链）：
 
@@ -19,3 +19,8 @@ Intel把target替换为x86_64-apple-darwin。`desktop:dev`/`desktop:build`使用
 `npm run test:agent`验证真实SDK的假模型工具循环、历史/人设及一次修复；macOS还执行运行时读写/网络/子进程负向测试，须先准备本机Rust目标的运行时。Rust的assistant测试覆盖实际隔离sidecar→本地假HTTP代理、语音/文字历史、去重和取消，不调用真实模型。
 
 完整范围、原生语音和实机待验收项见[方案](../docs/舵舟会议专家_全局Agent与语音交互方案.md)、[开发验证](../docs/小舵全局助手开发验证.md)和[AI开发指南](../docs/AI开发指南.md)。
+
+`propose_action.action`支持prepare_meeting/note/todo；todo是待用户确认的本场待办，不能由Agent直接执行写入。回顾笔记/待办时使用user_record回答类型和工具返回的record来源，不能伪装成meeting_fact；背景授权关闭时不提供记录。
+
+
+R66/R68：Pi压缩现已启用，压缩provider请求的工具声明为空并经同一Rust代理；usage/finish_reason透传。Rust按完整轮次有界读取历史、持久保存范围/模型/epoch/through_turn摘要，重建Pi内存checkpoint及近期原话，完整聊天不删除。会议记忆复用有效stage结构化产物，经get_context提供索引，事实引用仍需读原文；总结不为记忆额外重复调用模型。首版限制及证据见[统一总结与记忆验证](../docs/统一总结与记忆开发验证.md)。

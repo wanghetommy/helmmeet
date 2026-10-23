@@ -19,6 +19,7 @@ pub fn target(config: &ModelConfig) -> String {
         Sha256::digest(serde_json::to_vec(config).unwrap_or_default())
     )
 }
+pub const MAX_MODEL_OUTPUT_TOKENS: u32 = 131072;
 pub fn request(
     rt: &Runtime,
     config: &ModelConfig,
@@ -92,14 +93,48 @@ fn request_inner(
     check: &dyn Fn() -> Result<(), String>,
     json_output: bool,
 ) -> Result<String, String> {
-    completion(&request_exchange(
+    completion(&request_with_capacity_retry(
         rt,
         config,
         messages,
         check,
         json_output,
         None,
+        None,
     )?)
+}
+fn request_with_capacity_retry(
+    rt: &Runtime,
+    config: &ModelConfig,
+    messages: Value,
+    check: &dyn Fn() -> Result<(), String>,
+    json_output: bool,
+    tools: Option<&Value>,
+    tool_choice: Option<&Value>,
+) -> Result<Value, String> {
+    let data = request_exchange(
+        rt,
+        config,
+        messages.clone(),
+        check,
+        json_output,
+        tools,
+        tool_choice,
+    )?;
+    if data["choices"][0]["finish_reason"] == "length" {
+        if let Some(next) = larger_output_config(config) {
+            return request_exchange(rt, &next, messages, check, json_output, tools, tool_choice);
+        }
+    }
+    Ok(data)
+}
+/// Exact serialized body size, including tools and provider-specific options.
+pub fn agent_request_bytes(config: &ModelConfig, messages: &Value, tools: &Value) -> usize {
+    let mut body = request_body(config, messages, false);
+    if tools.as_array().is_some_and(|rows| !rows.is_empty()) {
+        body["tools"] = tools.clone();
+    }
+    body.to_string().len()
 }
 pub fn request_agent(
     rt: &Runtime,
@@ -108,7 +143,19 @@ pub fn request_agent(
     tools: &Value,
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<Value, String> {
-    let data = request_exchange(rt, config, messages, check, false, Some(tools))?;
+    let data = request_with_capacity_retry(
+        rt,
+        config,
+        messages,
+        check,
+        false,
+        if tools.as_array().is_some_and(|t| t.is_empty()) {
+            None
+        } else {
+            Some(tools)
+        },
+        None,
+    )?;
     let choice = &data["choices"][0];
     match choice["finish_reason"].as_str() {
         Some("tool_calls") => {
@@ -126,7 +173,116 @@ pub fn request_agent(
             completion(&data)?;
         }
     }
-    Ok(choice["message"].clone())
+    let mut message = choice["message"].clone();
+    message["_usage"] = data["usage"].clone();
+    message["_finish_reason"] = choice["finish_reason"].clone();
+    Ok(message)
+}
+pub fn token_budget(config: &ModelConfig) -> Result<usize, String> {
+    meeting_core::budget::input_tokens(config.context_tokens, config.max_output_tokens)
+        .ok_or_else(|| "模型上下文预算不足，请提高上下文窗口或减少输出预留".into())
+}
+pub fn input_budget(config: &ModelConfig) -> Result<usize, String> {
+    meeting_core::budget::request_bytes(config.context_tokens, config.max_output_tokens)
+        .ok_or_else(|| "模型上下文预算不足，请提高上下文窗口或减少输出预留".into())
+}
+pub fn soft_input_budget(config: &ModelConfig) -> Result<usize, String> {
+    Ok(meeting_core::budget::soft_request_bytes(input_budget(
+        config,
+    )?))
+}
+fn larger_output_config(config: &ModelConfig) -> Option<ModelConfig> {
+    if config.max_output_tokens >= MAX_MODEL_OUTPUT_TOKENS {
+        return None;
+    }
+    let mut next = config.clone();
+    next.max_output_tokens = config
+        .max_output_tokens
+        .saturating_mul(2)
+        .max(config.max_output_tokens.saturating_add(1024))
+        .min(MAX_MODEL_OUTPUT_TOKENS)
+        .min(config.context_tokens.saturating_sub(1));
+    (next.max_output_tokens > config.max_output_tokens).then_some(next)
+}
+pub(crate) fn estimated_tokens(rt: &Runtime, config: &ModelConfig, body: &Value) -> usize {
+    let ratio = rt
+        .db()
+        .ok()
+        .and_then(|db| {
+            db.query_row(
+                "SELECT ratio_milli FROM model_token_observations WHERE model_key=?",
+                [target(config)],
+                |r| r.get::<_, usize>(0),
+            )
+            .ok()
+        })
+        .unwrap_or(1000);
+    (meeting_core::budget::estimate(&body.to_string()) * ratio).div_ceil(1000)
+}
+pub(crate) fn agent_fits(
+    rt: &Runtime,
+    config: &ModelConfig,
+    messages: &Value,
+    tools: &Value,
+    bytes: usize,
+    reserve: usize,
+) -> Result<bool, String> {
+    let mut body = request_body(config, messages, false);
+    if tools.as_array().is_some_and(|a| !a.is_empty()) {
+        body["tools"] = tools.clone();
+    }
+    Ok(body.to_string().len() <= bytes
+        && estimated_tokens(rt, config, &body) <= token_budget(config)?.saturating_sub(reserve))
+}
+pub fn agent_remaining_bytes(
+    rt: &Runtime,
+    config: &ModelConfig,
+    messages: &Value,
+    tools: &Value,
+) -> Result<usize, String> {
+    let mut body = request_body(config, messages, false);
+    if tools.as_array().is_some_and(|v| !v.is_empty()) {
+        body["tools"] = tools.clone();
+    }
+    let current = agent_request_bytes(config, messages, tools);
+    let byte_room = input_budget(config)?.saturating_sub(current);
+    let byte_room = if current >= soft_input_budget(config)? {
+        byte_room.min(2048)
+    } else {
+        byte_room
+    };
+    Ok(
+        byte_room
+            .min(token_budget(config)?.saturating_sub(estimated_tokens(rt, config, &body)) * 2),
+    )
+}
+fn observe_usage(rt: &Runtime, config: &ModelConfig, body: &Value, data: &Value) {
+    if let Some(actual) = data["usage"]["prompt_tokens"].as_u64() {
+        let baseline = meeting_core::budget::estimate(&body.to_string()).max(1) as u64;
+        let ratio = actual
+            .saturating_mul(1000)
+            .div_ceil(baseline)
+            .clamp(1000, 8000);
+        if let Ok(db) = rt.db() {
+            let _=db.execute("INSERT INTO model_token_observations VALUES (?,?) ON CONFLICT(model_key) DO UPDATE SET ratio_milli=max(ratio_milli,excluded.ratio_milli)",params![target(config),ratio]);
+        }
+    }
+}
+fn context_error(code: u16, data: &Value) -> bool {
+    if !matches!(code, 400 | 413 | 422) {
+        return false;
+    }
+    let e = data["error"].to_string().to_lowercase();
+    [
+        "context_length_exceeded",
+        "maximum context length",
+        "context window",
+        "too many tokens",
+        "context length",
+        "上下文长度",
+    ]
+    .iter()
+    .any(|v| e.contains(v))
 }
 fn request_exchange(
     rt: &Runtime,
@@ -135,16 +291,12 @@ fn request_exchange(
     check: &dyn Fn() -> Result<(), String>,
     mut json_output: bool,
     tools: Option<&Value>,
+    tool_choice: Option<&Value>,
 ) -> Result<Value, String> {
     let (endpoint, _) = config.endpoint()?;
-    // Conservative byte budget; an unavailable tokenizer must not imply unlimited context.
-    if messages.to_string().len()
-        > config
-            .context_tokens
-            .checked_sub(config.max_output_tokens)
-            .ok_or("模型上下文预算无效")? as usize
-    {
-        return Err("输入超过此配置的保守上下文预算，请缩小范围、模板或会议信息".into());
+    let budget = input_budget(config)?;
+    if messages.to_string().len() > budget {
+        return Err("请求体超过当前模型输入安全预算，请压缩或减少本轮取证".into());
     }
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -160,12 +312,16 @@ fn request_exchange(
         if let Some(tools) = tools {
             body["tools"] = tools.clone();
         }
-        if body.to_string().len()
-            > config
-                .context_tokens
-                .saturating_sub(config.max_output_tokens) as usize
-        {
-            return Err("工具与会话超过上下文预算，请开始新对话或缩小范围".into());
+        if let Some(tool_choice) = tool_choice {
+            body["tool_choice"] = tool_choice.clone();
+        }
+        if body.to_string().len() > budget {
+            return Err("工具与会话超过当前模型输入安全预算，请压缩或减少本轮取证".into());
+        }
+        if estimated_tokens(rt, config, &body) > token_budget(config)? {
+            return Err(
+                "模型上下文容量不足：估算输入tokens超过该配置余量，请压缩或减少本轮取证".into(),
+            );
         }
         let mut request = client.post(endpoint.clone()).json(&body);
         if let Some(key) = key {
@@ -180,9 +336,7 @@ fn request_exchange(
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<u64>().ok());
-                let data = if (200..300).contains(&code)
-                    || (json_output && matches!(code, 400 | 422))
-                {
+                let data = if (200..300).contains(&code) || matches!(code, 400 | 413 | 422) {
                     let mut response = response;
                     let mut bytes = Vec::new();
                     while let Some(chunk) =
@@ -213,7 +367,11 @@ fn request_exchange(
         match response {
             Ok((code, _, Some(data))) if (200..300).contains(&code) => {
                 let data = data.map_err(str::to_string)?;
+                observe_usage(rt, config, &body, &data);
                 return Ok(data);
+            }
+            Ok((code, _, Some(Ok(data)))) if context_error(code, &data) => {
+                return Err("模型上下文容量不足：服务拒绝了本轮输入长度".into());
             }
             Ok((code, _, Some(Ok(body))))
                 if json_output && format_unsupported(code, &body) && attempt < 2 =>
@@ -243,6 +401,55 @@ fn request_exchange(
         }
     }
     Err("请求失败".into())
+}
+
+/// Sends a fixed, synthetic tool call to verify that a model profile supports
+/// the protocol required by the meeting assistant. No meeting data is sent.
+pub fn test_tool_call(
+    rt: &Runtime,
+    config: &ModelConfig,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "helmmeet_tool_probe",
+            "description": "固定连接测试工具，不执行任何外部操作。",
+            "parameters": {"type":"object","properties":{},"additionalProperties":false}
+        }
+    }]);
+    let messages = json!([
+        {"role":"system","content":"这是模型能力连接测试。只能调用指定工具，不要输出正文。"},
+        {"role":"user","content":"请调用 helmmeet_tool_probe。"}
+    ]);
+    let choice = json!({"type":"function","function":{"name":"helmmeet_tool_probe"}});
+    let data = request_exchange(
+        rt,
+        config,
+        messages,
+        check,
+        false,
+        Some(&tools),
+        Some(&choice),
+    )?;
+    let item = &data["choices"][0];
+    if item["finish_reason"] != "tool_calls" {
+        return Err("模型未返回工具调用，当前配置不能完成助手取证".into());
+    }
+    let calls = item["message"]["tool_calls"]
+        .as_array()
+        .ok_or("模型工具调用格式无效")?;
+    let valid = calls.iter().any(|call| {
+        call["type"] == "function"
+            && call["function"]["name"] == "helmmeet_tool_probe"
+            && call["function"]["arguments"].as_str().is_some_and(|args| {
+                serde_json::from_str::<Value>(args).is_ok_and(|v| v == json!({}))
+            })
+    });
+    if !valid {
+        return Err("模型返回了无法解析的工具调用参数".into());
+    }
+    Ok(())
 }
 fn cancellable_wait(
     duration: Duration,
@@ -323,7 +530,7 @@ pub fn validate(value: &Value, known: &HashSet<(String, u64)>) -> Result<(), Str
         if items.len() > 200 {
             return Err("模型结果条数超限".into());
         }
-        for item in items {
+        for (index, item) in items.iter().enumerate() {
             let field = if key == "actions" { "task" } else { "text" };
             let text = item[field].as_str().ok_or("模型文本字段无效")?;
             if text.is_empty() || text.len() > 12000 {
@@ -334,7 +541,7 @@ pub fn validate(value: &Value, known: &HashSet<(String, u64)>) -> Result<(), Str
                     section.as_str(),
                     Some("topic" | "outline" | "progress" | "open" | "minutes" | "answer")
                 ) {
-                    return Err("结果章节无效".into());
+                    return Err(format!("{key}[{index}].section无效：只能是topic、outline、progress、open、minutes、answer之一；中文章节名写入text，不能把task_type或kind填入section"));
                 }
             }
             let evidence = item["evidence"].as_array().ok_or("模型缺少引用")?;
@@ -351,13 +558,19 @@ pub fn validate(value: &Value, known: &HashSet<(String, u64)>) -> Result<(), Str
                     )
                 )
             {
-                return Err("模型分类字段无效".into());
+                return Err(format!("summary[{index}].kind无效：只能是discussion、decision、risk、question、suggestion、unanswered之一；不能使用task_type、section或中文分类名"));
             }
             let nonfact = key == "summary"
                 && (item["kind"] == "suggestion"
                     || (item["kind"] == "unanswered" && text == "会议中未明确"));
-            if evidence.len() > 32 || (evidence.is_empty() && !nonfact) {
-                return Err("模型事实缺少依据".into());
+            if evidence.len() > 32 {
+                return Err(format!(
+                    "{key}[{index}]引用过多：{}条，上限32条；请按独立事实拆分条目并保留各自引用",
+                    evidence.len()
+                ));
+            }
+            if evidence.is_empty() && !nonfact {
+                return Err(format!("{key}[{index}]事实或行动缺少依据：evidence为空；事实须补充原文引用，无依据则删除该条；未明确事项只能返回kind=unanswered、text=会议中未明确、evidence=[]"));
             }
             for reference in evidence {
                 let pair = (
@@ -381,6 +594,26 @@ pub fn validate(value: &Value, known: &HashSet<(String, u64)>) -> Result<(), Str
         }
     }
     Ok(())
+}
+pub(crate) fn split_segment(seg: &Value, limit: usize) -> Vec<Value> {
+    let text = seg["text"].as_str().unwrap_or("");
+    let mut out = vec![];
+    let mut start = 0usize;
+    let mut offset = 0usize;
+    let mut chunk = String::new();
+    for c in text.chars() {
+        if chunk.len() + c.len_utf8() > limit && !chunk.is_empty() {
+            out.push(json!({"segment_id":seg["id"],"revision":seg["revision"],"text":chunk,"start_ms":seg["start_ms"],"fragment_start":start,"fragment_end":offset}));
+            chunk = String::new();
+            start = offset;
+        }
+        chunk.push(c);
+        offset += 1;
+    }
+    if !chunk.is_empty() {
+        out.push(json!({"segment_id":seg["id"],"revision":seg["revision"],"text":chunk,"start_ms":seg["start_ms"],"fragment_start":start,"fragment_end":offset}));
+    }
+    out
 }
 fn sections_valid(value: &Value) -> bool {
     value["summary"]
@@ -484,12 +717,37 @@ impl CitationScope {
                 .into_iter()
                 .flatten()
             {
+                if key == "summary" {
+                    if let Some(kind) = item["kind"]
+                        .as_str()
+                        .and_then(meeting_core::summary::canonical_kind)
+                    {
+                        item["kind"] = json!(kind);
+                    }
+                }
+                // A model's unsupported "unanswered" wording is not a meeting
+                // fact. Drop its unverified wording rather than rejecting the
+                // whole minutes draft or promoting it to an uncited fact.
+                if key == "summary"
+                    && item["kind"] == "unanswered"
+                    && item["evidence"].as_array().is_some_and(Vec::is_empty)
+                    && item["text"]
+                        .as_str()
+                        .is_some_and(|t| !t.trim().is_empty() && t.len() <= 12000)
+                {
+                    item["text"] = json!("会议中未明确");
+                }
                 for r in item
                     .get_mut("evidence")
                     .and_then(Value::as_array_mut)
                     .into_iter()
                     .flatten()
                 {
+                    if let Some((sid, rev)) = r.as_str().and_then(|alias| self.aliases.get(alias)) {
+                        // A short alias already freezes one exact revision. This
+                        // expands known data; it never guesses an ID or revision.
+                        *r = json!({"segment_id":sid,"revision":rev});
+                    }
                     if let Some((sid, rev)) =
                         r["segment_id"].as_str().and_then(|s| self.aliases.get(s))
                     {
@@ -507,12 +765,77 @@ impl CitationScope {
         Ok(value)
     }
 }
+#[cfg(test)]
+static MEETING_DIAGNOSTICS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn diagnostic_shape(input: &Value, parsed: &Result<Value, String>, result: &Result<Value, String>) {
+    if std::env::var("HELMMEET_ALLOW_MEETING_MODEL").as_deref() != Ok("1") {
+        return;
+    }
+    let mut rows = Vec::new();
+    if let Ok(value) = parsed {
+        for key in ["summary", "actions"] {
+            for (index, item) in value[key].as_array().into_iter().flatten().enumerate() {
+                // Only known classifications are safe to log; arbitrary model
+                // strings may contain private meeting content.
+                let kind = item["kind"]
+                    .as_str()
+                    .filter(|k| {
+                        matches!(
+                            *k,
+                            "discussion"
+                                | "decision"
+                                | "risk"
+                                | "question"
+                                | "suggestion"
+                                | "unanswered"
+                        )
+                    })
+                    .unwrap_or("other");
+                let section = item["section"]
+                    .as_str()
+                    .filter(|s| {
+                        matches!(
+                            *s,
+                            "topic" | "outline" | "progress" | "open" | "minutes" | "answer"
+                        )
+                    })
+                    .unwrap_or("other");
+                let refs = item["evidence"].as_array();
+                rows.push(json!({
+                    "list": key, "index": index, "kind": kind, "section": section,
+                    "text_chars": item["text"].as_str().map(|s| s.chars().count()),
+                    "canonical_unanswered": item["text"] == "会议中未明确",
+                    "references": refs.map(Vec::len),
+                    "reference_strings": refs.map(|r| r.iter().filter(|v| v.is_string()).count()),
+                    "reference_objects_with_id": refs.map(|r| r.iter().filter(|v| v["segment_id"].is_string()).count())
+                }));
+            }
+        }
+    }
+    MEETING_DIAGNOSTICS.lock().unwrap().push(json!({
+        "phase": if input["transcript"].is_array() { "map" } else { "reduce" },
+        "input_segments": input["transcript"].as_array().map(Vec::len),
+        "allowed_references": input["allowed_evidence"].as_array().map(Vec::len),
+        "items": rows, "validation_error": result.as_ref().err()
+    }));
+}
 fn checked_request(
+    rt: &Runtime,
+    check: &dyn Fn() -> Result<(), String>,
+    config: &ModelConfig,
+    input: Value,
+    known: &HashSet<(String, u64)>,
+) -> Result<Value, String> {
+    grounded_request(rt, check, config, input, known, &|| Ok(()))
+}
+pub(crate) fn grounded_request(
     rt: &Runtime,
     check: &dyn Fn() -> Result<(), String>,
     config: &ModelConfig,
     mut input: Value,
     known: &HashSet<(String, u64)>,
+    before: &dyn Fn() -> Result<(), String>,
 ) -> Result<Value, String> {
     // Keep request task type distinct from summary item classification, including
     // legacy callers and reduce requests. Never reinterpret invalid output as fact.
@@ -521,11 +844,25 @@ fn checked_request(
             object.insert("task_type".into(), kind);
         }
     }
+    input["output_contract"] = json!({
+        "summary": {"type":"array","item":{
+            "required":["text","kind","section","evidence"],
+            "kind":{"enum":["discussion","decision","risk","question","suggestion","unanswered"]},
+            "section":{"enum":["topic","outline","progress","open","minutes","answer"]}
+        }},
+        "actions":{"type":"array"}
+    });
     let citations = prepare_citations(&mut input, known)?;
     let messages =
         json!([{"role":"system","content":RULES},{"role":"user","content":input.to_string()}]);
+    before()?;
     let output = request(rt, config, messages.clone(), check)?;
-    let first = parse(&output).and_then(|v| citations.restore_and_validate(v));
+    let parsed = parse(&output);
+    let first = parsed
+        .clone()
+        .and_then(|v| citations.restore_and_validate(v));
+    #[cfg(test)]
+    diagnostic_shape(&input, &parsed, &first);
     if let Ok(value) = first {
         return Ok(value);
     }
@@ -533,10 +870,15 @@ fn checked_request(
     check()?;
     // Regenerate from the original evidence instead of doubling context with a malformed reply.
     let mut repair = messages;
-    repair.as_array_mut().unwrap().push(json!({"role":"user","content":format!("上次结果未通过校验：{reason}。请依据同一输入重新生成一个完整JSON对象，必须含summary和actions数组。summary每项须有text、kind、section、evidence。kind只能是discussion、decision、risk、question、suggestion、unanswered之一，不能使用任务类型stage/minutes/answer或章节名；section只能是topic、outline、progress、open、minutes、answer之一。引用只能逐字复制allowed_evidence中的segment_id短编号与revision，不能使用上个批次或历史结果的编号。没有依据不增加事实，缺失的行动负责人/日期用null。不要Markdown或说明文字。") }));
-    let value = parse(&request(rt, config, repair, check)?)
-        .map_err(|e| format!("重新生成后仍未得到有效结构：{e}"))?;
-    citations.restore_and_validate(value)
+    repair.as_array_mut().unwrap().push(json!({"role":"user","content":format!("上次结果未通过校验：{reason}。请依据同一输入重新生成一个完整JSON对象，必须含summary和actions数组。summary每项须有text、kind、section、evidence。kind只能是discussion、decision、risk、question、suggestion、unanswered之一，不能使用任务类型stage/minutes/answer或章节名；section只能是topic、outline、progress、open、minutes、answer之一。evidence可以直接使用短编号字符串数组，如[\"ref_001\"]；只能逐字复制本次allowed_evidence中的编号，不能使用上个批次或历史结果的编号。单条事实最多32个引用，超过则拆成多条。没有依据不增加事实，缺失的行动负责人/日期用null。不要Markdown或说明文字。") }));
+    before()?;
+    let parsed = parse(&request(rt, config, repair, check)?);
+    let result = parsed
+        .clone()
+        .and_then(|v| citations.restore_and_validate(v));
+    #[cfg(test)]
+    diagnostic_shape(&input, &parsed, &result);
+    result.map_err(|e| format!("模型输出校验失败：{e}"))
 }
 pub fn test_structure(
     rt: &Runtime,
@@ -634,6 +976,26 @@ fn submit_inner(
         let existing=rt.db()?.query_row("SELECT id FROM analysis_jobs WHERE meeting_id=? AND type='stage' AND state IN('pending','running') ORDER BY rowid LIMIT 1",[meeting],|r|r.get::<_,String>(0)).optional().map_err(err)?;
         if let Some(job) = existing {
             return Ok(json!({"job_id":job}));
+        }
+    }
+    if kind == "stage"
+        && matches!(scope, "" | "all")
+        && crate::workspace::pending(&rt, meeting)?.is_empty()
+    {
+        if let Some(artifact) = detail["artifacts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|a| {
+                a["type"] == "stage"
+                    && a["status"] != "stale"
+                    && a["content"]["manual_text"].is_null()
+            })
+        {
+            let previous:Option<String>=rt.db()?.query_row("SELECT id FROM analysis_jobs WHERE meeting_id=? AND type='stage' AND state='succeeded' ORDER BY rowid DESC LIMIT 1",[meeting],|r|r.get(0)).optional().map_err(err)?;
+            if let Some(job) = previous {
+                return Ok(json!({"job_id":job,"artifact_id":artifact["id"],"reused":true}));
+            }
         }
     }
     let key = id();
@@ -758,6 +1120,7 @@ fn submit_inner(
             } else {
                 None
             };
+            let pending_before = crate::workspace::pending(&rt, &mid)?;
             let mut new_manifest = segments
                 .iter()
                 .map(|s| json!({"segment_id":s["id"],"revision":s["revision"]}))
@@ -814,13 +1177,17 @@ fn submit_inner(
             } else {
                 json!({"bindings":[],"excerpts":[],"terms":[]})
             };
+            if output_kind == "stage" {
+                segments
+                    .sort_by_key(|s| !pending_before.contains_key(s["id"].as_str().unwrap_or("")));
+            }
             let task_context = json!({"kind":output_kind,"template":instructions,"question":input["question"],"meeting_context":if context_allowed {detail["context"].clone()} else {Value::Null},"existing_actions":detail["actions"],"previous_summary":previous.as_ref().map(|a|&a["content"]),"chat_history":history,"selected_background":knowledge});
-            let manifest = segments
+            let mut manifest = segments
                 .iter()
                 .map(|s| json!({"segment_id":s["id"],"revision":s["revision"]}))
                 .collect::<Vec<_>>();
             let excluded_manifest = segments.iter().filter(|s|s["assistant_playback_overlap"]==true).map(|s|json!({"segment_id":s["id"],"revision":s["revision"],"reason":"assistant_playback_overlap"})).collect::<Vec<_>>();
-            let snapshot = json!({"excluded_manifest":excluded_manifest,"citation_policy":"batch_aliases_no_assistant_overlap_v1","request":input,"manifest":manifest,"new_manifest":new_manifest,"template":detail["template"],"knowledge_manifest":knowledge["bindings"],"config":config,"generation":generation,"consent_version":detail["consent_version"],"previous_artifact_id":previous.as_ref().map(|a|&a["id"]),"through_ms":detail["duration_ms"]});
+            let mut snapshot = json!({"excluded_manifest":excluded_manifest,"citation_policy":"batch_aliases_no_assistant_overlap_v1","request":input,"manifest":manifest,"new_manifest":new_manifest,"template":detail["template"],"knowledge_manifest":knowledge["bindings"],"config":config,"generation":generation,"consent_version":detail["consent_version"],"previous_artifact_id":previous.as_ref().map(|a|&a["id"]),"through_ms":detail["duration_ms"]});
             let frozen_key = format!("{:x}", Sha256::digest(format!("{task}:{snapshot}")));
             rt.db()?.execute("UPDATE analysis_jobs SET idempotency_key=?,input_snapshot=?,state='running',attempts=attempts+1 WHERE id=?",params![frozen_key,snapshot.to_string(),task]).map_err(err)?;
             let known: HashSet<_> = segments
@@ -845,29 +1212,65 @@ fn submit_inner(
                 check_job(&rt, &mid, generation, &task, automatic)
             };
             let overhead = RULES.len() + task_context.to_string().len() + 1024;
-            let batch_limit = (config.context_tokens - config.max_output_tokens) as usize;
-            let batch_limit = batch_limit.saturating_sub(overhead).min(18000);
+            let batch_limit = input_budget(&config)?;
+            let batch_limit = batch_limit
+                .saturating_sub(overhead)
+                .min(input_budget(&config)? * 2 / 5)
+                .min(10 * 1024);
             if batch_limit < 256 {
                 return Err("模板和会议背景超过上下文预算，请精简或提高配置容量".into());
             }
             let mut batches = vec![];
             let mut current = vec![];
             let mut size = 0;
-            for seg in segments
+            'segments: for seg in segments
                 .iter()
                 .filter(|s| s["assistant_playback_overlap"] != true)
             {
-                // Reserve room for the per-request allowed_evidence entry.
-                let n = seg.to_string().len() + 64;
-                if size + n > batch_limit && !current.is_empty() {
-                    batches.push(std::mem::take(&mut current));
-                    size = 0;
+                let pieces = split_segment(seg, batch_limit.saturating_sub(512).max(64));
+                for piece in pieces {
+                    if output_kind == "stage"
+                        && pending_before.contains_key(seg["id"].as_str().unwrap_or(""))
+                    {
+                        let exists:bool=rt.db()?.query_row("SELECT EXISTS(SELECT 1 FROM summary_fragments f JOIN artifacts a ON a.id=f.artifact_id WHERE f.meeting_id=? AND f.segment_id=? AND f.revision=? AND f.char_start<=? AND f.char_end>=? AND a.status!='stale')",params![mid,piece["segment_id"].as_str(),piece["revision"].as_u64(),piece["fragment_start"].as_u64(),piece["fragment_end"].as_u64()],|r|r.get(0)).map_err(err)?;
+                        if exists {
+                            continue;
+                        }
+                    }
+                    let n = piece.to_string().len() + 96;
+                    if size + n > batch_limit && !current.is_empty() {
+                        batches.push(std::mem::take(&mut current));
+                        if automatic.is_some() && batches.len() >= 2 {
+                            break 'segments;
+                        }
+                        size = 0;
+                    }
+                    current.push(piece);
+                    size += n;
                 }
-                current.push(json!({"segment_id":seg["id"],"revision":seg["revision"],"text":seg["text"],"start_ms":seg["start_ms"],"assistant_playback_overlap":seg["assistant_playback_overlap"]}));
-                size += n;
             }
             if !current.is_empty() {
                 batches.push(current);
+            }
+            if automatic.is_some() {
+                batches.truncate(2);
+            }
+            let fragments = batches.iter().flatten().cloned().collect::<Vec<_>>();
+            let selected = fragments
+                .iter()
+                .filter_map(reference_pair)
+                .collect::<HashSet<_>>();
+            if output_kind == "stage" {
+                new_manifest.retain(|r| reference_pair(r).is_some_and(|p| selected.contains(&p)));
+                manifest.retain(|r| reference_pair(r).is_some_and(|p| selected.contains(&p)));
+                snapshot["manifest"] = json!(manifest);
+                snapshot["new_manifest"] = json!(new_manifest);
+                rt.db()?
+                    .execute(
+                        "UPDATE analysis_jobs SET input_snapshot=? WHERE id=?",
+                        params![snapshot.to_string(), task],
+                    )
+                    .map_err(err)?;
             }
             let mut outputs = vec![];
             let mut groups = 0usize;
@@ -946,8 +1349,23 @@ fn submit_inner(
                 .flatten()
                 .filter(|c| c["state"] == "missing" || c["state"] == "failed")
                 .count();
-            let incomplete = covered < duration || gaps > 0 || assistant_overlap > 0;
+            let mut incomplete = covered < duration || gaps > 0 || assistant_overlap > 0;
             let version:u32=tx.query_row("SELECT coalesce(max(version),0)+1 FROM artifacts WHERE meeting_id=? AND type=?",params![mid,output_kind],|r|r.get(0)).map_err(err)?;
+            if output_kind == "stage"
+                && (pending_before.len() > new_manifest.len()
+                    || fragments.iter().any(|f| {
+                        f["fragment_start"].as_u64().unwrap_or(0) > 0
+                            || segments
+                                .iter()
+                                .find(|s| s["id"] == f["segment_id"])
+                                .is_some_and(|s| {
+                                    f["fragment_end"].as_u64().unwrap_or(0)
+                                        < s["text"].as_str().unwrap_or("").chars().count() as u64
+                                })
+                    }))
+            {
+                incomplete = true;
+            }
             let artifact = id();
             let coverage = json!({"from_ms":0,"to_ms":duration,"processed_ms":covered,"assistant_playback_overlap_segments":assistant_overlap,"incomplete":incomplete,"model":config.model,"profile_id":config.profile_id,"config_version":config.config_version,"profile_name":config.display_name,"base_url":config.base_url,"question":input["question"],"generated_at":now(),"assistant_id":assistant_id,"template_version":detail["template"]["version"],"manifest":manifest,"knowledge_manifest":knowledge["bindings"],"background_excerpts":knowledge["excerpts"],"incremental":previous.is_some()});
             tx.execute(
@@ -963,6 +1381,25 @@ fn submit_inner(
                 ],
             )
             .map_err(err)?;
+            if output_kind == "stage" && matches!(scope, "" | "all") {
+                tx.execute(
+                    "INSERT INTO meeting_memories VALUES (?,?,?,?,?,?)",
+                    params![
+                        artifact,
+                        mid,
+                        generation,
+                        detail["consent_version"].as_u64().unwrap_or(0),
+                        serde_json::to_string(&manifest).map_err(err)?,
+                        now()
+                    ],
+                )
+                .map_err(err)?;
+                tx.execute(
+                    "UPDATE summary_schedules SET completed_asr_ms=(SELECT coalesce(sum(end_ms-start_ms),0) FROM asr_chunks WHERE meeting_id=?) WHERE meeting_id=?",
+                    params![mid, mid],
+                )
+                .map_err(err)?;
+            }
             for (key, list) in [
                 ("summary", &value["summary"]),
                 ("actions", &value["actions"]),
@@ -1019,11 +1456,62 @@ fn submit_inner(
                 }
             }
             if output_kind == "stage" && matches!(scope, "" | "all") {
-                for r in &new_manifest {
-                    tx.execute("INSERT INTO summary_coverage VALUES (?,?,?) ON CONFLICT(meeting_id,segment_id) DO UPDATE SET revision=excluded.revision",params![mid,r["segment_id"].as_str(),r["revision"].as_u64()]).map_err(err)?;
+                for f in &fragments {
+                    if pending_before.contains_key(f["segment_id"].as_str().unwrap_or("")) {
+                        tx.execute(
+                            "INSERT OR REPLACE INTO summary_fragments VALUES (?,?,?,?,?,?)",
+                            params![
+                                mid,
+                                f["segment_id"].as_str(),
+                                f["revision"].as_u64(),
+                                f["fragment_start"].as_u64(),
+                                f["fragment_end"].as_u64(),
+                                artifact
+                            ],
+                        )
+                        .map_err(err)?;
+                    }
                 }
+                for r in &new_manifest {
+                    let text:String=tx.query_row("SELECT text FROM transcript_revisions WHERE meeting_id=? AND segment_id=? AND revision=?",params![mid,r["segment_id"].as_str(),r["revision"].as_u64()],|row|row.get(0)).map_err(err)?;
+                    let mut q=tx.prepare("SELECT f.char_start,f.char_end FROM summary_fragments f JOIN artifacts a ON a.id=f.artifact_id WHERE f.meeting_id=? AND f.segment_id=? AND f.revision=? AND a.status!='stale' ORDER BY f.char_start").map_err(err)?;
+                    let spans = q
+                        .query_map(
+                            params![mid, r["segment_id"].as_str(), r["revision"].as_u64()],
+                            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                        )
+                        .map_err(err)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(err)?;
+                    let mut through = 0;
+                    for (start, end) in spans {
+                        if start > through {
+                            break;
+                        }
+                        through = through.max(end);
+                    }
+                    if through >= text.chars().count() as u64 {
+                        tx.execute("INSERT INTO summary_coverage VALUES (?,?,?) ON CONFLICT(meeting_id,segment_id) DO UPDATE SET revision=excluded.revision",params![mid,r["segment_id"].as_str(),r["revision"].as_u64()]).map_err(err)?;
+                    }
+                }
+                let first_gap:Option<u64>=tx.query_row("SELECT min(s.start_ms) FROM transcript_segments s LEFT JOIN summary_coverage c ON c.segment_id=s.id AND c.meeting_id=s.meeting_id WHERE s.meeting_id=? AND s.state IN('final','edited') AND (c.revision IS NULL OR c.revision!=s.current_revision)",[&mid],|r|r.get(0)).map_err(err)?;
+                let mut current_coverage = coverage.clone();
+                current_coverage["to_ms"] =
+                    json!(first_gap
+                        .unwrap_or_else(|| detail["asr_processed_ms"].as_u64().unwrap_or(0)));
+                current_coverage["asr_through_ms"] = detail["asr_processed_ms"].clone();
                 tx.execute(
-                    "UPDATE summary_schedules SET failures=0,paused_reason=NULL WHERE meeting_id=?",
+                    "UPDATE artifacts SET coverage_json=? WHERE id=?",
+                    params![current_coverage.to_string(), artifact],
+                )
+                .map_err(err)?;
+                tx.execute(
+                    "DELETE FROM summary_model_backoff WHERE model_key=?",
+                    [target(&config)],
+                )
+                .map_err(err)?;
+                tx.execute(
+                    "UPDATE summary_schedules SET failures=0,retry_after_utc=0,paused_reason=NULL WHERE meeting_id=?",
                     [&mid],
                 )
                 .map_err(err)?;
@@ -1059,25 +1547,62 @@ fn submit_inner(
                 let changed=db.execute("UPDATE analysis_jobs SET state=?,error_code=? WHERE id=? AND state IN('pending','running')",params![if invalid {"cancelled"}else{"failed"},e,task]).unwrap_or(0);
                 let changed = if invalid { 0 } else { changed };
                 if changed > 0 && automatic.is_some() {
-                    let permanent = e.contains("HTTP 400")
-                        || e.contains("HTTP 422")
-                        || e.contains("HTTP 401")
-                        || e.contains("HTTP 403")
-                        || e.contains("HTTP 404")
-                        || (!e.contains("HTTP") && (e.contains("凭据") || e.contains("授权")));
+                    let transient = e.contains("HTTP 429")
+                        || e.contains("HTTP 5")
+                        || e.contains("连接失败")
+                        || e.contains("超时")
+                        || e.contains("响应读取失败");
                     let retry = e
                         .split("retry_after_seconds=")
                         .nth(1)
                         .and_then(|n| n.parse::<u64>().ok())
                         .unwrap_or(0);
+                    let attempts: u64 = db
+                        .query_row(
+                            "SELECT failures FROM summary_schedules WHERE meeting_id=?",
+                            [&mid],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    // Invalid output is recoverable, but cannot create an
+                    // unlimited automatic model loop. Each job already has one
+                    // repair; stop after three consecutive failed jobs.
+                    let output_failure = e.starts_with("模型输出校验失败：");
+                    let permanent = if output_failure {
+                        attempts >= 2
+                    } else {
+                        !transient
+                    };
+                    let delay = match attempts {
+                        0 => 30,
+                        1 => 120,
+                        _ => 300,
+                    };
                     let retry_at = chrono::Utc::now()
                         .timestamp()
-                        .saturating_add(i64::try_from(retry).unwrap_or(i64::MAX));
+                        .saturating_add(i64::try_from(retry.max(delay)).unwrap_or(i64::MAX));
                     let _ = db.execute(
                         "UPDATE summary_schedules SET retry_after_utc=? WHERE meeting_id=?",
                         params![retry_at, mid],
                     );
-                    let _=db.execute("UPDATE summary_schedules SET failures=failures+1,paused_reason=CASE WHEN ? OR failures+1>=3 THEN ? ELSE NULL END WHERE meeting_id=?",params![permanent,e,mid]);
+                    if transient {
+                        if let Ok(config) = serde_json::from_value::<ModelConfig>(
+                            db.query_row(
+                                "SELECT input_snapshot FROM analysis_jobs WHERE id=?",
+                                [&task],
+                                |r| r.get::<_, String>(0),
+                            )
+                            .ok()
+                            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                            .unwrap_or(Value::Null)["config"]
+                                .clone(),
+                        ) {
+                            let probe_after =
+                                retry_at.max(chrono::Utc::now().timestamp().saturating_add(300));
+                            let _=db.execute("INSERT INTO summary_model_backoff VALUES (?,?) ON CONFLICT(model_key) DO UPDATE SET retry_after_utc=max(retry_after_utc,excluded.retry_after_utc)",params![target(&config),probe_after]);
+                        }
+                    }
+                    let _=db.execute("UPDATE summary_schedules SET failures=failures+1,paused_reason=CASE WHEN ? THEN ? ELSE NULL END WHERE meeting_id=?",params![permanent,e,mid]);
                 }
             }
         }
@@ -1214,6 +1739,23 @@ mod tests {
         json!({"summary":[{"text":"合成结论中有 {括号} 与引号\"，保持原文依据","kind":"discussion","section":"topic","evidence":[{"segment_id":"s1","revision":1}]}],"actions":[]})
     }
     #[test]
+    fn output_capacity_grows_only_within_the_configured_capability() {
+        let mut config = ModelConfig {
+            context_tokens: 524288,
+            max_output_tokens: 4096,
+            ..ModelConfig::default()
+        };
+        assert_eq!(
+            larger_output_config(&config).unwrap().max_output_tokens,
+            8192
+        );
+        config.max_output_tokens = MAX_MODEL_OUTPUT_TOKENS;
+        assert!(larger_output_config(&config).is_none());
+        config.context_tokens = 8192;
+        config.max_output_tokens = 8191;
+        assert!(larger_output_config(&config).is_none());
+    }
+    #[test]
     fn accepts_wrapped_complete_json_but_never_salvages_truncation_or_multiple_results() {
         let json = fact().to_string();
         for text in [
@@ -1228,6 +1770,71 @@ mod tests {
         assert!(parse(&format!("{json}\n{json}")).is_err());
         assert!(parse("<think>incomplete").is_err());
         assert!(parse("[]").is_err());
+    }
+    #[test]
+    fn full_request_dynamic_boundary_is_independent_from_tokens_and_usage_is_aggregate() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (_dir, rt, mut config) = fixture(&format!("http://{}", listener.local_addr().unwrap()));
+        config.context_tokens = 131072;
+        let limit = input_budget(&config).unwrap();
+        let make = |n| json!([{"role":"user","content":"中".repeat(n)}]);
+        let mut lo = 0usize;
+        let mut hi = 200000usize;
+        while lo < hi {
+            let n = lo + (hi - lo).div_ceil(2);
+            if request_body(&config, &make(n), true).to_string().len() <= limit {
+                lo = n;
+            } else {
+                hi = n - 1;
+            }
+        }
+        let messages = make(lo);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let input = receive(&mut stream);
+            assert!(
+                input.to_string().len() > limit.saturating_sub(1024)
+                    && input.to_string().len() <= limit
+            );
+            let mut result = reply("合成成功");
+            result["usage"] = json!({"prompt_tokens":70000,"completion_tokens":5});
+            respond(&mut stream, 200, result);
+        });
+        assert_eq!(
+            request(&rt, &config, messages.clone(), &|| Ok(())).unwrap(),
+            "合成成功"
+        );
+        server.join().unwrap();
+        assert!(request(&rt, &config, make(lo + 1), &|| Ok(()))
+            .unwrap_err()
+            .contains("输入安全预算"));
+        let row: usize = rt
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT ratio_milli FROM model_token_observations WHERE model_key=?",
+                [target(&config)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(row > 1000);
+        let mut small = config;
+        small.context_tokens = 32768;
+        assert!(request(&rt, &small, messages, &|| Ok(()))
+            .unwrap_err()
+            .contains("模型上下文容量不足"));
+        assert!(context_error(
+            400,
+            &json!({"error":{"code":"context_length_exceeded"}})
+        ));
+        assert!(!context_error(
+            401,
+            &json!({"error":{"message":"context window"}})
+        ));
+        assert!(!context_error(
+            400,
+            &json!({"error":{"message":"invalid model"}})
+        ));
     }
     #[test]
     fn provider_options_are_scoped_and_truncation_is_not_treated_as_success() {
@@ -1283,7 +1890,7 @@ mod tests {
         invalid["summary"][0]["kind"] = json!("minutes");
         invalid["summary"][0]["section"] = json!("minutes");
         let known = HashSet::from([("s1".into(), 1)]);
-        assert!(validate(&invalid, &known).unwrap_err().contains("分类"));
+        assert!(validate(&invalid, &known).unwrap_err().contains("kind"));
         let mut valid = invalid.clone();
         valid["summary"][0]["kind"] = json!("discussion");
         let expected = valid.clone();
@@ -1310,6 +1917,145 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("不能使用任务类型"));
+    }
+    #[test]
+    fn kind_aliases_need_no_remote_repair_and_cannot_bypass_evidence_validation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (_root, rt, c) = fixture(&format!("http://{}", listener.local_addr().unwrap()));
+        let mut output = fact();
+        let mut rows = vec![output["summary"][0].clone(); 4];
+        for (row, kind) in rows
+            .iter_mut()
+            .zip([" Discussion ", "决策", "风险", "建议"])
+        {
+            row["kind"] = json!(kind);
+        }
+        output["summary"] = json!(rows);
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            receive(&mut socket);
+            respond(&mut socket, 200, reply(&output.to_string()));
+        });
+        let known = HashSet::from([("s1".into(), 1)]);
+        let output = checked_request(&rt, &|| Ok(()), &c,
+            json!({"task_type":"stage","transcript":[{"segment_id":"s1","revision":1,"text":"合成原文"}]}), &known).unwrap();
+        server.join().unwrap();
+        assert_eq!(output["summary"][3]["kind"], "suggestion");
+        assert_eq!(output["summary"][1]["kind"], "decision");
+        let scope = CitationScope {
+            aliases: HashMap::new(),
+            known,
+        };
+        let mut invalid = fact();
+        invalid["summary"][0]["kind"] = json!("决策");
+        invalid["summary"][0]["evidence"][0]["segment_id"] = json!("outside");
+        assert!(scope
+            .restore_and_validate(invalid)
+            .unwrap_err()
+            .contains("输入范围以外"));
+        let mut invalid = fact();
+        invalid["summary"][0]["kind"] = json!("决策");
+        invalid["summary"][0]["evidence"] = json!([]);
+        assert!(scope
+            .restore_and_validate(invalid)
+            .unwrap_err()
+            .contains("缺少依据"));
+    }
+    #[test]
+    fn invalid_section_is_repaired_from_original_evidence_with_explicit_contract() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (_root, rt, c) = fixture(&format!("http://{}", listener.local_addr().unwrap()));
+        let mut invalid = fact();
+        invalid["summary"][0]["section"] = json!("当前主题");
+        let known = HashSet::from([("s1".into(), 1)]);
+        assert!(validate(&invalid, &known)
+            .unwrap_err()
+            .contains("summary[0].section"));
+        let server = thread::spawn(move || {
+            for output in [invalid, fact()] {
+                let (mut socket, _) = listener.accept().unwrap();
+                let request = receive(&mut socket);
+                let input: Value =
+                    serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(input["task_type"], "stage");
+                assert_eq!(
+                    input["output_contract"]["summary"]["item"]["section"]["enum"][0],
+                    "topic"
+                );
+                respond(&mut socket, 200, reply(&output.to_string()));
+            }
+        });
+        let output=checked_request(&rt,&||Ok(()),&c,json!({"task_type":"stage","transcript":[{"segment_id":"s1","revision":1,"text":"合成原文"}]}),&known).unwrap();
+        assert_eq!(output, fact());
+        server.join().unwrap();
+        let mut invalid = fact();
+        invalid["summary"][0]["kind"] = json!("stage");
+        assert!(validate(&invalid, &known).is_err());
+        invalid["summary"][0]["kind"] = json!("discussion");
+        invalid["summary"][0]["section"] = json!("stage");
+        assert!(validate(&invalid, &known).is_err());
+    }
+    #[test]
+    fn model_unanswered_wording_is_normalized_but_uncited_facts_and_actions_still_fail() {
+        let mut input =
+            json!({"transcript":[{"segment_id":"original","revision":3,"text":"合成原文"}]});
+        let scope =
+            prepare_citations(&mut input, &HashSet::from([("original".into(), 3)])).unwrap();
+        let value = json!({"summary":[{"text":"合成会议信息尚未说明，不能推断","kind":"unanswered","section":"minutes","evidence":[]}],"actions":[]});
+        let accepted = scope.restore_and_validate(value.clone()).unwrap();
+        assert_eq!(accepted["summary"][0]["text"], "会议中未明确");
+        for kind in ["discussion", "decision", "risk", "question"] {
+            let mut invalid = value.clone();
+            invalid["summary"][0]["kind"] = json!(kind);
+            assert!(scope
+                .restore_and_validate(invalid)
+                .unwrap_err()
+                .contains("evidence为空"));
+        }
+        let mut action = value;
+        action["actions"] = json!([{"task":"合成但无依据的行动","evidence":[]}]);
+        assert!(scope.restore_and_validate(action).is_err());
+        let mut too_many = fact();
+        too_many["summary"][0]["evidence"] =
+            json!(vec![json!({"segment_id":"original","revision":3}); 33]);
+        let error = scope.restore_and_validate(too_many).unwrap_err();
+        assert!(error.contains("引用过多"));
+        assert!(!error.contains("缺少依据"));
+    }
+    #[test]
+    fn short_reference_strings_expand_only_to_the_exact_frozen_pair() {
+        let mut input =
+            json!({"transcript":[{"segment_id":"original","revision":3,"text":"合成原文"}]});
+        let scope =
+            prepare_citations(&mut input, &HashSet::from([("original".into(), 3)])).unwrap();
+        let mut value = fact();
+        value["summary"][0]["evidence"] = json!(["ref_001"]);
+        let out = scope.restore_and_validate(value.clone()).unwrap();
+        assert_eq!(
+            out["summary"][0]["evidence"],
+            json!([{"segment_id":"original","revision":3}])
+        );
+        value["summary"][0]["evidence"] = json!(["ref_999"]);
+        assert!(scope.restore_and_validate(value).is_err());
+    }
+    #[test]
+    fn minutes_with_realistic_missing_metadata_and_short_references_need_no_repair() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (_root, rt, c) = fixture(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let body = receive(&mut socket);
+            let input: Value =
+                serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            let alias = input["allowed_evidence"][0]["segment_id"].clone();
+            let out = json!({"summary":[{"text":"合成已讨论目标","kind":"discussion","section":"minutes","evidence":[alias]},{"text":"会议日期及主持人未提供，不能从本段确定","kind":"unanswered","section":"minutes","evidence":[]}],"actions":[]});
+            respond(&mut socket, 200, reply(&out.to_string()));
+        });
+        let out=checked_request(&rt,&||Ok(()),&c,json!({"kind":"minutes","transcript":[{"segment_id":"original","revision":3,"text":"合成原文"}]}),&HashSet::from([("original".into(),3)])).unwrap();
+        server.join().unwrap();
+        assert_eq!(out["summary"][0]["evidence"][0]["segment_id"], "original");
+        assert_eq!(out["summary"][1]["text"], "会议中未明确");
     }
     #[test]
     fn citation_aliases_exclude_overlap_and_fence_batches_revisions_and_reducers() {
@@ -1611,6 +2357,77 @@ mod tests {
         let d = rt.detail(&mid).unwrap();
         assert_eq!(d["artifacts"].as_array().unwrap().len(), 2);
         assert_eq!(d["jobs"][0]["state"], "succeeded");
+    }
+    #[test]
+    #[ignore = "requires explicit user permission for one real meeting model task and isolated source backup"]
+    fn authorized_meeting_minutes_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::env::var("HELMMEET_ALLOW_MEETING_MODEL").as_deref(),
+            Ok("1")
+        );
+        let source = std::path::PathBuf::from(
+            std::env::var_os("HELMMEET_MEETING_DIAGNOSTIC_SOURCE").expect("source root"),
+        );
+        let mid = std::env::var("HELMMEET_MEETING_DIAGNOSTIC_ID").expect("one meeting id");
+        uuid::Uuid::parse_str(&mid).unwrap();
+        let isolated = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(isolated.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        {
+            let src = rusqlite::Connection::open_with_flags(
+                source.join("app.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut dest = rusqlite::Connection::open(isolated.path().join("app.sqlite")).unwrap();
+            rusqlite::backup::Backup::new(&src, &mut dest)
+                .unwrap()
+                .run_to_completion(64, Duration::from_millis(5), None)
+                .unwrap();
+        }
+        for name in ["credentials.json", "settings.json"] {
+            if source.join(name).is_file() {
+                std::fs::copy(source.join(name), isolated.path().join(name)).unwrap();
+                std::fs::set_permissions(
+                    isolated.path().join(name),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+        }
+        let rt = Runtime::open_with_vault(
+            isolated.path().into(),
+            Arc::new(crate::credentials::FileStore::new(isolated.path().into())),
+        )
+        .unwrap();
+        let job = submit(rt.clone(), &mid, "minutes", "", "all").unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(900);
+        let (state, error) = loop {
+            let row: (String, Option<String>) = rt
+                .db()
+                .unwrap()
+                .query_row(
+                    "SELECT state,error_code FROM analysis_jobs WHERE id=?",
+                    [job["job_id"].as_str().unwrap()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            if !["pending", "running"].contains(&row.0.as_str()) {
+                break row;
+            }
+            assert!(std::time::Instant::now() < until);
+            thread::sleep(Duration::from_millis(100));
+        };
+        for h in std::mem::take(&mut *rt.analysis_threads.lock().unwrap()) {
+            h.join().unwrap();
+        }
+        let report = json!({"state":state,"error":error,"requests":MEETING_DIAGNOSTICS.lock().unwrap().clone()});
+        println!("MEETING_DIAGNOSTIC_SHAPE={report}");
+        // The original app database and audio are never opened for writing.
+        assert!(["succeeded", "failed"].contains(&state.as_str()));
+        if std::env::var("HELMMEET_MEETING_DIAGNOSTIC_REQUIRE_SUCCESS").as_deref() == Ok("1") {
+            assert_eq!(state, "succeeded", "isolated minutes validation failed");
+        }
     }
     #[test]
     fn rejects_fabricated_and_empty_evidence() {

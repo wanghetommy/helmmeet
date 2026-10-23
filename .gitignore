@@ -91,6 +91,8 @@ config/local.json
 *.pcm
 *.mp3
 *.m4a
+# User-provided product wake response, normalized for the offline playback/AEC path.
+!native/voice-assistant/assets/wake-acknowledgement.wav
 coverage/
 apps/desktop/src-tauri/gen/
 artifacts/

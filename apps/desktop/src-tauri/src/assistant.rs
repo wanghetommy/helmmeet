@@ -16,6 +16,27 @@ use std::{
     time::{Duration, Instant},
 };
 
+thread_local! { static TURN_BUDGET: std::cell::RefCell<(String,usize,usize)> = const { std::cell::RefCell::new((String::new(),0,6)) }; }
+pub(crate) fn begin_budget(turn: &str, limit: usize) {
+    TURN_BUDGET.with(|b| *b.borrow_mut() = (turn.into(), 0, limit));
+}
+pub(crate) fn remaining_models(turn: &str) -> usize {
+    TURN_BUDGET.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.0 != turn {
+            *b = (turn.into(), 0, 6);
+        }
+        b.2.saturating_sub(b.1)
+    })
+}
+pub(crate) fn spend_model(turn: &str) -> Result<(), String> {
+    if remaining_models(turn) == 0 {
+        return Err("本轮模型预算已用完，已保存的审阅进度保留".into());
+    }
+    TURN_BUDGET.with(|b| b.borrow_mut().1 += 1);
+    Ok(())
+}
+
 fn valid_uuid(id: &str) -> Result<(), String> {
     uuid::Uuid::parse_str(id)
         .map(|_| ())
@@ -122,7 +143,7 @@ pub fn open(rt: &Runtime, meeting: Option<String>, general: bool) -> Result<Valu
             })
             .map_err(err)?
         } else {
-            "与小舵聊一聊".into()
+            "通用聊天".into()
         };
         let cid = id();
         let tx = db.transaction().map_err(err)?;
@@ -147,12 +168,12 @@ pub fn detail(rt: &Runtime, cid: &str) -> Result<Value, String> {
     valid_uuid(cid)?;
     let db = rt.db()?;
     let (mid,title,epoch):(Option<String>,String,u64)=db.query_row("SELECT c.meeting_id,coalesce(m.title,c.title),c.epoch FROM assistant_conversations c LEFT JOIN meetings m ON m.id=c.meeting_id WHERE c.id=?",[cid],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(err)?;
-    let mut q=db.prepare("SELECT t.id,t.question,t.source,t.state,t.response_json,t.error,t.created_at,t.model_json,a.content_json FROM assistant_turns t LEFT JOIN conversation_turns old ON old.job_id=t.legacy_job_id LEFT JOIN artifacts a ON a.id=old.artifact_id WHERE t.conversation_id=? AND t.epoch=? ORDER BY t.rowid DESC LIMIT 120").map_err(err)?;
+    let mut q=db.prepare("SELECT t.id,t.question,t.source,t.state,t.response_json,t.error,t.created_at,t.model_json,a.content_json,p.completed,p.total,p.model_calls,p.estimated_calls,p.through_ms,p.phase FROM assistant_turns t LEFT JOIN conversation_turns old ON old.job_id=t.legacy_job_id LEFT JOIN artifacts a ON a.id=old.artifact_id LEFT JOIN assistant_review_progress p ON p.turn_id=t.id WHERE t.conversation_id=? AND t.epoch=? ORDER BY t.rowid DESC LIMIT 120").map_err(err)?;
     let mut turns=q.query_map(params![cid,epoch],|r|{
         let response:Option<String>=r.get(4)?;let legacy:Option<String>=r.get(8)?;
         let result=response.and_then(|s|serde_json::from_str::<Value>(&s).ok()).or_else(||legacy.and_then(|s|serde_json::from_str::<Value>(&s).ok()).map(|v|json!({"legacy":true,"blocks":v["summary"].as_array().into_iter().flatten().map(|s|json!({"kind":"legacy","text":s["text"],"sources":s["evidence"]})).collect::<Vec<_>>(),"evidence":[]})));
         let model:Option<String>=r.get(7)?;let model=model.and_then(|s|serde_json::from_str::<Value>(&s).ok());
-        Ok(json!({"id":r.get::<_,String>(0)?,"question":r.get::<_,String>(1)?,"source":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"answer":result,"error":r.get::<_,Option<String>>(5)?,"created_at":r.get::<_,String>(6)?,"model_name":model.as_ref().map(|m|&m["display_name"])}))
+        Ok(json!({"id":r.get::<_,String>(0)?,"question":r.get::<_,String>(1)?,"source":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"answer":result,"error":r.get::<_,Option<String>>(5)?,"created_at":r.get::<_,String>(6)?,"model_name":model.as_ref().map(|m|&m["display_name"]),"review":if let Some(done)=r.get::<_,Option<u64>>(9)? {json!({"completed":done,"total":r.get::<_,u64>(10)?,"model_calls":r.get::<_,u64>(11)?,"estimated_calls":r.get::<_,u64>(12)?,"through_ms":r.get::<_,u64>(13)?,"phase":r.get::<_,String>(14)?})} else {Value::Null}}))
     }).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
     turns.reverse();
     if let Some(mid) = mid.as_deref() {
@@ -256,6 +277,34 @@ pub fn accept(rt: &Runtime, pid: &str) -> Result<Value, String> {
                 .map_err(err)?;
             json!({"saved":true})
         }
+        Some("todo") => {
+            let mid = payload["meeting_id"].as_str().ok_or("待办会议无效")?;
+            let task = payload["text"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty() && s.len() <= 6000)
+                .ok_or("待办内容无效或过长")?;
+            let mut db = rt.db()?;
+            let tx = db.transaction().map_err(err)?;
+            let generation: u64 = tx
+                .query_row(
+                    "SELECT generation FROM meetings WHERE id=? AND state!='deleting'",
+                    [mid],
+                    |r| r.get(0),
+                )
+                .map_err(|_| "会议已删除")?;
+            if payload["meeting_generation"].as_u64() != Some(generation) {
+                return Err("会议已修订，请重新生成待办草稿".into());
+            }
+            let changes = json!({"task":task,"owner_text":null,"due_text":null,"confirmation_state":"confirmed","execution_state":"todo","assistant_proposal_id":pid});
+            tx.execute("INSERT OR IGNORE INTO action_items(id,meeting_id,task,confirmation_state,locked_fields_json) VALUES (?,?,?,'confirmed','[\"task\",\"owner_text\",\"due_text\"]')",params![pid,mid,task]).map_err(err)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO action_revisions VALUES (?,1,'human',?,'[]',?)",
+                params![pid, changes.to_string(), now()],
+            )
+            .map_err(err)?;
+            tx.commit().map_err(err)?;
+            json!({"saved":true,"action_id":pid})
+        }
         _ => return Err("操作类型无效".into()),
     };
     rt.db()?
@@ -304,10 +353,47 @@ fn configuration(rt: &Runtime, mid: Option<&str>) -> Result<ModelConfig, String>
         )
     }
 }
+fn user_records(detail: &Value) -> Value {
+    let mut result = json!({"notes":[],"actions":[],"partial":false});
+    let mut budget = 12000usize;
+    for (key, limit) in [("notes", 20), ("actions", 30)] {
+        let rows = detail[key].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        for row in rows.iter().rev().take(limit) {
+            let text = row[if key == "notes" { "text" } else { "task" }]
+                .as_str()
+                .unwrap_or("");
+            let version = row["version"].as_u64().unwrap_or(1);
+            let record = json!({"source_id":format!("record:{}:{}:{version}",key,row["id"].as_str().unwrap_or("")),"kind":"record","name":if key=="notes" {"用户笔记"} else {"本场待办记录"},"meeting_id":detail["id"],"text":text,"version":version,"owner_text":row["owner_text"],"due_text":row["due_text"],"execution_state":row["execution_state"],"confirmation_state":row["confirmation_state"]});
+            let size = record.to_string().len();
+            if size > budget {
+                result["partial"] = json!(true);
+                continue;
+            }
+            budget -= size;
+            result[key].as_array_mut().unwrap().push(record);
+        }
+        if rows.len() > limit {
+            result["partial"] = json!(true);
+        }
+    }
+    result
+}
 fn snapshot(rt: &Runtime, mid: Option<&str>, scope: &str) -> Result<Value, String> {
     let mut evidence = vec![];
     let context = if let Some(mid) = mid {
         let d = rt.detail(mid)?;
+        let paragraph_ids = d["paragraphs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|p| {
+                p["segment_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| Some((id.as_str()?.to_owned(), p["id"].as_str()?.to_owned())))
+            })
+            .collect::<HashMap<_, _>>();
         if d["state"] == "ready" {
             return Err("会议尚未开始，请在通用聊天中准备会议".into());
         }
@@ -316,9 +402,15 @@ fn snapshot(rt: &Runtime, mid: Option<&str>, scope: &str) -> Result<Value, Strin
             .unwrap_or(0)
             .saturating_sub(600000);
         let selected = scope.strip_prefix("selection:");
+        let selected_paragraph = selected
+            .and_then(|id| d["paragraphs"].as_array()?.iter().find(|p| p["id"] == id))
+            .and_then(|p| p["segment_ids"].as_array());
         for s in d["segments"].as_array().into_iter().flatten() {
             if (scope == "recent" && s["end_ms"].as_u64().unwrap_or(0) <= cutoff)
-                || selected.is_some_and(|id| s["id"].as_str() != Some(id))
+                || selected.is_some_and(|id| {
+                    selected_paragraph
+                        .map_or(s["id"].as_str() != Some(id), |ids| !ids.contains(&s["id"]))
+                })
             {
                 continue;
             }
@@ -332,9 +424,9 @@ fn snapshot(rt: &Runtime, mid: Option<&str>, scope: &str) -> Result<Value, Strin
                     s["start_ms"].as_u64().unwrap_or(0),
                     s["end_ms"].as_u64().unwrap_or(0),
                 )?;
-            evidence.push(json!({"assistant_playback_overlap":overlap,"source_id":format!("meeting:{}:{}",s["id"].as_str().unwrap_or(""),s["revision"]),"kind":"meeting","text":s["text"],"meeting_id":mid,"segment_id":s["id"],"revision":s["revision"],"start_ms":s["start_ms"]}));
+            evidence.push(json!({"paragraph_id":paragraph_ids.get(s["id"].as_str().unwrap_or("")),"assistant_playback_overlap":overlap,"source_id":format!("meeting:{}:{}",s["id"].as_str().unwrap_or(""),s["revision"]),"kind":"meeting","text":s["text"],"meeting_id":mid,"segment_id":s["id"],"revision":s["revision"],"start_ms":s["start_ms"]}));
         }
-        json!({"kind":"meeting","scope":scope,"context_allowed":d["context_consent"],"meeting_id":mid,"title":d["title"],"state":d["state"],"context":if d["context_consent"]==true { d["context"].clone() } else { Value::Null },"template":d["template"],"duration_ms":d["duration_ms"],"asr_through_ms":d["asr_processed_ms"],"generation":d["generation"],"chat_epoch":d["chat_epoch"],"consent_version":d["consent_version"]})
+        json!({"kind":"meeting","scope":scope,"context_allowed":d["context_consent"],"meeting_id":mid,"title":d["title"],"state":d["state"],"context":if d["context_consent"]==true { d["context"].clone() } else { Value::Null },"user_records":if d["context_consent"]==true {user_records(&d)} else {Value::Null},"meeting_memory":if d["context_consent"]==true {crate::memory::context(rt,mid,scope)?} else {Value::Null},"template":d["template"],"duration_ms":d["duration_ms"],"asr_through_ms":d["asr_processed_ms"],"recording_through_ms":d["duration_ms"],"asr_missing_ranges":d["coverage"].as_array().into_iter().flatten().filter(|v|v["state"]=="missing" || v["state"]=="failed").count(),"generation":d["generation"],"chat_epoch":d["chat_epoch"],"consent_version":d["consent_version"]})
     } else {
         json!({"kind":"general","title":"通用聊天","knowledge_scope":settings(rt)?["collections"]})
     };
@@ -358,7 +450,7 @@ fn snapshot(rt: &Runtime, mid: Option<&str>, scope: &str) -> Result<Value, Strin
             .flatten()
             .enumerate()
         {
-            evidence.push(json!({"source_id":format!("knowledge:{sid}:{version}:term-{i}"),"kind":"knowledge","text":format!("标准名称：{}；别名：{}",term["canonical"].as_str().unwrap_or(""),term["aliases"]),"set_id":sid,"version":version,"name":name}));
+            evidence.push(json!({"source_id":format!("knowledge:{sid}:{version}:term-{i}"),"kind":"knowledge","text":format!("标准名称：{}；别名：{}",term["canonical"].as_str().unwrap_or(""),term["aliases"]),"set_id":sid,"version":version,"name":name,"canonical":term["canonical"],"aliases":term["aliases"]}));
         }
         let db = rt.db()?;
         let mut q=db.prepare("SELECT id,text FROM knowledge_chunks WHERE set_id=? AND version=? ORDER BY ordinal").map_err(err)?;
@@ -372,6 +464,15 @@ fn snapshot(rt: &Runtime, mid: Option<&str>, scope: &str) -> Result<Value, Strin
         for (chunk, text) in rows {
             evidence.push(json!({"source_id":format!("knowledge:{sid}:{version}:{chunk}"),"kind":"knowledge","text":text,"set_id":sid,"version":version,"name":name,"chunk_id":chunk}));
         }
+    }
+    for key in ["notes", "actions"] {
+        evidence.extend(
+            context["user_records"][key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
     }
     evidence.push(json!({"source_id":"method:duozhou-v1","kind":"method","name":"小舵会议方法 v1","text":METHODS}));
     if evidence.len() > 30000
@@ -402,12 +503,23 @@ pub fn submit_scoped(
     utterance: Option<String>,
     scope: &str,
 ) -> Result<Value, String> {
+    submit_with_review(rt, cid, question, source, utterance, scope, false)
+}
+pub fn submit_with_review(
+    rt: Arc<Runtime>,
+    cid: &str,
+    question: &str,
+    source: &str,
+    utterance: Option<String>,
+    scope: &str,
+    review_requested: bool,
+) -> Result<Value, String> {
     rt.ensure_running()?;
     valid_uuid(cid)?;
     if !matches!(scope, "all" | "recent")
         && !scope
             .strip_prefix("selection:")
-            .is_some_and(|s| valid_uuid(s).is_ok())
+            .is_some_and(|s| valid_uuid(s.strip_prefix("p-").unwrap_or(s)).is_ok())
     {
         return Err("提问范围无效".into());
     }
@@ -445,7 +557,15 @@ pub fn submit_scoped(
         }
     }
     let config = configuration(&rt, mid.as_deref())?;
-    let snapshot = snapshot(&rt, mid.as_deref(), scope)?;
+    let mut snapshot = snapshot(&rt, mid.as_deref(), scope)?;
+    snapshot["context"]["conversation_id"] = json!(cid);
+    if review_requested && (mid.is_none() || scope != "all") {
+        return Err("整场审阅需要选择本场全部原文".into());
+    }
+    let reviewing = mid.is_some()
+        && scope == "all"
+        && (review_requested || meeting_core::retrieval::whole_review(question))
+        && crate::review::is_large(&snapshot, &config);
     let turn = id();
     rt.db()?.execute("INSERT INTO assistant_turns(id,conversation_id,epoch,question,source,utterance_id,state,model_json,snapshot_json,created_at) VALUES (?,?,?,?,?,?,'pending',?,?,?)",params![turn,cid,epoch,question.trim(),source,utterance,serde_json::to_string(&config).map_err(err)?,json!({"context":snapshot["context"]}).to_string(),now()]).map_err(|_|"本会话已有回答进行中，请等待或取消")?;
     drop(_gate);
@@ -456,17 +576,39 @@ pub fn submit_scoped(
     let mut handles = rt.analysis_threads.lock().map_err(|_| "任务锁异常")?;
     rt.ensure_running()?;
     handles.push(std::thread::spawn(move||{
-        let check=||check_turn(&worker_rt,&task,&config,&snapshot);
+        let began=Instant::now();
+        begin_budget(&task,if reviewing {24}else{6});
+        let check=||{if began.elapsed()>Duration::from_secs(if reviewing {600}else{180}){return Err("本轮问答及压缩超过总时限，请重试；已成功保存的记忆保留".into());}check_turn(&worker_rt,&task,&config,&snapshot)};
         let result:Result<(),String>=(||{
             check()?;
             worker_rt.db()?.execute("UPDATE assistant_turns SET state='running' WHERE id=? AND state='pending'",[&task]).map_err(err)?;
-            let history=if snapshot["context"]["context_allowed"]==false { vec![] } else { history(&worker_rt,&cid,&task,&snapshot["context"])? };
-            let answer=run_pi(&worker_rt,&task,&config,&question,&history,&snapshot,&check)?;
+            if reviewing {crate::review::initialize(&worker_rt,&task,&snapshot,&config)?;}
+            let (history,checkpoint)=if snapshot["context"]["context_allowed"]==false { (vec![],Value::Null) } else { remembered_history(&worker_rt,&cid,&task,&config,&question,&snapshot,&check)? };
+            let outcome=if reviewing {Some(crate::review::run(&worker_rt,&task,&config,&snapshot,&question,&check)?)}else{None};
+            let mut answer_snapshot=snapshot.clone();
+            if let Some(outcome)=&outcome {answer_snapshot["review_notes"]=outcome.notes.clone();}
+            let mut answer=run_pi(&worker_rt,&task,&config,PiInput{question:&question,history:&history,snapshot:&answer_snapshot,checkpoint:&checkpoint,compact_only:false},&check)?;
+            if let Some(outcome)=&outcome {
+                answer["coverage"]["basis"]=json!(if outcome.completed==outcome.total && outcome.assembled {"review_complete"}else{"review_partial"});
+                answer["coverage"]["review_completed"]=json!(outcome.completed);answer["coverage"]["review_total"]=json!(outcome.total);
+            }
             let _gate=worker_rt.model_gate.lock().map_err(|_|"模型锁异常")?;check()?;
             let mut db=worker_rt.db()?;let tx=db.transaction().map_err(err)?;
             if let Some(mid)=snapshot["context"]["meeting_id"].as_str(){let generation:u64=tx.query_row("SELECT generation FROM meetings WHERE id=?",[mid],|r|r.get(0)).map_err(err)?;if Some(generation)!=snapshot["context"]["generation"].as_u64(){return Err("会议内容已变化，请重新提问".into());}}
             let changed=tx.execute("UPDATE assistant_turns SET state='succeeded',response_json=? WHERE id=? AND state='running' AND epoch=(SELECT epoch FROM assistant_conversations WHERE id=conversation_id)",params![answer.to_string(),task]).map_err(err)?;
-            if changed!=1{return Err("本次回答已取消".into());}tx.commit().map_err(err)?;Ok(())
+            if changed!=1{return Err("本次回答已取消".into());}
+            if let Some(outcome)=&outcome {tx.execute("UPDATE assistant_review_progress SET model_calls=?,phase=? WHERE turn_id=?",params![24usize.saturating_sub(remaining_models(&task)),if outcome.completed==outcome.total && outcome.assembled {"complete"}else{"partial"},task]).map_err(err)?;}
+            tx.commit().map_err(err)?;
+            drop(db);
+            let _ = crate::assistant_history::sync_turn(&worker_rt, &task);
+            let _ = crate::assistant_history::schedule(
+                worker_rt.clone(),
+                &cid,
+                epoch,
+                &config,
+                &snapshot,
+            );
+            Ok(())
         })();
         if let Err(e)=result{let _=worker_rt.db().and_then(|db|db.execute("UPDATE assistant_turns SET state='failed',error=? WHERE id=? AND state IN ('pending','running')",params![e,task]).map_err(err));}
     }));
@@ -508,40 +650,228 @@ fn check_turn(
     }
     Ok(())
 }
+fn context_key(context: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(
+            json!([
+                context["kind"],
+                context["meeting_id"],
+                context["scope"],
+                context["generation"],
+                context["chat_epoch"],
+                context["consent_version"],
+                context["knowledge_scope"]
+            ])
+            .to_string()
+        )
+    )
+}
+#[cfg(test)]
 fn history(rt: &Runtime, cid: &str, turn: &str, context: &Value) -> Result<Vec<Value>, String> {
-    let d = detail(rt, cid)?;
-    let mut history = vec![];
-    for t in d["turns"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|t| t["id"] != turn && t["state"] == "succeeded")
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        if context["kind"] == "general" {
-            let raw: Option<String> = rt
-                .db()?
+    Ok(history_page(rt, cid, turn, context, None)?.0)
+}
+fn history_page(
+    rt: &Runtime,
+    cid: &str,
+    turn: &str,
+    context: &Value,
+    through: Option<&str>,
+) -> Result<(Vec<Value>, bool), String> {
+    let db = rt.db()?;
+    let mut q=db.prepare("SELECT t.id,t.question,t.response_json,t.snapshot_json,a.content_json FROM assistant_turns t JOIN assistant_conversations c ON c.id=t.conversation_id LEFT JOIN conversation_turns old ON old.job_id=t.legacy_job_id LEFT JOIN artifacts a ON a.id=old.artifact_id LEFT JOIN assistant_review_progress p ON p.turn_id=t.id WHERE t.conversation_id=? AND t.epoch=c.epoch AND t.id!=? AND t.state='succeeded' AND t.model_json IS (SELECT model_json FROM assistant_turns WHERE id=?) AND t.rowid>coalesce((SELECT rowid FROM assistant_turns WHERE id=?),0) ORDER BY t.rowid").map_err(err)?;
+    let mut rows = q.query(params![cid, turn, turn, through]).map_err(err)?;
+    let mut messages = vec![];
+    let mut bytes = 0;
+    while let Some(r) = rows.next().map_err(err)? {
+        let raw: Option<String> = r.get(3).map_err(err)?;
+        let old = raw
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .unwrap_or(Value::Null);
+        if context_key(&old["context"]) != context_key(context) {
+            continue;
+        }
+        let id: String = r.get(0).map_err(err)?;
+        let question: String = r.get(1).map_err(err)?;
+        let response: Option<String> = r.get(2).map_err(err)?;
+        let legacy: Option<String> = r.get(4).map_err(err)?;
+        let answer = response.or(legacy).unwrap_or_default();
+        let n = question.len() + answer.len() + 256;
+        if bytes + n > 128 * 1024 && !messages.is_empty() {
+            return Ok((messages, true));
+        }
+        if n > 128 * 1024 {
+            return Err("单轮历史超过安全读取预算，原记录保留，请缩小会话范围".into());
+        }
+        bytes += n;
+        messages.push(json!({"turn_id":id,"role":"user","text":question}));
+        messages.push(json!({"turn_id":id,"role":"assistant","text":answer}));
+    }
+    Ok((messages, false))
+}
+fn remembered_history(
+    rt: &Runtime,
+    cid: &str,
+    turn: &str,
+    config: &ModelConfig,
+    question: &str,
+    snapshot: &Value,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(Vec<Value>, Value), String> {
+    let scope = context_key(&snapshot["context"]);
+    let epoch: u64 = rt
+        .db()?
+        .query_row(
+            "SELECT epoch FROM assistant_conversations WHERE id=?",
+            [cid],
+            |r| r.get(0),
+        )
+        .map_err(err)?;
+    let model = analysis::target(config);
+    let stored:Option<(String,String,u64)>=rt.db()?.query_row("SELECT summary,through_turn,tokens_before FROM assistant_compactions WHERE conversation_id=? AND epoch=? AND scope_key=? AND model_key=? ORDER BY rowid DESC LIMIT 1",params![cid,epoch,scope,model],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(err)?;
+    let mut checkpoint=stored.as_ref().map(|(text,through,tokens)|json!({"summary":text,"through_turn":through,"tokens_before":tokens})).unwrap_or(Value::Null);
+    let budget = analysis::input_budget(config)?;
+    // Reserve context/tool space, and retain full question/answer pairs.
+    let history_budget = (budget.min(analysis::token_budget(config)? * 2) * 7 / 10)
+        .saturating_sub(snapshot["context"].to_string().len() + question.len() + 4000)
+        .clamp(512, 12_000);
+    for _ in 0..3 {
+        let (rows, more) = history_page(
+            rt,
+            cid,
+            turn,
+            &snapshot["context"],
+            checkpoint["through_turn"].as_str(),
+        )?;
+        if !more
+            && rows
+                .iter()
+                .map(|r| r["text"].as_str().unwrap_or("").len() + 128)
+                .sum::<usize>()
+                + checkpoint.to_string().len()
+                <= history_budget
+        {
+            return Ok((rows, checkpoint));
+        }
+        let mut batch = vec![];
+        let mut bytes = checkpoint.to_string().len() + 2500;
+        let keep_recent_messages = if more { 0 } else { 2 };
+        while rows.len().saturating_sub(batch.len()) > keep_recent_messages
+            || (!more && !rows.is_empty() && batch.is_empty())
+        {
+            let pair = &rows[batch.len()..batch.len() + 2];
+            let n = pair.iter().map(|r| r.to_string().len()).sum::<usize>();
+            if bytes + n > budget.min(32_000).saturating_sub(3000) {
+                break;
+            }
+            bytes += n;
+            batch.extend_from_slice(pair);
+            if bytes > budget / 2 {
+                break;
+            }
+        }
+        if batch.is_empty() {
+            // A very large historical turn must not block a new question. The
+            // complete chat remains persisted; this turn can still use the
+            // frozen meeting ContextPack and current question.
+            return Ok((vec![], checkpoint));
+        }
+        let result = run_pi(
+            rt,
+            turn,
+            config,
+            PiInput {
+                question: "",
+                history: &batch,
+                snapshot,
+                checkpoint: &checkpoint,
+                compact_only: true,
+            },
+            check,
+        );
+        let result = match result {
+            Ok(v) => v,
+            Err(e) => {
+                check()?;
+                if !more
+                    && serde_json::to_vec(&rows).map_err(err)?.len()
+                        + checkpoint.to_string().len()
+                        + snapshot["context"].to_string().len()
+                        + question.len()
+                        + 4000
+                        < budget
+                {
+                    return Ok((rows, checkpoint));
+                }
+                return Err(format!("上下文压缩未完成：{e}；原始记录和已保存摘要保留"));
+            }
+        };
+        let summary = result["summary"].as_str().ok_or("压缩结果缺失")?;
+        if summary.is_empty() || summary.len() > 6144 {
+            return Err("压缩摘要超过限制，完整历史已保留".into());
+        }
+        let through = batch.last().unwrap()["turn_id"]
+            .as_str()
+            .ok_or("压缩边界无效")?;
+        check()?;
+        let _gate = rt.model_gate.lock().map_err(|_| "模型锁异常")?;
+        check()?;
+        let mut db = rt.db()?;
+        let tx = db.transaction().map_err(err)?;
+        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM assistant_turns t JOIN assistant_conversations c ON c.id=t.conversation_id WHERE t.id=? AND t.state='running' AND t.epoch=? AND c.epoch=t.epoch)",params![turn,epoch],|r|r.get(0)).map_err(err)?;
+        if !valid {
+            return Err("本轮对话已取消，压缩结果未写回".into());
+        }
+        if let Some(mid) = snapshot["context"]["meeting_id"].as_str() {
+            let valid: bool = tx
                 .query_row(
-                    "SELECT snapshot_json FROM assistant_turns WHERE id=?",
-                    [t["id"].as_str().unwrap_or("")],
+                    "SELECT generation=? AND consent_version=? FROM meetings WHERE id=?",
+                    params![
+                        snapshot["context"]["generation"].as_u64(),
+                        snapshot["context"]["consent_version"].as_u64(),
+                        mid
+                    ],
                     |r| r.get(0),
                 )
                 .map_err(err)?;
-            let old = raw
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .unwrap_or(Value::Null);
-            if old["context"]["knowledge_scope"] != context["knowledge_scope"] {
-                continue;
+            if !valid {
+                return Err("会议或授权已变化，压缩结果未写回".into());
             }
         }
-        history.push(json!({"role":"user","text":t["question"]}));
-        history.push(json!({"role":"assistant","text":t["answer"].to_string()}));
+        tx.execute(
+            "INSERT INTO assistant_compactions VALUES (?,?,?,?,?,?,?,?,?,?)",
+            params![
+                id(),
+                cid,
+                epoch,
+                scope,
+                model,
+                through,
+                summary,
+                result["tokens_before"].as_u64().unwrap_or(0),
+                result["usage"].to_string(),
+                now()
+            ],
+        )
+        .map_err(err)?;
+        tx.commit().map_err(err)?;
+        checkpoint = json!({"summary":summary,"through_turn":through,"tokens_before":result["tokens_before"]});
     }
-    Ok(history)
+    let (rows, more) = history_page(
+        rt,
+        cid,
+        turn,
+        &snapshot["context"],
+        checkpoint["through_turn"].as_str(),
+    )?;
+    if !more
+        && serde_json::to_vec(&rows).map_err(err)?.len() + checkpoint.to_string().len()
+            <= history_budget
+    {
+        return Ok((rows, checkpoint));
+    }
+    Err("已保存本轮压缩进度，历史积压仍超预算，请继续重试或缩小对话范围；原记录保留".into())
 }
 fn runtime_dir() -> PathBuf {
     let packaged = std::env::current_exe().ok().and_then(|p| {
@@ -567,15 +897,58 @@ impl Drop for Process {
         let _ = self.0.wait();
     }
 }
-fn run_pi(
+#[derive(Clone, Copy)]
+pub(crate) struct PiInput<'a> {
+    pub question: &'a str,
+    pub history: &'a [Value],
+    pub snapshot: &'a Value,
+    pub checkpoint: &'a Value,
+    pub compact_only: bool,
+}
+pub(crate) fn run_pi(
     rt: &Runtime,
     turn: &str,
     config: &ModelConfig,
-    question: &str,
-    history: &[Value],
-    snapshot: &Value,
+    start: PiInput<'_>,
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<Value, String> {
+    let first = run_pi_once(rt, turn, config, start, check, 1);
+    if !start.compact_only
+        && first
+            .as_ref()
+            .is_err_and(|error| adaptive_capacity_error(error))
+    {
+        check()?;
+        return run_pi_once(rt, turn, config, start, check, 2);
+    }
+    first
+}
+fn adaptive_capacity_error(error: &str) -> bool {
+    [
+        "模型上下文容量不足",
+        "模型基础上下文不足",
+        "模型输出被截断",
+        "请求体超过当前模型输入安全预算",
+        "工具与会话超过当前模型输入安全预算",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+fn run_pi_once(
+    rt: &Runtime,
+    turn: &str,
+    config: &ModelConfig,
+    start: PiInput<'_>,
+    check: &dyn Fn() -> Result<(), String>,
+    reduction: usize,
+) -> Result<Value, String> {
+    let PiInput {
+        question,
+        history,
+        snapshot,
+        checkpoint,
+        compact_only,
+    } = start;
     let directory = runtime_dir()
         .canonicalize()
         .map_err(|_| "小舵运行时未准备，请运行项目Agent准备脚本")?;
@@ -598,7 +971,7 @@ fn run_pi(
         .stderr(Stdio::null());
     let mut child = Process(command.spawn().map_err(|_| "小舵隔离运行时无法启动")?);
     let mut input = child.0.stdin.take().ok_or("Agent输入不可用")?;
-    writeln!(input,"{}",json!({"type":"start","question":question,"scope":snapshot["context"],"history":history,"context_tokens":config.context_tokens,"max_tokens":config.max_output_tokens})).map_err(|_|"Agent启动消息失败")?;
+    writeln!(input,"{}",json!({"type":"start","assistant_name":settings(rt)?["wake_word"],"question":question,"scope":snapshot["context"],"history":history,"context_tokens":config.context_tokens,"max_tokens":config.max_output_tokens,"checkpoint":checkpoint,"compact_only":compact_only,"model_budget":remaining_models(turn)})).map_err(|_|"Agent启动消息失败")?;
     let stdout = child.0.stdout.take().ok_or("Agent输出不可用")?;
     let (tx, rx) = mpsc::sync_channel(4);
     let reader = std::thread::spawn(move || {
@@ -620,6 +993,12 @@ fn run_pi(
     let mut searches = 0;
     let mut models = 0;
     let mut seen = HashMap::new();
+    let mut prepared: Option<Value> = None;
+    let mut tool_cache = std::collections::HashSet::new();
+    let mut no_growth = 0;
+    let model_limit = remaining_models(turn);
+    let mut wire_messages = json!([]);
+    let mut wire_tools = json!([]);
     let result = (|| loop {
         check()?;
         if started.elapsed() > Duration::from_secs(60) {
@@ -630,28 +1009,69 @@ fn run_pi(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(_) => return Err("小舵运行时中断".into()),
         };
-        let m: Value = serde_json::from_str(&line).map_err(|_| "Agent协议无效")?;
+        let mut m: Value = serde_json::from_str(&line).map_err(|_| "Agent协议无效")?;
         let result = match m["type"].as_str() {
             Some("ready") => continue,
             Some("tool_request") => {
-                calls += 1;
-                if calls > 8 {
-                    return Err("已达到本轮检索上限".into());
-                }
-                if m["name"] == "search_evidence" {
-                    searches += 1;
-                    if searches > 2 {
-                        return Err("本轮检索已达上限，请缩小问题范围".into());
+                let key = json!([m["name"], m["args"]]).to_string();
+                let repeated = !tool_cache.insert(key);
+                let is_search = m["name"] == "search_evidence";
+                let exhausted_limit = calls >= 8 || (is_search && searches >= 2) || no_growth >= 2;
+                let previous_seen = seen.len();
+                let reply = if repeated || exhausted_limit {
+                    no_growth += 1;
+                    json!({"rows":[],"retrieval_exhausted":exhausted_limit || no_growth>=2,"cached":repeated,"notice":"已有内容保留；停止重复检索，依据已提供背景回答。尚无依据的部分说明缺口或追问，不断言会议没有提到。"})
+                } else {
+                    calls += 1;
+                    if is_search {
+                        searches += 1;
                     }
+                    let remaining =
+                        analysis::agent_remaining_bytes(rt, config, &wire_messages, &wire_tools)?;
+                    let reserve = ((model_limit.saturating_sub(models)) * 384
+                        + (8usize.saturating_sub(calls)) * 256
+                        + 512)
+                        .min(4096);
+                    let limit = remaining.saturating_sub(reserve).min(20 * 1024 / reduction);
+                    if limit < 512 {
+                        exhausted(
+                            m["args"]["offset"].as_u64().unwrap_or(0) as usize,
+                            m["args"]["char_offset"].as_u64().unwrap_or(0) as usize,
+                            snapshot["evidence"].as_array().map_or(0, Vec::len),
+                        )
+                    } else {
+                        match tool(rt, turn, question, snapshot, &m, &mut seen, limit) {
+                            Ok(v) => v,
+                            Err(e) => json!({"error":e,"executed":false}),
+                        }
+                    }
+                };
+                let returned_evidence = reply["rows"]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty())
+                    || reply["user_records"].as_object().is_some_and(|records| {
+                        records
+                            .values()
+                            .any(|rows| rows.as_array().is_some_and(|rows| !rows.is_empty()))
+                    });
+                if !returned_evidence
+                    && previous_seen == seen.len()
+                    && m["name"] != "propose_action"
+                {
+                    no_growth += 1;
+                } else {
+                    no_growth = 0;
                 }
-                match tool(rt, turn, question, snapshot, &m, &mut seen) {
-                    Ok(v) => v,
-                    Err(e) => json!({"error":e,"executed":false}),
-                }
+                wire_messages
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"role":"tool",
+                    "tool_call_id":m["tool_call_id"],"content":reply.to_string()}));
+                reply
             }
             Some("model_request") => {
                 models += 1;
-                if models > 6 {
+                if models > model_limit {
                     return Err("已达到本轮模型调用上限".into());
                 }
                 let tools = m["tools"].as_array().ok_or("Agent工具声明无效")?;
@@ -659,13 +1079,52 @@ fn run_pi(
                     .iter()
                     .filter_map(|t| t["function"]["name"].as_str())
                     .collect::<std::collections::HashSet<_>>();
-                if names.len() != TOOLS.len()
-                    || tools.len() != TOOLS.len()
-                    || tools
-                        .iter()
-                        .any(|t| !TOOLS.contains(&t["function"]["name"].as_str().unwrap_or("")))
+                let is_compaction = m["purpose"] == "compaction" && tools.is_empty();
+                let is_final_answer =
+                    m["purpose"] == "final_answer" && tools.is_empty() && !compact_only;
+                if !is_compaction
+                    && !is_final_answer
+                    && (names.len() != TOOLS.len()
+                        || tools.len() != TOOLS.len()
+                        || tools.iter().any(|t| {
+                            !TOOLS.contains(&t["function"]["name"].as_str().unwrap_or(""))
+                        }))
                 {
                     return Err("Agent请求了未开放工具".into());
+                }
+                if !is_compaction {
+                    let tools_value = m["tools"].clone();
+                    if prepared.is_none() {
+                        let pack = crate::assistant_context::prepare(
+                            rt,
+                            config,
+                            snapshot,
+                            question,
+                            &m["messages"],
+                            &tools_value,
+                            reduction,
+                        )?;
+                        remember_returned(
+                            &pack,
+                            snapshot["evidence"].as_array().ok_or("依据快照无效")?,
+                            &mut seen,
+                        );
+                        for row in pack["chat_history"]["rows"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                        {
+                            if let Some(source_id) = row["source_id"].as_str() {
+                                seen.insert(source_id.to_owned(), row.clone());
+                            }
+                        }
+                        prepared = Some(pack);
+                    }
+                    m["messages"] = crate::assistant_context::inject(
+                        &m["messages"],
+                        question,
+                        prepared.as_ref().unwrap(),
+                    );
                 }
                 let bounded = || {
                     check()?;
@@ -691,19 +1150,62 @@ fn run_pi(
                     drop(queue);
                     std::thread::sleep(Duration::from_millis(50));
                 };
-                analysis::request_agent(rt, config, m["messages"].clone(), &m["tools"], &bounded)?
+                let mut selected = config.clone();
+                if is_compaction {
+                    selected.max_output_tokens = selected.max_output_tokens.min(1536);
+                }
+                spend_model(turn)?;
+                let response = analysis::request_agent(
+                    rt,
+                    &selected,
+                    m["messages"].clone(),
+                    &m["tools"],
+                    &bounded,
+                )?;
+                if is_final_answer
+                    && response["tool_calls"]
+                        .as_array()
+                        .is_some_and(|v| !v.is_empty())
+                {
+                    return Err("模型在最终回答阶段仍请求工具，请重试或检查模型工具能力".into());
+                }
+                wire_messages = m["messages"].clone();
+                wire_tools = m["tools"].clone();
+                let mut message = json!({"role":"assistant","content":response["content"]});
+                if !response["tool_calls"].is_null() {
+                    message["tool_calls"] = response["tool_calls"].clone();
+                }
+                wire_messages
+                    .as_array_mut()
+                    .ok_or("Agent消息结构无效")?
+                    .push(message);
+                response
             }
-            Some("result") => {
+            Some("compacted") if compact_only => {
+                let summary = m["summary"].as_str().ok_or("压缩摘要无效")?;
+                if summary.len() > 6144 || summary.trim().is_empty() {
+                    return Err("压缩摘要无效".into());
+                }
+                return Ok(
+                    json!({"summary":summary,"tokens_before":m["tokens_before"],"usage":m["usage"]}),
+                );
+            }
+            Some("result") if !compact_only => {
                 let mut answer =
                     validate_answer(m["text"].as_str().ok_or("Agent没有回答正文")?, &seen)?;
-                answer["coverage"] = json!({"scope":snapshot["context"]["scope"],"through_ms":snapshot["context"]["asr_through_ms"],"transcript_returned":seen.values().filter(|e|e["kind"]=="meeting").count(),"transcript_total":snapshot["evidence"].as_array().into_iter().flatten().filter(|e|e["kind"]=="meeting").count()});
+                answer["coverage"] = json!({"scope":snapshot["context"]["scope"],"through_ms":snapshot["context"]["asr_through_ms"],"transcript_returned":seen.values().filter(|e|e["kind"]=="meeting" && e["partial"]!=true).count(),"transcript_excerpts":seen.values().filter(|e|e["kind"]=="meeting" && e["partial"]==true).count(),"basis":prepared.as_ref().map(|p|p["basis"].clone()),"memory_processed":snapshot["context"]["meeting_memory"]["processed_segments"],"memory_total":snapshot["context"]["meeting_memory"]["segments_total"],"memory_pending":snapshot["context"]["meeting_memory"]["pending_segments"],"chat_history_rows":prepared.as_ref().map(|p|p["chat_history"]["rows"].as_array().map_or(0,Vec::len)),"chat_summary_pending":prepared.as_ref().map(|p|p["chat_history"]["pending_turns"].clone()),"asr_missing_ranges":snapshot["context"]["asr_missing_ranges"],"recording_through_ms":snapshot["context"]["recording_through_ms"],"playback_overlap_segments":snapshot["evidence"].as_array().into_iter().flatten().filter(|e|e["assistant_playback_overlap"]==true).count(),"transcript_total":snapshot["evidence"].as_array().into_iter().flatten().filter(|e|e["kind"]=="meeting").count()});
                 return Ok(answer);
             }
             Some("validate") => match validate_answer(m["text"].as_str().unwrap_or(""), &seen) {
                 Ok(_) => json!({"ok":true}),
                 Err(e) => json!({"ok":false,"error":e}),
             },
-            Some("failure") => return Err("小舵Agent失败，请检查模型工具能力后重试".into()),
+            Some("failure") => {
+                let reason = m["error"]
+                    .as_str()
+                    .unwrap_or("Agent运行失败，请检查模型配置和工具能力");
+                return Err(format!("小舵Agent失败：{reason}"));
+            }
             _ => return Err("Agent协议事件无效".into()),
         };
         check()?;
@@ -720,6 +1222,168 @@ fn run_pi(
     let _ = reader.join();
     result
 }
+// A model needs an unambiguous citation ID, not three copies of its UUID.
+// Full provenance remains in the host snapshot and validated answer evidence.
+fn model_evidence(row: &Value) -> Value {
+    let mut result = json!({});
+    for key in [
+        "source_id",
+        "paragraph_id",
+        "kind",
+        "text",
+        "start_ms",
+        "name",
+        "version",
+        "owner_text",
+        "due_text",
+        "execution_state",
+        "confirmation_state",
+    ] {
+        if !row[key].is_null() {
+            result[key] = row[key].clone();
+        }
+    }
+    if row["assistant_playback_overlap"] == true {
+        result["assistant_playback_overlap"] = json!(true);
+    }
+    result
+}
+fn tool_wire_bytes(value: &Value) -> usize {
+    // Tool JSON becomes a string inside the next HTTP JSON body: count both layers.
+    Value::String(value.to_string()).to_string().len()
+}
+fn exhausted(offset: usize, char_offset: usize, total: usize) -> Value {
+    json!({"rows":[],"offset":offset,"total":total,"next_offset":offset,
+        "next_char_offset":char_offset,"partial":true,"budget_exhausted":true,
+        "notice":"本轮读取预算已用完，请依据已读内容回答并说明未完整覆盖；原文保留，可继续有针对性地提问。"})
+}
+fn evidence_page(rows: &[Value], offset: usize, char_offset: usize, limit: usize) -> Value {
+    let mut out = json!({"rows":[],"offset":offset,"total":rows.len(),"next_offset":null,
+        "next_char_offset":null,"partial":offset>0,"coverage":"仅返回的原文片段可作依据，未读部分不能推断不存在"});
+    let mut count = 0;
+    for (index, source) in rows.iter().enumerate().skip(offset) {
+        let mut row = model_evidence(source);
+        let start = if index == offset { char_offset } else { 0 };
+        let original = source["text"].as_str().unwrap_or("");
+        let chars = original.chars().collect::<Vec<_>>();
+        let start = start.min(chars.len());
+        row["text"] = json!(chars[start..].iter().collect::<String>());
+        if start > 0 {
+            row["partial"] = json!(true);
+            row["char_start"] = json!(start);
+        }
+        out["rows"].as_array_mut().unwrap().push(row.clone());
+        out["next_offset"] = (index + 1 < rows.len()).then_some(index + 1).into();
+        out["next_char_offset"] = Value::Null;
+        out["partial"] = json!(offset > 0 || start > 0 || index + 1 < rows.len());
+        if tool_wire_bytes(&out) <= limit {
+            count += 1;
+            continue;
+        }
+        out["rows"].as_array_mut().unwrap().pop();
+        if count > 0 {
+            out["next_offset"] = json!(index);
+            out["partial"] = json!(true);
+            break;
+        }
+        // A single long segment is paged at Unicode boundaries without changing
+        // its original segment/revision ID. Never register the unseen suffix.
+        let (mut low, mut high) = (start, chars.len());
+        while low < high {
+            let end = low + (high - low).div_ceil(2);
+            row["text"] = json!(chars[start..end].iter().collect::<String>());
+            row["partial"] = json!(true);
+            row["char_start"] = json!(start);
+            row["char_end"] = json!(end);
+            out["rows"] = json!([row]);
+            out["partial"] = json!(true);
+            out["next_offset"] = json!(index);
+            out["next_char_offset"] = json!(end);
+            if tool_wire_bytes(&out) <= limit {
+                low = end;
+            } else {
+                high = end - 1;
+            }
+            row = out["rows"][0].clone();
+        }
+        if low == start {
+            return exhausted(offset, char_offset, rows.len());
+        }
+        row["text"] = json!(chars[start..low].iter().collect::<String>());
+        row["char_end"] = json!(low);
+        out["rows"] = json!([row]);
+        out["next_char_offset"] = json!(low);
+        return out;
+    }
+    out
+}
+fn bounded_context(context: &Value, limit: usize) -> Value {
+    let mut result = context.clone();
+    // Keep the most recent user records and meeting memory facts. Omitted records
+    // remain searchable; permission/scope/watermarks are never summarized away.
+    for pointer in [
+        "/user_records/notes",
+        "/user_records/actions",
+        "/meeting_memory/facts",
+    ] {
+        while tool_wire_bytes(&result) > limit {
+            let Some(rows) = result.pointer_mut(pointer).and_then(Value::as_array_mut) else {
+                break;
+            };
+            if rows.is_empty() {
+                break;
+            }
+            rows.pop();
+            result["partial"] = json!(true);
+            if pointer.starts_with("/user_records/") {
+                result["user_records"]["partial"] = json!(true);
+            }
+        }
+    }
+    if tool_wire_bytes(&result) > limit {
+        result = json!({"kind":context["kind"],"meeting_id":context["meeting_id"],
+            "scope":context["scope"],"context_allowed":context["context_allowed"],
+            "state":context["state"],"asr_through_ms":context["asr_through_ms"],
+            "partial":true,"notice":"详细背景超过本轮剩余预算，请检索相关原文或用户记录；不能宣称完整读取。"});
+    }
+    result
+}
+fn remember_returned(reply: &Value, all: &[Value], seen: &mut HashMap<String, Value>) {
+    let top_level_records = ["notes", "actions"]
+        .into_iter()
+        .flat_map(|key| reply["user_records"][key].as_array().into_iter().flatten());
+    let nested_records = ["notes", "actions"].into_iter().flat_map(|key| {
+        reply["context"]["user_records"][key]
+            .as_array()
+            .into_iter()
+            .flatten()
+    });
+    for row in reply["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(top_level_records)
+        .chain(nested_records)
+    {
+        let Some(source) = all
+            .iter()
+            .find(|source| source["source_id"] == row["source_id"])
+        else {
+            continue;
+        };
+        let mut returned = source.clone();
+        returned["text"] = row["text"].clone();
+        if row["text"] != source["text"] {
+            returned["partial"] = json!(true);
+        }
+        let key = source["source_id"].as_str().unwrap_or("");
+        // Later excerpts cannot erase a previously complete read of this source.
+        if seen.get(key).is_none_or(|old| old["partial"] == true) {
+            seen.insert(key.into(), returned);
+        }
+    }
+}
+
 fn tool(
     rt: &Runtime,
     turn: &str,
@@ -727,92 +1391,72 @@ fn tool(
     snapshot: &Value,
     m: &Value,
     seen: &mut HashMap<String, Value>,
+    reply_limit: usize,
 ) -> Result<Value, String> {
     let all = snapshot["evidence"].as_array().ok_or("依据快照无效")?;
     let rows = match m["name"].as_str() {
-        Some("get_context") => return Ok(snapshot["context"].clone()),
+        Some("get_context") => {
+            let reply = bounded_context(&snapshot["context"], reply_limit);
+            remember_returned(&reply, all, seen);
+            return Ok(reply);
+        }
         Some("get_methods") => all
             .iter()
             .filter(|v| v["kind"] == "method")
             .cloned()
             .collect::<Vec<_>>(),
         Some("get_transcript") => {
+            if let Some(ids) = m["args"]["source_ids"].as_array() {
+                if ids.len() > 32 {
+                    return Err("单次最多核对32个来源".into());
+                }
+                let rows = ids
+                    .iter()
+                    .filter_map(|id| {
+                        all.iter()
+                            .find(|e| e["source_id"] == *id && e["kind"] == "meeting")
+                            .cloned()
+                    })
+                    .collect::<Vec<_>>();
+                let reply = evidence_page(&rows, 0, 0, reply_limit);
+                remember_returned(&reply, all, seen);
+                return Ok(reply);
+            }
             let offset = m["args"]["offset"].as_u64().unwrap_or(0) as usize;
             let rows = all
                 .iter()
                 .filter(|v| v["kind"] == "meeting")
+                .cloned()
                 .collect::<Vec<_>>();
-            let selected = rows
-                .iter()
-                .skip(offset)
-                .take(24)
-                .map(|v| (*v).clone())
-                .collect::<Vec<_>>();
-            for v in &selected {
-                seen.insert(v["source_id"].as_str().unwrap_or("").into(), v.clone());
-            }
-            return Ok(
-                json!({"rows":selected,"offset":offset,"total":rows.len(),"next_offset":(offset+24<rows.len()).then_some(offset+24),"coverage":"仅这些分页已返回；未读部分不能推断不存在"}),
-            );
+            let char_offset = m["args"]["char_offset"].as_u64().unwrap_or(0) as usize;
+            let reply = evidence_page(&rows, offset, char_offset, reply_limit);
+            remember_returned(&reply, all, seen);
+            return Ok(reply);
         }
         Some("search_evidence") => {
             let query = m["args"]["query"].as_str().unwrap_or(question);
             if query.len() > 720 {
                 return Err("检索词过长".into());
             }
-            let folded = query.to_lowercase();
-            let chars = folded
-                .chars()
-                .filter(|c| c.is_alphanumeric())
-                .take(100)
-                .collect::<Vec<_>>();
-            let needles = if chars.len() == 1 {
-                vec![chars.iter().collect::<String>()]
-            } else {
-                chars
-                    .windows(2)
-                    .map(|s| s.iter().collect::<String>())
-                    .collect::<Vec<_>>()
-            };
-            let mut scored = all
-                .iter()
-                .map(|e| {
-                    (
-                        needles
-                            .iter()
-                            .filter(|n| {
-                                e["text"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .to_lowercase()
-                                    .contains(n.as_str())
-                            })
-                            .count(),
-                        e,
-                    )
-                })
-                .filter(|(s, e)| *s > 0 || e["kind"] == "method")
-                .collect::<Vec<_>>();
-            scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
-            scored
-                .into_iter()
-                .take(10)
-                .map(|(_, e)| e.clone())
-                .collect()
+            crate::assistant_context::ranked(snapshot, query)
         }
         Some("propose_action") => {
             let a = &m["args"];
             let kind = a["action"].as_str().ok_or("操作草稿无效")?;
-            if !matches!(kind, "prepare_meeting" | "note") {
+            if !matches!(kind, "prepare_meeting" | "note" | "todo") {
                 return Err("不支持该操作草稿".into());
             }
             let title = a["title"].as_str().unwrap_or("新会议");
             let text = a["text"].as_str().unwrap_or("");
-            if title.len() > 360 || text.len() > 9000 {
+            if title.len() > 360
+                || text.len() > 9000
+                || (kind == "todo" && text.len() > 6000)
+                || text.trim().is_empty()
+            {
                 return Err("操作草稿过长".into());
             }
-            if kind == "note" && snapshot["context"]["meeting_id"].is_null() {
-                return Err("记笔记需要明确会议".into());
+            if matches!(kind, "note" | "todo") && snapshot["context"]["meeting_id"].is_null() {
+                return Err("保存记录需要明确会议".into());
             }
             let mut pid = id();
             let payload = json!({"action":kind,"title":title,"text":text,"meeting_type":a["meeting_type"].as_str().unwrap_or("general"),"meeting_id":snapshot["context"]["meeting_id"],"meeting_generation":snapshot["context"]["generation"],"question":question});
@@ -840,49 +1484,133 @@ fn tool(
         }
         _ => return Err("Agent工具未开放".into()),
     };
-    for v in &rows {
-        seen.insert(v["source_id"].as_str().unwrap_or("").into(), v.clone());
-    }
-    Ok(json!({"rows":rows,"coverage":"这是检索结果，不代表整场完整扫描"}))
+    let offset = m["args"]["offset"].as_u64().unwrap_or(0) as usize;
+    let char_offset = m["args"]["char_offset"].as_u64().unwrap_or(0) as usize;
+    let mut reply = evidence_page(&rows, offset, char_offset, reply_limit);
+    reply["coverage"] = json!("这是检索结果，不代表整场完整扫描；未读部分不能推断不存在");
+    reply["partial"] = json!(true);
+    remember_returned(&reply, all, seen);
+    Ok(reply)
 }
+
+fn unwrap_answer(mut value: Value) -> Value {
+    if value["blocks"].is_array() {
+        return value;
+    }
+    for key in ["answer", "result", "data", "output"] {
+        if value[key]["blocks"].is_array() {
+            let nested = value[key].clone();
+            if let Some(object) = value.as_object_mut() {
+                object.insert("blocks".into(), nested["blocks"].clone());
+            }
+            return value;
+        }
+    }
+    value
+}
+
+fn canonical_reference(raw: &str, seen: &HashMap<String, Value>) -> Result<String, String> {
+    let raw = raw
+        .trim()
+        .trim_matches('`')
+        .trim_matches(|c| matches!(c, '[' | ']' | '(' | ')' | ',' | ';' | '"'));
+    if seen.contains_key(raw) {
+        return Ok(raw.to_owned());
+    }
+    let embedded = seen
+        .keys()
+        .filter(|key| raw.contains(key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if embedded.len() == 1 {
+        return Ok(embedded[0].clone());
+    }
+    // Some providers shorten a UUID citation to the segment UUID or omit the
+    // revision suffix. Resolve only an unambiguous suffix of at least 8 chars.
+    if raw.len() >= 8 {
+        let suffixes = seen
+            .keys()
+            .filter(|key| key.ends_with(raw))
+            .cloned()
+            .collect::<Vec<_>>();
+        if suffixes.len() == 1 {
+            return Ok(suffixes[0].clone());
+        }
+    }
+    Err(format!(
+        "小舵引用了未检索的依据：{}",
+        raw.chars().take(80).collect::<String>()
+    ))
+}
+
+fn normalize_reference(value: &Value, seen: &HashMap<String, Value>) -> Result<String, String> {
+    let raw = value
+        .as_str()
+        .or_else(|| value.get("source_id").and_then(Value::as_str))
+        .ok_or("引用ID无效：必须是字符串或source_id对象")?;
+    canonical_reference(raw, seen)
+}
+
 pub fn validate_answer(text: &str, seen: &HashMap<String, Value>) -> Result<Value, String> {
-    let value = analysis::parse(text)?;
-    let blocks = value["blocks"].as_array().ok_or("小舵回答结构无效")?;
+    let mut value = unwrap_answer(analysis::parse(text)?);
+    let mut blocks = value["blocks"]
+        .as_array()
+        .cloned()
+        .or_else(|| value["summary"].as_array().map(|items| items.iter().map(|item| json!({"kind":"meeting_fact","text":item["text"],"sources":item["evidence"]})).collect()))
+        .ok_or("小舵回答结构无效：缺少blocks数组")?;
     if blocks.is_empty() || blocks.len() > 16 {
-        return Err("小舵回答条目无效".into());
+        return Err("小舵回答条目无效：blocks数量必须为1到16条".into());
     }
     let mut used = HashMap::new();
-    for b in blocks {
-        let kind = b["kind"].as_str().ok_or("回答类型无效")?;
+    for b in &mut blocks {
+        let kind = b["kind"]
+            .as_str()
+            .ok_or("回答类型无效：缺少kind")?
+            .to_owned();
         if !matches!(
-            kind,
-            "meeting_fact" | "knowledge" | "suggestion" | "unanswered"
+            kind.as_str(),
+            "meeting_fact" | "knowledge" | "user_record" | "suggestion" | "unanswered"
         ) || b["text"]
             .as_str()
             .is_none_or(|t| t.trim().is_empty() || t.len() > 9000)
         {
-            return Err("小舵回答内容无效".into());
+            return Err("小舵回答内容无效：kind或text不符合协议".into());
         }
-        let refs = b["sources"].as_array().ok_or("回答引用无效")?;
-        if refs.len() > 20 || (matches!(kind, "meeting_fact" | "knowledge") && refs.is_empty()) {
-            return Err("小舵事实缺少依据".into());
+        if b["sources"].is_null() && b["evidence"].is_array() {
+            b["sources"] = b["evidence"].clone();
         }
-        for reference in refs {
-            let key = reference.as_str().ok_or("引用ID无效")?;
-            let e = seen.get(key).ok_or("小舵引用了未检索的依据")?;
+        let refs = b["sources"].as_array().cloned().unwrap_or_default();
+        if refs.len() > 20
+            || (matches!(kind.as_str(), "meeting_fact" | "knowledge" | "user_record")
+                && refs.is_empty())
+        {
+            return Err(format!("小舵事实缺少依据：{}必须引用已读取来源", kind));
+        }
+        let mut normalized = Vec::with_capacity(refs.len());
+        for reference in &refs {
+            let key = normalize_reference(reference, seen)?;
+            let e = seen.get(&key).ok_or("小舵引用了未检索的依据")?;
             if kind == "meeting_fact" && e["assistant_playback_overlap"] == true {
                 return Err(
-                    "此段与助手播报重叠，不能确认为会议事实；请标为待澄清或使用其他原文".into(),
+                    "会议事实引用了与助手播报重叠的原文：请标为待澄清或改用其他原文".into(),
                 );
             }
             if (kind == "meeting_fact" && e["kind"] != "meeting")
                 || (kind == "knowledge" && e["kind"] != "knowledge")
+                || (kind == "user_record" && e["kind"] != "record")
             {
-                return Err("资料不能作为会议共识引用".into());
+                return Err(format!(
+                    "引用类型不匹配：{}不能引用{}来源",
+                    kind,
+                    e["kind"].as_str().unwrap_or("未知")
+                ));
             }
+            normalized.push(Value::String(key.clone()));
             used.insert(key, e);
         }
+        b["sources"] = Value::Array(normalized);
     }
+    value["blocks"] = Value::Array(blocks.clone());
     Ok(
         json!({"blocks":blocks,"evidence":used.values().collect::<Vec<_>>(),"engine":"pi-coding-agent/1.3.0"}),
     )
@@ -891,6 +1619,31 @@ pub fn validate_answer(text: &str, seen: &HashMap<String, Value>) -> Result<Valu
 struct QueueEntry<'a> {
     rt: &'a Runtime,
     id: String,
+}
+pub(crate) fn with_model(
+    rt: &Runtime,
+    turn: &str,
+    check: &dyn Fn() -> Result<(), String>,
+    operation: impl FnOnce() -> Result<Value, String>,
+) -> Result<Value, String> {
+    let _entry = QueueEntry::new(rt, turn)?;
+    loop {
+        check()?;
+        let queue = rt.analysis_waiting.lock().map_err(|_| "分析队列异常")?;
+        let next = queue
+            .iter()
+            .enumerate()
+            .min_by_key(|(i, (_, p))| (*p, *i))
+            .map(|(_, (id, _))| id);
+        if next.map(String::as_str) == Some(turn) {
+            if let Ok(_permit) = rt.llm_gate.try_lock() {
+                drop(queue);
+                return operation();
+            }
+        }
+        drop(queue);
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 impl<'a> QueueEntry<'a> {
     fn new(rt: &'a Runtime, id: &str) -> Result<Self, String> {
@@ -913,6 +1666,24 @@ impl Drop for QueueEntry<'_> {
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn adaptive_capacity_errors_are_retried_without_treating_auth_as_capacity() {
+        assert!(adaptive_capacity_error("模型输出被截断：已达到输出上限"));
+        assert!(adaptive_capacity_error(
+            "模型基础上下文不足，请减少过长的问题或历史"
+        ));
+        assert!(adaptive_capacity_error(
+            "模型上下文容量不足：服务拒绝了本轮输入长度"
+        ));
+        assert!(adaptive_capacity_error("请求体超过当前模型输入安全预算"));
+        assert!(!adaptive_capacity_error(
+            "模型服务返回 HTTP 401，请检查模型、凭据或额度"
+        ));
+        assert!(!adaptive_capacity_error(
+            "模型输出校验失败：summary[0].evidence"
+        ));
+    }
     fn setup() -> (tempfile::TempDir, Arc<Runtime>) {
         let tmp = tempfile::tempdir().unwrap();
         let rt = Runtime::open_with_vault(
@@ -1048,11 +1819,174 @@ mod tests {
             &snap,
             &json!({"name":"get_methods","args":{}}),
             &mut seen,
+            10 * 1024,
         )
         .unwrap();
         assert_eq!(methods["rows"][0]["kind"], "method");
         assert!(validate_answer(r#"{"blocks":[{"kind":"meeting_fact","text":"假共识","sources":["method:duozhou-v1"]}]}"#,&seen).is_err());
         assert!(validate_answer(r#"{"blocks":[{"kind":"suggestion","text":"核对验收条件","sources":["method:duozhou-v1"]}]}"#,&seen).is_ok());
+    }
+    #[test]
+    fn answer_validation_repairs_common_provider_wrappers_and_reference_aliases() {
+        let mut seen = HashMap::new();
+        seen.insert(
+            "meeting:12345678-1234-4234-8234-123456789abc:7".into(),
+            json!({"source_id":"meeting:12345678-1234-4234-8234-123456789abc:7","kind":"meeting","text":"已读取原文"}),
+        );
+        let answer = validate_answer(
+            r#"{"answer":{"blocks":[{"kind":"meeting_fact","text":"原文提到目标。","evidence":[{"source_id":"meeting:12345678-1234-4234-8234-123456789abc:7"}]}]}}"#,
+            &seen,
+        )
+        .unwrap();
+        assert_eq!(
+            answer["blocks"][0]["sources"][0],
+            "meeting:12345678-1234-4234-8234-123456789abc:7"
+        );
+    }
+    #[test]
+    fn paragraph_selection_freezes_every_original_member_and_keeps_revisions() {
+        let (_tmp, rt) = setup();
+        let (mid, first) = seed(&rt, "合成段落提问", "第一句。");
+        let second = id();
+        {
+            let db = rt.db().unwrap();
+            db.execute(
+                "INSERT INTO transcript_segments VALUES (?,?,1000,2000,'mixed',1,'final')",
+                params![second, mid],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO transcript_revisions VALUES (?,1,?,'第二句。','asr',?)",
+                params![second, mid, now()],
+            )
+            .unwrap();
+        }
+        let snap = snapshot(&rt, Some(&mid), &format!("selection:p-{first}")).unwrap();
+        let rows = snap["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "meeting")
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["paragraph_id"], rows[1]["paragraph_id"]);
+        assert_eq!(rows[0]["revision"], 1);
+        let one = snapshot(&rt, Some(&mid), &format!("selection:{first}")).unwrap();
+        assert_eq!(
+            one["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["kind"] == "meeting")
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn confirmed_todo_is_persistent_idempotent_and_separate_from_meeting_facts() {
+        let (_tmp, rt) = setup();
+        let (mid, _) = seed(&rt, "合成待办会议", "待核对目标");
+        rt.db()
+            .unwrap()
+            .execute("UPDATE meetings SET context_consent=1 WHERE id=?", [&mid])
+            .unwrap();
+        let c = open(&rt, Some(mid.clone()), false).unwrap();
+        let cid = c["id"].as_str().unwrap();
+        let turn = id();
+        rt.db().unwrap().execute("INSERT INTO assistant_turns(id,conversation_id,epoch,question,source,state,created_at) VALUES (?,?,0,'记下核对目标','text','succeeded',?)",params![turn,cid,now()]).unwrap();
+        let snap = snapshot(&rt, Some(&mid), "all").unwrap();
+        let request = json!({"name":"propose_action","args":{"action":"todo","title":"核对目标","text":"与团队核对本周交付目标"}});
+        let mut seen = HashMap::new();
+        let p = tool(
+            &rt,
+            &turn,
+            "记下核对目标",
+            &snap,
+            &request,
+            &mut seen,
+            10 * 1024,
+        )
+        .unwrap();
+        let pid = p["proposal_id"].as_str().unwrap();
+        assert!(rt.detail(&mid).unwrap()["actions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let saved = accept(&rt, pid).unwrap();
+        assert_eq!(accept(&rt, pid).unwrap(), saved);
+        let d = rt.detail(&mid).unwrap();
+        assert_eq!(d["actions"].as_array().unwrap().len(), 1);
+        assert!(d["actions"][0]["owner_text"].is_null());
+        assert!(d["actions"][0]["due_text"].is_null());
+        assert_eq!(d["actions"][0]["confirmation_state"], "confirmed");
+        assert_eq!(d["actions"][0]["execution_state"], "todo");
+        assert_eq!(
+            rt.db()
+                .unwrap()
+                .query_row(
+                    "SELECT origin FROM action_revisions WHERE action_id=?",
+                    [pid],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "human"
+        );
+        assert!(d["artifacts"].as_array().unwrap().is_empty());
+        assert!(rt.capture.lock().unwrap().is_none());
+        assert!(
+            snapshot(&rt, Some(&mid), "all").unwrap()["context"]["user_records"]["actions"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 1
+        );
+        let with_record = snapshot(&rt, Some(&mid), "all").unwrap();
+        tool(
+            &rt,
+            &turn,
+            "回顾记录",
+            &with_record,
+            &json!({"name":"get_context"}),
+            &mut seen,
+            10 * 1024,
+        )
+        .unwrap();
+        let record = &with_record["context"]["user_records"]["actions"][0]["source_id"];
+        let answer = json!({"blocks":[{"kind":"user_record","text":"你保存了核对目标这项待办。","sources":[record]}]});
+        assert!(validate_answer(&answer.to_string(), &seen).is_ok());
+        let mut fake_fact = answer;
+        fake_fact["blocks"][0]["kind"] = json!("meeting_fact");
+        assert!(validate_answer(&fake_fact.to_string(), &seen).is_err());
+        rt.db()
+            .unwrap()
+            .execute("UPDATE meetings SET context_consent=0 WHERE id=?", [&mid])
+            .unwrap();
+        let hidden = snapshot(&rt, Some(&mid), "all").unwrap();
+        assert!(hidden["context"]["user_records"].is_null());
+        assert!(!hidden["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["kind"] == "record"));
+        assert!(tool(
+            &rt,
+            &turn,
+            "记下",
+            &json!({"context":{"kind":"general","meeting_id":null}}),
+            &request,
+            &mut seen,
+            10 * 1024
+        )
+        .is_err());
+        let p=tool(&rt,&turn,"再记下",&snap,&json!({"name":"propose_action","args":{"action":"todo","title":"另一项","text":"合成第二项任务"}}),&mut seen, 10 * 1024).unwrap();
+        rt.db()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET generation=generation+1 WHERE id=?",
+                [&mid],
+            )
+            .unwrap();
+        assert!(accept(&rt, p["proposal_id"].as_str().unwrap()).is_err());
     }
     #[test]
     fn accepted_drafts_are_idempotent_and_never_start_capture() {
@@ -1062,7 +1996,7 @@ mod tests {
         let turn = id();
         rt.db().unwrap().execute("INSERT INTO assistant_turns(id,conversation_id,epoch,question,source,state,created_at) VALUES (?,?,0,'准备周会','text','succeeded',?)",params![turn,cid,now()]).unwrap();
         let mut seen = HashMap::new();
-        let result=tool(&rt,&turn,"准备周会",&json!({"context":{"kind":"general"},"evidence":[]}),&json!({"name":"propose_action","args":{"action":"prepare_meeting","title":"合成周会","text":"讨论卡点和下一步","meeting_type":"weekly"}}),&mut seen).unwrap();
+        let result=tool(&rt,&turn,"准备周会",&json!({"context":{"kind":"general"},"evidence":[]}),&json!({"name":"propose_action","args":{"action":"prepare_meeting","title":"合成周会","text":"讨论卡点和下一步","meeting_type":"weekly"}}),&mut seen, 10 * 1024).unwrap();
         let pid = result["proposal_id"].as_str().unwrap();
         let first = accept(&rt, pid).unwrap();
         assert_eq!(accept(&rt, pid).unwrap(), first);
@@ -1070,8 +2004,253 @@ mod tests {
         assert!(rt.capture.lock().unwrap().is_none());
     }
     #[test]
+    fn tool_pages_count_escaped_wire_bytes_and_never_register_unseen_suffixes() {
+        let source = json!({"source_id":"meeting:synthetic:1","kind":"meeting",
+            "meeting_id":"host-only-meeting-id","segment_id":"host-only-segment-id",
+            "revision":1,"start_ms":0,"text":"中文\"引号\\换行\n".repeat(500)});
+        let rows = vec![source.clone()];
+        let mut restored = String::new();
+        let mut offset = 0;
+        let mut seen = HashMap::new();
+        loop {
+            let page = evidence_page(&rows, 0, offset, 1800);
+            assert!(tool_wire_bytes(&page) <= 1800);
+            assert_ne!(page["budget_exhausted"], true);
+            let row = &page["rows"][0];
+            assert!(row["meeting_id"].is_null());
+            assert!(row["segment_id"].is_null());
+            restored.push_str(row["text"].as_str().unwrap());
+            remember_returned(&page, &rows, &mut seen);
+            assert_eq!(seen["meeting:synthetic:1"]["partial"], true);
+            assert_eq!(
+                seen["meeting:synthetic:1"]["segment_id"],
+                "host-only-segment-id"
+            );
+            if page["next_offset"].is_null() {
+                break;
+            }
+            let next = page["next_char_offset"].as_u64().unwrap() as usize;
+            assert!(next > offset);
+            offset = next;
+        }
+        assert_eq!(restored, source["text"].as_str().unwrap());
+        let no_space = evidence_page(&rows, 0, 0, 512);
+        assert!(tool_wire_bytes(&no_space) <= 512);
+        assert_eq!(no_space["partial"], true);
+        let context = json!({"kind":"meeting","meeting_id":"synthetic","scope":"all","context_allowed":true,
+            "user_records":{"notes":[{"source_id":"record:secret","text":"未返回笔记".repeat(1000)}],"actions":[]},
+            "meeting_memory":{"facts":[{"text":"历史索引".repeat(1000)}]}});
+        let bounded = bounded_context(&context, 1024);
+        assert!(tool_wire_bytes(&bounded) <= 1024);
+        assert_eq!(bounded["context_allowed"], true);
+        assert_eq!(bounded["partial"], true);
+        let mut hidden = HashMap::new();
+        remember_returned(
+            &bounded,
+            &[json!({"source_id":"record:secret","kind":"record","text":"未返回笔记"})],
+            &mut hidden,
+        );
+        assert!(hidden.is_empty());
+    }
+    #[test]
+    fn meeting_pagination_respects_capacity_and_returns_full_or_explicit_partial_coverage() {
+        for count in [84, 207] {
+            let (_tmp, rt) = setup();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            models::save(
+                &rt,
+                models::ProfileInput {
+                    profile_id: None,
+                    expected_version: None,
+                    display_name: "合成32768窗口".into(),
+                    base_url: format!("http://{}", listener.local_addr().unwrap()),
+                    model: "fake-tools".into(),
+                    context_tokens: 32768,
+                    max_output_tokens: 4096,
+                    timeout_seconds: 10,
+                    key_action: "clear".into(),
+                    api_key: String::new(),
+                },
+            )
+            .unwrap();
+            let (mid, _) = seed(&rt, "合成分页会议", "合成目标是核对范围。");
+            {
+                let db = rt.db().unwrap();
+                db.execute(
+                    "UPDATE meetings SET state='recording',recording_duration_ms=173489 WHERE id=?",
+                    [&mid],
+                )
+                .unwrap();
+                db.execute("INSERT INTO recording_sources(meeting_id,source,state,device) VALUES (?,'microphone','active',0)",[&mid]).unwrap();
+                for n in 1..count {
+                    let sid = id();
+                    db.execute(
+                        "INSERT INTO transcript_segments VALUES (?,?,?,?,'mixed',1,'final')",
+                        params![sid, mid, n * 2000, n * 2000 + 1000],
+                    )
+                    .unwrap();
+                    db.execute(
+                        "INSERT INTO transcript_revisions VALUES (?,1,?,?,'asr',?)",
+                        params![sid, mid, "合成目标是核对范围。", now()],
+                    )
+                    .unwrap();
+                }
+            }
+            let c = open(&rt, Some(mid), false).unwrap();
+            let cid = c["id"].as_str().unwrap();
+            let server = std::thread::spawn(move || {
+                let mut first_source = Value::Null;
+                let mut largest = 0;
+                for n in 0..6 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = receive(&mut stream);
+                    largest = largest.max(request.to_string().len());
+                    assert!(request.to_string().len() <= 128 * 1024);
+                    assert!(meeting_core::budget::estimate(&request.to_string()) <= 25395);
+                    let messages = request["messages"].as_array().unwrap();
+                    let last = messages
+                        .iter()
+                        .rev()
+                        .find(|m| m["role"] == "tool")
+                        .map(|m| {
+                            serde_json::from_str::<Value>(m["content"].as_str().unwrap()).unwrap()
+                        });
+                    let message = if n == 0 {
+                        json!({"content":null,"tool_calls":[{"id":format!("context-{n}"),"type":"function","function":{"name":"get_context","arguments":"{}"}}]})
+                    } else {
+                        let offset = last
+                            .as_ref()
+                            .and_then(|v| v["next_offset"].as_u64())
+                            .unwrap_or(0);
+                        if let Some(data) = last.as_ref().filter(|v| v["rows"].is_array()) {
+                            assert_ne!(data["budget_exhausted"], true);
+                            assert!(!data["rows"].as_array().unwrap().is_empty());
+                            if first_source.is_null() {
+                                first_source = data["rows"][0]["source_id"].clone();
+                            }
+                            assert!(data["rows"][0]["meeting_id"].is_null());
+                        }
+                        let complete = last
+                            .as_ref()
+                            .is_some_and(|v| v["rows"].is_array() && v["next_offset"].is_null());
+                        if complete || request["tools"].as_array().is_none_or(Vec::is_empty) {
+                            assert!(n <= 4, "must leave the final model call for repair");
+                            let mut blocks = vec![
+                                json!({"kind":"meeting_fact","text":"已读原文提到核对范围。","sources":[first_source]}),
+                            ];
+                            if !complete {
+                                blocks.push(json!({"kind":"unanswered","text":"我只读取了部分原文，尚未完整覆盖整场会议。","sources":[]}));
+                            }
+                            json!({"content":json!({"blocks":blocks}).to_string()})
+                        } else {
+                            json!({"content":null,"tool_calls":[{"id":format!("page-{n}"),"type":"function","function":{"name":"get_transcript","arguments":json!({"offset":offset}).to_string()}}]})
+                        }
+                    };
+                    let finished = message["tool_calls"].is_null();
+                    let body=json!({"choices":[{"finish_reason":if finished{"stop"}else{"tool_calls"},"message":message}]}).to_string();
+                    write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                    if finished {
+                        break;
+                    }
+                }
+                largest
+            });
+            let turn =
+                submit(rt.clone(), cid, "帮我核对整场会议目标", "voice", Some(id())).unwrap();
+            assert_eq!(
+                wait(&rt, turn["turn_id"].as_str().unwrap()),
+                "succeeded",
+                "{}",
+                detail(&rt, cid).unwrap()
+            );
+            let largest = server.join().unwrap();
+            assert!(largest > 25395);
+            let response = detail(&rt, cid).unwrap()["turns"][0]["answer"].clone();
+            let returned = response["coverage"]["transcript_returned"]
+                .as_u64()
+                .unwrap();
+            assert_eq!(response["coverage"]["transcript_total"], count);
+            if count == 84 {
+                assert_eq!(returned, count as u64);
+            } else {
+                assert!(returned > 0 && returned < count as u64);
+                assert!(response["blocks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|b| b["kind"] == "unanswered"
+                        && b["text"].as_str().unwrap().contains("部分")));
+            }
+            assert!(response["evidence"][0]["segment_id"].is_string());
+        }
+    }
+    #[test]
+    fn provider_capacity_error_restarts_once_with_smaller_evidence_and_same_question() {
+        let (_tmp, rt) = setup();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        profile(&rt, &format!("http://{}", listener.local_addr().unwrap()));
+        let (mid, _) = seed(&rt, "合成容量降级", &"核对范围。".repeat(8000));
+        let c = open(&rt, Some(mid), false).unwrap();
+        let cid = c["id"].as_str().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut first_page = 0;
+            for n in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = receive(&mut stream);
+                assert!(request.to_string().contains("合成容量问题"));
+                let tool = request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|m| m["role"] == "tool")
+                    .map(|m| {
+                        serde_json::from_str::<Value>(m["content"].as_str().unwrap()).unwrap()
+                    });
+                let (code, body) = if n == 1 {
+                    first_page = tool.unwrap()["rows"][0]["text"].as_str().unwrap().len();
+                    (
+                        400,
+                        json!({"error":{"code":"context_length_exceeded","message":"maximum context length"}}),
+                    )
+                } else if n == 3 {
+                    let data = tool.unwrap();
+                    assert!(data["rows"][0]["text"].as_str().unwrap().len() < first_page);
+                    (
+                        200,
+                        json!({"choices":[{"finish_reason":"stop","message":{"content":json!({"blocks":[{"kind":"meeting_fact","text":"我看到需要核对范围。","sources":[data["rows"][0]["source_id"]]}]}).to_string()}}]}),
+                    )
+                } else {
+                    (
+                        200,
+                        json!({"choices":[{"finish_reason":"tool_calls","message":{"content":null,"tool_calls":[{"id":format!("raw-{n}"),"type":"function","function":{"name":"get_transcript","arguments":"{\"offset\":0}"}}]}}]}),
+                    )
+                };
+                let body = body.to_string();
+                write!(stream,"HTTP/1.1 {code} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let turn = submit(rt.clone(), cid, "合成容量问题", "text", None).unwrap();
+        assert_eq!(
+            wait(&rt, turn["turn_id"].as_str().unwrap()),
+            "succeeded",
+            "{}",
+            detail(&rt, cid).unwrap()
+        );
+        server.join().unwrap();
+        let d = detail(&rt, cid).unwrap();
+        assert_eq!(d["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            d["turns"][0]["answer"]["coverage"]["transcript_returned"],
+            0
+        );
+    }
+    #[test]
     fn real_pi_broker_unifies_voice_and_text_history_and_deduplicates() {
         let (_tmp, rt) = setup();
+        let mut preferences = settings(&rt).unwrap();
+        preferences["wake_word"] = json!("小帆同学");
+        save_settings(&rt, preferences).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         profile(
             &rt,
@@ -1145,6 +2324,18 @@ mod tests {
         .unwrap();
         assert_eq!(wait(&rt, second["turn_id"].as_str().unwrap()), "succeeded");
         let requests = server.join().unwrap();
+        for request in &requests {
+            let system = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .filter_map(|message| message["content"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(system.contains("你的名字是“小帆同学”"));
+            assert!(system.contains("必须以第一人称"));
+        }
         assert!(requests[2].to_string().contains("合成语音问题"));
         assert!(requests[2].to_string().contains("目标是本周交付"));
         let d = detail(&rt, cid).unwrap();
@@ -1157,6 +2348,93 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+    #[test]
+    fn large_history_is_compacted_persisted_and_reused_without_remote_services() {
+        let (_tmp, mut rt) = setup();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        profile(&rt, &format!("http://{}", listener.local_addr().unwrap()));
+        let c = open(&rt, None, true).unwrap();
+        let cid = c["id"].as_str().unwrap();
+        let context = snapshot(&rt, None, "all").unwrap()["context"].clone();
+        let config = configuration(&rt, None).unwrap();
+        for n in 0..9 {
+            rt.db().unwrap().execute("INSERT INTO assistant_turns(id,conversation_id,epoch,question,source,state,response_json,model_json,snapshot_json,created_at) VALUES (?,?,0,?,'text','succeeded',?,?,?,?)",params![id(),cid,format!("第{n}轮合成目标{}","范围待核对".repeat(70)),json!({"blocks":[{"kind":"suggestion","text":"核对验收".repeat(70),"sources":[]}]}).to_string(),serde_json::to_string(&config).unwrap(),json!({"context":context}).to_string(),now()]).unwrap();
+        }
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = done.clone();
+        let server = std::thread::spawn(move || {
+            let mut compact = 0;
+            let mut answers = 0;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                };
+                let input = receive(&mut stream);
+                let content = if input["tools"].is_null() {
+                    compact += 1;
+                    "合成目标是核对范围和验收，尚未确认会议决定。".to_string()
+                } else {
+                    answers += 1;
+                    assert!(input.to_string().contains("合成目标"));
+                    json!({"blocks":[{"kind":"suggestion","text":"先核对范围与验收。","sources":[]}]}).to_string()
+                };
+                let body=json!({"usage":{"prompt_tokens":500,"completion_tokens":40,"total_tokens":540},"choices":[{"message":{"content":content},"finish_reason":"stop"}]}).to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+            (compact, answers)
+        });
+        let first = submit(rt.clone(), cid, "回顾范围", "text", None).unwrap();
+        let state = wait(&rt, first["turn_id"].as_str().unwrap());
+        assert_eq!(state, "succeeded", "{}", detail(&rt, cid).unwrap());
+        let count: usize = rt
+            .db()
+            .unwrap()
+            .query_row("SELECT count(*) FROM assistant_compactions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(count > 0);
+        let root = rt.root.clone();
+        for h in rt.analysis_threads.lock().unwrap().drain(..) {
+            h.join().unwrap();
+        }
+        drop(rt);
+        rt = Runtime::open_with_vault(root, Arc::new(models::tests::MemoryVault::default()))
+            .unwrap();
+        let second = submit(rt.clone(), cid, "继续核对", "text", None).unwrap();
+        assert_eq!(wait(&rt, second["turn_id"].as_str().unwrap()), "succeeded");
+        assert_eq!(
+            rt.db()
+                .unwrap()
+                .query_row("SELECT count(*) FROM assistant_compactions", [], |r| r
+                    .get::<_, usize>(0))
+                .unwrap(),
+            count
+        );
+        done.store(true, std::sync::atomic::Ordering::Release);
+        let (compact, answers) = server.join().unwrap();
+        assert!(compact > 0);
+        assert_eq!(answers, 2);
+        assert_eq!(
+            detail(&rt, cid).unwrap()["turns"].as_array().unwrap().len(),
+            11
+        );
+        clear(&rt, cid).unwrap();
+        let snap = snapshot(&rt, None, "all").unwrap();
+        assert!(history(
+            &rt,
+            cid,
+            second["turn_id"].as_str().unwrap(),
+            &snap["context"]
+        )
+        .unwrap()
+        .is_empty());
     }
     #[test]
     fn cancellation_kills_queued_agent_before_any_http_dispatch() {

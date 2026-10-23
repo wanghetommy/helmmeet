@@ -51,3 +51,16 @@ extern "C" int32_t hm_kws_accept(void *handle,const float *samples,int32_t count
  while(!SherpaOnnxVoiceActivityDetectorEmpty(v->vad)){flags|=4;SherpaOnnxVoiceActivityDetectorPop(v->vad);}
  return flags;
 }
+// Meeting boundary VAD is independent of keyword activation and owns no device.
+extern "C" void *hm_meeting_vad_create(const char *directory){
+ try {
+  if(!directory)return nullptr;
+  auto v=std::make_unique<Voice>();std::string model=std::string(directory)+"/silero_vad.onnx";
+  SherpaOnnxVadModelConfig d{};d.silero_vad.model=model.c_str();d.silero_vad.threshold=.5f;
+  d.silero_vad.min_silence_duration=.1f;d.silero_vad.min_speech_duration=.16f;
+  d.silero_vad.window_size=512;d.silero_vad.max_speech_duration=60;
+  d.sample_rate=16000;d.num_threads=1;d.provider="cpu";
+  v->vad=SherpaOnnxCreateVoiceActivityDetector(&d,65.f);if(!v->vad)return nullptr;
+  return v.release();
+ }catch(...){return nullptr;}
+}

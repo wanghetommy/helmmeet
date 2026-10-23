@@ -82,7 +82,7 @@ class ModelProfileMigrations(unittest.TestCase):
         self.db.close()
 
     def test_latest_schema_and_immutable_model_versions(self):
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 11)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 18)
         for statement in ("UPDATE model_configs SET config_json='{}'", 'DELETE FROM model_configs'):
             with self.assertRaises(sqlite3.IntegrityError):
                 self.db.execute(statement)

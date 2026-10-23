@@ -5,6 +5,8 @@ fn main() {
         "x86_64-apple-darwin" => "x86_64",
         _ => panic!("Desktop supports macOS arm64 / x86_64 only"),
     };
+    // ASR script conversion uses the macOS CoreFoundation text transforms.
+    println!("cargo:rustc-link-lib=framework=CoreFoundation");
     if std::env::var_os("CARGO_FEATURE_AUDIO_PROCESSING").is_some() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let library = root
@@ -96,7 +98,11 @@ fn main() {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
-        tauri_build::AppManifest::new().commands(&["get_system_status", "dispatch"]),
+        tauri_build::AppManifest::new().commands(&[
+            "get_system_status",
+            "dispatch",
+            "launch_request",
+        ]),
     ))
     .expect("desktop build setup failed");
 }

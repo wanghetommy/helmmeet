@@ -1,9 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod acoustic_probe;
+mod activity;
 mod analysis;
 mod asr;
 mod assistant;
+mod assistant_context;
+mod assistant_history;
 mod audio;
+mod calibration;
 mod commands;
 mod config;
 mod credentials;
@@ -13,13 +17,17 @@ mod echo;
 mod enhancement;
 mod exit_probe;
 mod knowledge;
+mod launch;
 mod lifecycle;
 #[path = "../../../../agent/prompts.rs"]
 mod meeting_prompts;
+mod memory;
 mod models;
+mod paragraphs;
 #[cfg(feature = "audio-processing")]
 mod processing;
 mod product;
+mod review;
 mod routes;
 mod voice;
 mod workspace;
@@ -136,6 +144,17 @@ fn main() {
             std::process::exit(2);
         }
         #[cfg(feature = "audio-processing")]
+        return;
+    }
+    if let Some(index) = std::env::args().position(|s| s == "--probe-whisper-metal") {
+        let model = std::env::args()
+            .nth(index + 1)
+            .expect("--probe-whisper-metal requires a model path");
+        let _context = whisper_rs::WhisperContext::new_with_params(
+            &model,
+            asr::context_parameters_for_probe(),
+        )
+        .expect("Metal model probe failed");
         return;
     }
     // No log backend enabled: suppress upstream logs which may contain token text.
@@ -284,6 +303,7 @@ fn main() {
     }
     let exit_probe = std::env::args().any(|s| s == "--check-asr-exit");
     let app = tauri::Builder::default()
+        .manage(launch::LaunchInbox::default())
         .setup(move |app| {
             let root = std::env::var_os("HELMMEET_DATA_ROOT")
                 .map(std::path::PathBuf::from)
@@ -311,7 +331,9 @@ fn main() {
             app.manage(lifecycle::Shutdown::new(vec![
                 asr::spawn(rt.clone()),
                 voice::background(rt.clone()),
+                activity::background(rt.clone()),
                 workspace::background(rt.clone()),
+                calibration::background(rt.clone()),
                 enhancement::background(rt.clone()),
             ]));
             app.manage(rt.clone());
@@ -362,10 +384,35 @@ fn main() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![get_system_status, dispatch])
+        .invoke_handler(tauri::generate_handler![
+            get_system_status,
+            dispatch,
+            launch::launch_request
+        ])
         .build(tauri::generate_context!())
         .expect("启动 HelmMeet 失败");
     app.run(move |app, event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Opened { ref urls } = event {
+            for url in urls {
+                if url.scheme() != "helmmeet" {
+                    continue;
+                }
+                match app.state::<launch::LaunchInbox>().receive(url) {
+                    Ok(_) => {
+                        let _ = app.emit("launch-link", ());
+                    }
+                    Err(message) => {
+                        let _ = app.emit("launch-link-error", message);
+                    }
+                }
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                }
+            }
+        }
         if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
             let shutdown = app.state::<lifecycle::Shutdown>();
             if shutdown.ready() {

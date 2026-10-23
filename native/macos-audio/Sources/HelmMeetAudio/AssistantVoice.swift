@@ -9,6 +9,7 @@ final class AssistantSpeaker {
     var engine: AVAudioEngine?
     var player: AVAudioPlayerNode?
     var generation: UInt64 = 0
+    var playbackGeneration: UInt64 = 0
     var status: Int32 = 0 // 0 idle, 1 rendering, 2 playing, -1 unavailable
     var reference: [Float] = []
     var referenceStart: UInt64 = 0
@@ -27,6 +28,7 @@ final class AssistantSpeaker {
     }
     func stop() {
         generation &+= 1
+        playbackGeneration &+= 1
         synthesizer.stopSpeaking(at: .immediate)
         player?.stop(); engine?.stop(); player = nil; engine = nil
         reference = []; referenceStart = 0; status = 0
@@ -43,6 +45,7 @@ final class AssistantSpeaker {
         status = 1
         var pcm: [Float] = []
         var converter: PacketConverter?
+        var completed = false
         let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
         synthesizer.write(utterance) { [weak self] buffer in
             guard let self = self, let audio = buffer as? AVAudioPCMBuffer else { return }
@@ -54,8 +57,11 @@ final class AssistantSpeaker {
             let dst = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
             for i in 0..<src.count { if src[i].mDataByteSize > 0 { memcpy(dst[i].mData!, src[i].mData!, Int(src[i].mDataByteSize)) } }
             DispatchQueue.main.async {
-                guard self.generation == token else { return }
+                guard self.generation == token, !completed else { return }
                 if copy.frameLength == 0 {
+                    // AVSpeechSynthesizer may deliver more than one empty
+                    // terminal buffer. Finish this utterance exactly once.
+                    completed = true
                     guard !pcm.isEmpty else { self.status = -1; return }
                     if text == "小舵在" { self.cache[text] = pcm }
                     if let done = renderOnly { self.status = 0; done(pcm) } else { self.play(pcm, token) }
@@ -69,8 +75,18 @@ final class AssistantSpeaker {
         }
         return 0
     }
+    func playPCM(_ pcm: [Float]) -> Int32 {
+        guard !pcm.isEmpty, pcm.count <= 16000 * 4,
+              pcm.allSatisfy({ $0.isFinite && abs($0) <= 1 }) else { return 1 }
+        stop()
+        guard !screenLocked else { status = -1; return 1 }
+        play(pcm, generation)
+        return status == 2 ? 0 : 1
+    }
     func play(_ pcm: [Float], _ token: UInt64) {
         guard generation == token, !screenLocked else { return }
+        playbackGeneration &+= 1
+        let playbackToken = playbackGeneration
         let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(pcm.count)) else { status = -1; return }
         buffer.frameLength = buffer.frameCapacity
@@ -83,7 +99,7 @@ final class AssistantSpeaker {
         referenceStart = UInt64((AVAudioTime.seconds(forHostTime: time) + audio.outputNode.presentationLatency) * 1_000_000_000)
         status = 2
         node.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { [weak self] _ in
-            DispatchQueue.main.async { guard let self = self, self.generation == token else { return }; self.player?.stop(); self.engine?.stop(); self.player = nil; self.engine = nil; self.status = 0 }
+            DispatchQueue.main.async { guard let self = self, self.generation == token, self.playbackGeneration == playbackToken else { return }; self.player?.stop(); self.engine?.stop(); self.player = nil; self.engine = nil; self.status = 0 }
         }
         node.play(at: AVAudioTime(hostTime: time))
     }
@@ -94,6 +110,13 @@ private func getSpeaker() -> AssistantSpeaker { if speaker == nil { speaker = As
 @_cdecl("hm_voice_speak") public func hmVoiceSpeak(_ text: UnsafePointer<CChar>) -> Int32 {
     let owned = String(cString: text)
     return onVoiceMain { getSpeaker().speak(owned) }
+}
+@_cdecl("hm_voice_play_pcm") public func hmVoicePlayPCM(_ input: UnsafePointer<Float>, _ count: Int32) -> Int32 {
+    guard count > 0, count <= 16000 * 4 else { return 1 }
+    // Own the caller's PCM before moving to the main queue. Uses the same player,
+    // cancellation fence and timestamped AEC reference as synthesized answers.
+    let pcm = Array(UnsafeBufferPointer(start: input, count: Int(count)))
+    return onVoiceMain { getSpeaker().playPCM(pcm) }
 }
 @_cdecl("hm_voice_stop") public func hmVoiceStop() { onVoiceMain { speaker?.stop() } }
 @_cdecl("hm_voice_state") public func hmVoiceState() -> Int32 { onVoiceMain { getSpeaker().screenLocked ? -2 : getSpeaker().status } }

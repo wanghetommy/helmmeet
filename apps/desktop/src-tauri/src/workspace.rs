@@ -37,21 +37,34 @@ pub fn transcript(
         )
         .map_err(err)?;
     let sql = if source == "original" {
-        "SELECT s.id,s.start_ms,r.revision,r.text FROM transcript_segments s JOIN transcript_revisions r ON r.segment_id=s.id AND r.revision=(SELECT min(revision) FROM transcript_revisions WHERE segment_id=s.id AND origin='asr') WHERE s.meeting_id=? ORDER BY s.start_ms,s.id"
+        "SELECT s.id,s.start_ms,r.revision,r.text,s.end_ms FROM transcript_segments s JOIN transcript_revisions r ON r.segment_id=s.id AND r.revision=(SELECT min(revision) FROM transcript_revisions WHERE segment_id=s.id AND origin='asr') WHERE s.meeting_id=? ORDER BY s.start_ms,s.id"
     } else {
-        "SELECT s.id,s.start_ms,r.revision,r.text FROM transcript_segments s JOIN transcript_revisions r ON r.segment_id=s.id AND r.revision=s.current_revision WHERE s.meeting_id=? ORDER BY s.start_ms,s.id"
+        "SELECT s.id,s.start_ms,r.revision,r.text,s.end_ms FROM transcript_segments s JOIN transcript_revisions r ON r.segment_id=s.id AND r.revision=s.current_revision WHERE s.meeting_id=? ORDER BY s.start_ms,s.id"
     };
     let mut stmt = db.prepare(sql).map_err(err)?;
-    let rows=stmt.query_map([meeting],|r|Ok(json!({"segment_id":r.get::<_,String>(0)?,"start_ms":r.get::<_,u64>(1)?,"revision":r.get::<_,u64>(2)?,"text":r.get::<_,String>(3)?}))).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
-    let text = format_transcript(&rows, timestamps);
+    let rows=stmt.query_map([meeting],|r|Ok(json!({"segment_id":r.get::<_,String>(0)?,"start_ms":r.get::<_,u64>(1)?,"revision":r.get::<_,u64>(2)?,"text":r.get::<_,String>(3)?,"end_ms":r.get::<_,u64>(4)?}))).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
+    let active: bool = db
+        .query_row(
+            "SELECT state IN('recording','finalizing') FROM meetings WHERE id=?",
+            [meeting],
+            |r| r.get(0),
+        )
+        .map_err(err)?;
+    let paragraphs = crate::paragraphs::project(&db, meeting, &rows, active)?;
+    let paragraphs = if source == "current" {
+        crate::calibration::decorate(&db, meeting, paragraphs)?
+    } else {
+        paragraphs
+    };
+    let text = format_transcript(&paragraphs, timestamps);
     let hash = format!(
         "{:x}",
         Sha256::digest(
-            serde_json::to_vec(&json!([meeting, source, timestamps, rows])).map_err(err)?
+            serde_json::to_vec(&json!([meeting, source, timestamps, rows, text])).map_err(err)?
         )
     );
     Ok(
-        json!({"meeting_id":meeting,"title":title,"source":source,"timestamps":timestamps,"through_ms":duration,"segments":rows,"text":text,"hash":hash}),
+        json!({"meeting_id":meeting,"title":title,"source":source,"timestamps":timestamps,"through_ms":duration,"segments":rows,"paragraphs":paragraphs,"text":text,"hash":hash}),
     )
 }
 pub fn format_transcript(rows: &[Value], timestamps: bool) -> String {
@@ -103,24 +116,26 @@ pub fn write_clipboard(text: &str) -> Result<(), String> {
 }
 pub fn pending(rt: &Runtime, mid: &str) -> Result<Revisions, String> {
     let db = rt.db()?;
-    let mut s=db.prepare("SELECT s.id,s.current_revision,r.text FROM transcript_segments s JOIN transcript_revisions r ON r.segment_id=s.id AND r.revision=s.current_revision LEFT JOIN summary_coverage c ON c.meeting_id=s.meeting_id AND c.segment_id=s.id WHERE s.meeting_id=? AND (c.revision IS NULL OR c.revision!=s.current_revision)").map_err(err)?;
-    let rows = s
+    let mut q=db.prepare("SELECT s.id,s.current_revision,r.text,c.revision FROM transcript_segments s JOIN transcript_revisions r ON r.segment_id=s.id AND r.revision=s.current_revision LEFT JOIN summary_coverage c ON c.meeting_id=s.meeting_id AND c.segment_id=s.id WHERE s.meeting_id=? AND s.state IN('final','edited') AND (c.revision IS NULL OR c.revision!=s.current_revision)").map_err(err)?;
+    let rows = q
         .query_map([mid], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                (
-                    r.get::<_, u64>(1)?,
-                    r.get::<_, String>(2)?
-                        .chars()
-                        .filter(|c| !c.is_whitespace())
-                        .count(),
-                ),
+                r.get::<_, u64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<u64>>(3)?,
             ))
         })
         .map_err(err)?
-        .collect::<Result<Revisions, _>>()
+        .collect::<Result<Vec<_>, _>>()
         .map_err(err)?;
-    Ok(rows.into_iter().filter(|(_, (_, n))| *n > 0).collect())
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, rev, text, old)| {
+            let n = text.chars().filter(|c| c.is_alphanumeric()).count();
+            (n > 0 || old.is_some()).then_some((id, (rev, if old.is_some() { 0 } else { n })))
+        })
+        .collect())
 }
 pub fn set_schedule(
     rt: &Runtime,
@@ -142,10 +157,10 @@ pub fn set_schedule(
             |r| r.get(0),
         )
         .map_err(err)?;
-    if !matches!(mode, "realtime" | "minute" | "three_minutes")
+    if !matches!(mode, "realtime" | "three_minutes" | "economy")
         && !(matches!(mode, "legacy_5" | "legacy_10") && current_mode == mode)
     {
-        return Err("请选择实时、1 分钟或 3 分钟".into());
+        return Err("请选择实时、3 分钟或节省调用".into());
     }
     if enabled {
         let permitted:bool=tx.query_row("SELECT analysis_mode!='transcript_only' AND context_consent=1 FROM meetings WHERE id=?",[mid],|r|r.get(0)).map_err(err)?;
@@ -161,21 +176,25 @@ pub fn set_schedule(
 struct Clock {
     version: u64,
     elapsed: u64,
+    boundary_ms: u64,
+    completion_seq: u64,
     window: Window,
     job: Option<String>,
 }
 pub fn background(rt: Arc<Runtime>) -> crate::lifecycle::Worker {
     crate::lifecycle::Worker::spawn(move |stop| {
         let mut clocks: HashMap<String, Clock> = HashMap::new();
-        let mut last = Instant::now();
         let mut ticks = 0u64;
+        let mut last = Instant::now();
         while stop.wait(std::time::Duration::from_millis(250)) {
-            if crate::product::globally_paused(&rt).unwrap_or(true) {
-                last = Instant::now();
-                continue;
-            }
             let delta = last.elapsed().as_millis() as u64;
             last = Instant::now();
+            if crate::product::globally_paused(&rt).unwrap_or(true) {
+                for clock in clocks.values_mut() {
+                    clock.window.clear_boundary();
+                }
+                continue;
+            }
             ticks += 1;
             if ticks.is_multiple_of(40) {
                 let _ = crate::commands::cleanup(&rt);
@@ -197,7 +216,7 @@ pub fn background(rt: Arc<Runtime>) -> crate::lifecycle::Worker {
                 };
                 let d = (|| -> Result<Value, String> {
                     let db = rt.db()?;
-                    let mut v=db.query_row("SELECT m.state,m.analysis_mode,m.context_consent,s.enabled,s.mode,s.version,s.paused_reason FROM meetings m JOIN summary_schedules s ON s.meeting_id=m.id WHERE m.id=?",[mid],|r|Ok(json!({"state":r.get::<_,String>(0)?,"analysis_mode":r.get::<_,String>(1)?,"context_consent":r.get::<_,bool>(2)?,"schedule":{"enabled":r.get::<_,bool>(3)?,"mode":r.get::<_,String>(4)?,"version":r.get::<_,u64>(5)?,"paused_reason":r.get::<_,Option<String>>(6)?}}))).map_err(err)?;
+                    let mut v=db.query_row("SELECT m.state,m.analysis_mode,m.context_consent,s.enabled,s.mode,s.version,s.paused_reason,s.completed_asr_ms,s.failures,(SELECT coalesce(max(a.rowid),0) FROM artifacts a JOIN meeting_memories mm ON mm.artifact_id=a.id WHERE a.meeting_id=m.id) FROM meetings m JOIN summary_schedules s ON s.meeting_id=m.id WHERE m.id=?",[mid],|r|Ok(json!({"state":r.get::<_,String>(0)?,"analysis_mode":r.get::<_,String>(1)?,"context_consent":r.get::<_,bool>(2)?,"schedule":{"enabled":r.get::<_,bool>(3)?,"mode":r.get::<_,String>(4)?,"version":r.get::<_,u64>(5)?,"paused_reason":r.get::<_,Option<String>>(6)?,"completed_asr_ms":r.get::<_,u64>(7)?,"failures":r.get::<_,u64>(8)?,"completion_seq":r.get::<_,u64>(9)?}}))).map_err(err)?;
                     let mut stmt=db.prepare("SELECT id,state FROM analysis_jobs WHERE meeting_id=? AND type='stage' AND state IN('pending','running')").map_err(err)?;
                     v["jobs"]=json!(stmt.query_map([mid],|r|Ok(json!({"id":r.get::<_,String>(0)?,"type":"stage","state":r.get::<_,String>(1)?}))).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?);
                     Ok(v)
@@ -209,6 +228,8 @@ pub fn background(rt: Arc<Runtime>) -> crate::lifecycle::Worker {
                 let c = clocks.entry(mid.into()).or_insert_with(|| Clock {
                     version,
                     elapsed: 0,
+                    boundary_ms: 0,
+                    completion_seq: 0,
                     window: Window::default(),
                     job: None,
                 });
@@ -216,6 +237,8 @@ pub fn background(rt: Arc<Runtime>) -> crate::lifecycle::Worker {
                     *c = Clock {
                         version,
                         elapsed: 0,
+                        boundary_ms: 0,
+                        completion_seq: 0,
                         window: Window::default(),
                         job: None,
                     };
@@ -223,20 +246,39 @@ pub fn background(rt: Arc<Runtime>) -> crate::lifecycle::Worker {
                 let Ok(pending) = pending(&rt, mid) else {
                     continue;
                 };
-                let mode = schedule["mode"].as_str().unwrap_or("realtime");
+                let mode = schedule["mode"].as_str().unwrap_or("three_minutes");
+                let (asr_ms,first,revised,sources) = match rt.db().and_then(|db| {
+                    let asr=db.query_row("SELECT coalesce(sum(end_ms-start_ms),0) FROM asr_chunks WHERE meeting_id=?",[mid],|r|r.get::<_,u64>(0)).map_err(err)?;
+                    let first=!db.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE meeting_id=? AND type='stage' AND status!='stale' AND json_extract(content_json,'$.manual_text') IS NULL)",[mid],|r|r.get::<_,bool>(0)).map_err(err)?;
+                    let revised=db.query_row("SELECT EXISTS(SELECT 1 FROM summary_coverage c JOIN transcript_segments s ON s.id=c.segment_id AND s.meeting_id=c.meeting_id WHERE c.meeting_id=? AND c.revision!=s.current_revision)",[mid],|r|r.get::<_,bool>(0)).map_err(err)?;
+                    let mut q=db.prepare("SELECT CASE source WHEN 'microphone' THEN 0 ELSE 1 END,state FROM recording_sources WHERE meeting_id=? AND state!='disabled'").map_err(err)?;
+                    let sources=q.query_map([mid],|r|Ok((r.get::<_,i32>(0)?,r.get::<_,String>(1)?))).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
+                    Ok((asr,first,revised,sources))
+                }) { Ok(v)=>v,Err(_)=>continue };
+                let seq = schedule["completion_seq"].as_u64().unwrap_or(0);
+                if c.completion_seq != seq {
+                    c.completion_seq = seq;
+                    c.window.completed(
+                        schedule["completed_asr_ms"].as_u64().unwrap_or(asr_ms),
+                        &pending,
+                        false,
+                        0,
+                    );
+                    c.job = None;
+                }
+                c.elapsed = asr_ms;
+                if d["state"] == "recording" {
+                    c.boundary_ms += delta;
+                } else {
+                    c.window.clear_boundary();
+                }
                 let seconds = match mode {
-                    "minute" => 60,
+                    "economy" => 600,
                     "three_minutes" => 180,
                     "legacy_5" => 300,
                     "legacy_10" => 600,
-                    _ => 15,
+                    _ => 30,
                 };
-                if d["state"] == "recording"
-                    || d["state"] == "completed"
-                    || d["state"] == "needs_attention"
-                {
-                    c.elapsed += delta;
-                }
                 if let Some(job) = &c.job {
                     let status = rt.db().and_then(|db| {
                         db.query_row("SELECT state FROM analysis_jobs WHERE id=?", [job], |r| {
@@ -247,16 +289,21 @@ pub fn background(rt: Arc<Runtime>) -> crate::lifecycle::Worker {
                     if let Ok(state) = status {
                         if !matches!(state.as_str(), "pending" | "running") {
                             c.window
-                                .completed(c.elapsed, &pending, state == "failed", seconds);
+                                .completed(c.elapsed, &pending, state == "failed", 0);
                             c.job = None;
                         }
                     } else {
-                        c.window.completed(c.elapsed, &pending, true, seconds);
+                        c.window.completed(c.elapsed, &pending, true, 0);
                         c.job = None;
                     }
                 }
                 if fresh {
-                    c.window.completed(c.elapsed, &pending, false, seconds);
+                    c.window.completed(
+                        schedule["completed_asr_ms"].as_u64().unwrap_or(0),
+                        &pending,
+                        false,
+                        seconds,
+                    );
                 }
                 c.window.observe(c.elapsed, &pending);
                 if d["state"] == "recording" {
@@ -292,7 +339,9 @@ pub fn background(rt: Arc<Runtime>) -> crate::lifecycle::Worker {
                         );
                     }
                 }
-                if retry_wait
+                let model_wait=crate::models::selected(&rt,mid).ok().is_some_and(|config|rt.db().ok().is_some_and(|db|db.query_row("SELECT EXISTS(SELECT 1 FROM summary_model_backoff WHERE model_key=? AND retry_after_utc>?)",params![crate::analysis::target(&config),chrono::Utc::now().timestamp()],|r|r.get::<_,bool>(0)).unwrap_or(false)));
+                if model_wait
+                    || retry_wait
                     || !schedule["enabled"].as_bool().unwrap_or(false)
                     || !schedule["paused_reason"].is_null()
                     || d["analysis_mode"] == "transcript_only"
@@ -323,10 +372,34 @@ pub fn background(rt: Arc<Runtime>) -> crate::lifecycle::Worker {
                         c.window.dispatched();
                         continue;
                     }
-                    if (d["state"] == "recording"
-                        && c.window.due(c.elapsed, seconds, mode == "realtime"))
-                        || (tail && !pending.is_empty() && c.window.can_dispatch(c.elapsed))
-                    {
+                    let quiet = crate::activity::quiet(&rt, mid, &sources);
+                    let catchup=rt.db().ok().and_then(|db|db.query_row("SELECT EXISTS(SELECT 1 FROM summary_fragments f JOIN transcript_segments s ON s.id=f.segment_id AND s.meeting_id=f.meeting_id LEFT JOIN summary_coverage c ON c.segment_id=s.id AND c.meeting_id=s.meeting_id WHERE f.meeting_id=? AND f.revision=s.current_revision AND (c.revision IS NULL OR c.revision!=s.current_revision)) OR coalesce((SELECT sum(length(CAST(r.text AS BLOB))) FROM transcript_segments s JOIN transcript_revisions r ON r.segment_id=s.id AND r.revision=s.current_revision LEFT JOIN summary_coverage c ON c.meeting_id=s.meeting_id AND c.segment_id=s.id WHERE s.meeting_id=? AND s.state IN('final','edited') AND (c.revision IS NULL OR c.revision!=s.current_revision)),0)>10240",params![mid,mid],|r|r.get::<_,bool>(0)).ok()).unwrap_or(false);
+                    let retrying =
+                        schedule["failures"].as_u64().unwrap_or(0) > 0 && !pending.is_empty();
+                    let ready = (catchup || retrying) && d["state"] == "recording"
+                        || d["state"] == "recording"
+                            && c.window.at_boundary_on(
+                                c.elapsed,
+                                c.boundary_ms,
+                                mode,
+                                first,
+                                revised,
+                                quiet,
+                            );
+                    if let Ok(mut state) = rt.transient.lock() {
+                        state[mid]["summary_state"] = json!(if pending.is_empty() {
+                            "已同步会议记忆"
+                        } else if c.job.is_some() {
+                            "正在更新总结与记忆"
+                        } else if c.window.waiting() {
+                            "等待发言停顿"
+                        } else {
+                            "累计新增原文"
+                        });
+                        state[mid]["summary_pending_chars"] =
+                            json!(pending.values().map(|(_, n)| n).sum::<usize>());
+                    }
+                    if ready || (tail && !pending.is_empty() && c.window.can_dispatch(c.elapsed)) {
                         if tail {
                             if let Ok(db) = rt.db() {
                                 let _ = db.execute(
@@ -340,7 +413,7 @@ pub fn background(rt: Arc<Runtime>) -> crate::lifecycle::Worker {
                                 c.job = v["job_id"].as_str().map(str::to_string);
                                 c.window.dispatched();
                             }
-                            Err(_) => c.window.completed(c.elapsed, &pending, true, seconds),
+                            Err(_) => c.window.completed(c.elapsed, &pending, true, 0),
                         }
                     }
                 }
@@ -466,6 +539,9 @@ mod tests {
             _ => "answer",
         };
         let output = json!({"summary":[{"text":"合成讨论主题","section":section,"kind":"discussion","evidence":[{"segment_id":r["segment_id"],"revision":r["revision"]}]}],"actions":[]});
+        respond_output(s, &output, code);
+    }
+    fn respond_output(s: &mut TcpStream, output: &Value, code: u16) {
         let body = json!({"choices":[{"message":{"content":output.to_string()}}]}).to_string();
         write!(s,"HTTP/1.1 {code} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
     }
@@ -547,6 +623,163 @@ mod tests {
             .execute("UPDATE template_versions SET name='overwrite'", [])
             .is_err());
         assert_eq!(rt.detail(&m).unwrap()["schedule"]["enabled"], false);
+        drop(rt);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn long_segment_backlog_commits_bounded_fragments_and_resumes_after_restart() {
+        let (root, mut rt) = runtime();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        model(&rt, &format!("http://{}", listener.local_addr().unwrap()));
+        let mid = meeting(&rt, "weekly");
+        let text = "合成讨论目标需要核对。".repeat(2200);
+        let sid = seed(&rt, &mid, &text, 0);
+        enable(&rt, &mid);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = done.clone();
+        let server = std::thread::spawn(move || {
+            let mut calls = 0;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                };
+                let input = receive(&mut stream);
+                let source = &input["allowed_evidence"][0];
+                if let Some(rows) = input["transcript"].as_array() {
+                    assert!(
+                        rows.iter()
+                            .map(|r| r["text"].as_str().unwrap().len())
+                            .sum::<usize>()
+                            <= 10 * 1024
+                    );
+                }
+                let output = json!({"summary":[{"text":"合成讨论目标待核对","kind":"discussion","section":"topic","evidence":[source]}],"actions":[]});
+                let body=json!({"choices":[{"message":{"content":output.to_string()},"finish_reason":"stop"}]}).to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                calls += 1;
+            }
+            calls
+        });
+        let mut rounds = 0;
+        while !pending(&rt, &mid).unwrap().is_empty() && rounds < 12 {
+            let job = analysis::submit_auto(rt.clone(), &mid, 2).unwrap();
+            wait(&rt, &mid, &job);
+            let state: String = rt
+                .db()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM analysis_jobs WHERE id=?",
+                    [job["job_id"].as_str().unwrap()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "succeeded", "{}", rt.detail(&mid).unwrap());
+            rounds += 1;
+            if rounds == 1 {
+                assert!(!pending(&rt, &mid).unwrap().is_empty());
+                assert!(
+                    rt.db()
+                        .unwrap()
+                        .query_row(
+                            "SELECT count(*) FROM summary_fragments WHERE segment_id=?",
+                            [&sid],
+                            |r| r.get::<_, usize>(0)
+                        )
+                        .unwrap()
+                        > 0
+                );
+                for h in rt.analysis_threads.lock().unwrap().drain(..) {
+                    h.join().unwrap();
+                }
+                drop(rt);
+                rt = Runtime::open_with_vault(root.clone(), Arc::new(MemoryVault::default()))
+                    .unwrap();
+            }
+        }
+        done.store(true, std::sync::atomic::Ordering::Release);
+        let calls = server.join().unwrap();
+        assert!(rounds > 1 && rounds < 12);
+        assert!(calls >= rounds);
+        assert!(pending(&rt, &mid).unwrap().is_empty());
+        let d = rt.detail(&mid).unwrap();
+        let latest = d["artifacts"][0]["id"].as_str().unwrap();
+        assert_eq!(
+            rt.db()
+                .unwrap()
+                .query_row(
+                    "SELECT artifact_id FROM meeting_memories WHERE artifact_id=?",
+                    [latest],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            latest
+        );
+        let memory = crate::memory::context(&rt, &mid, "all").unwrap();
+        assert!(!memory["facts"].as_array().unwrap().is_empty());
+        assert!(crate::memory::context(&rt, &mid, "recent")
+            .unwrap()
+            .is_null());
+        rt.db()
+            .unwrap()
+            .execute("UPDATE meetings SET context_consent=0 WHERE id=?", [&mid])
+            .unwrap();
+        assert!(crate::memory::context(&rt, &mid, "all").unwrap()["facts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        drop(rt);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn completion_clock_excludes_asr_progress_during_model_work() {
+        let (root, rt) = runtime();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        model(&rt, &format!("http://{}", listener.local_addr().unwrap()));
+        let mid = meeting(&rt, "weekly");
+        seed(&rt, &mid, "合成原文目标", 0);
+        enable(&rt, &mid);
+        let owner = rt.clone();
+        let meeting = mid.clone();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let input = receive(&mut s);
+            owner
+                .db()
+                .unwrap()
+                .execute("INSERT INTO asr_chunks VALUES (?,0,180000)", [&meeting])
+                .unwrap();
+            respond(&mut s, &input, 200);
+        });
+        let job = analysis::submit(rt.clone(), &mid, "stage", "", "all").unwrap();
+        wait(&rt, &mid, &job);
+        server.join().unwrap();
+        assert_eq!(
+            rt.db()
+                .unwrap()
+                .query_row(
+                    "SELECT completed_asr_ms FROM summary_schedules WHERE meeting_id=?",
+                    [&mid],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+            180000
+        );
+        assert_eq!(
+            rt.db()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM meeting_memories WHERE meeting_id=?",
+                    [&mid],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+            1
+        );
         drop(rt);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -674,6 +907,120 @@ mod tests {
                 .len(),
             2
         );
+        drop(rt);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn transient_service_failures_keep_coverage_and_backoff_the_shared_model() {
+        let (root, rt) = runtime();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        model(&rt, &format!("http://{}", listener.local_addr().unwrap()));
+        let mid = meeting(&rt, "weekly");
+        seed(&rt, &mid, "合成原文保持不变", 0);
+        enable(&rt, &mid);
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut s, _) = listener.accept().unwrap();
+                let input = receive(&mut s);
+                respond(&mut s, &input, 503);
+            }
+        });
+        let job = analysis::submit_auto(rt.clone(), &mid, 2).unwrap();
+        join(&rt);
+        assert_eq!(
+            rt.db()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM analysis_jobs WHERE id=?",
+                    [job["job_id"].as_str().unwrap()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "failed"
+        );
+        server.join().unwrap();
+        let d = rt.detail(&mid).unwrap();
+        assert_eq!(d["schedule"]["failures"], 1);
+        assert!(d["schedule"]["paused_reason"].is_null());
+        assert_eq!(pending(&rt, &mid).unwrap().len(), 1);
+        let until: i64 = rt
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT retry_after_utc FROM summary_model_backoff",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(until >= chrono::Utc::now().timestamp() + 295);
+        assert!(d["artifacts"].as_array().unwrap().is_empty());
+        drop(rt);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn invalid_output_retries_with_backoff_then_pauses_without_advancing_and_can_resume() {
+        let (root, rt) = runtime();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        model(&rt, &format!("http://{}", listener.local_addr().unwrap()));
+        let m = meeting(&rt, "general");
+        seed(&rt, &m, "合成依据保持不变", 0);
+        enable(&rt, &m);
+        let server = std::thread::spawn(move || {
+            // Three failed jobs, each including the single format repair.
+            for _ in 0..6 {
+                let (mut s, _) = listener.accept().unwrap();
+                let input = receive(&mut s);
+                let r = &input["transcript"][0];
+                let item = json!({"text":"合成内容","section":"topic","kind":"discussion","evidence":[{"segment_id":r["segment_id"],"revision":r["revision"]}]});
+                let mut invalid = item.clone();
+                invalid["kind"] = json!("progress");
+                respond_output(
+                    &mut s,
+                    &json!({"summary":[item.clone(),item.clone(),item,invalid],"actions":[]}),
+                    200,
+                );
+            }
+            let (mut s, _) = listener.accept().unwrap();
+            let input = receive(&mut s);
+            respond(&mut s, &input, 200);
+        });
+        for attempt in 1..=3 {
+            let before = chrono::Utc::now().timestamp();
+            analysis::submit_auto(rt.clone(), &m, 2).unwrap();
+            join(&rt);
+            let d = rt.detail(&m).unwrap();
+            assert_eq!(d["schedule"]["failures"], attempt);
+            assert_eq!(d["schedule"]["paused_reason"].is_string(), attempt == 3);
+            assert_eq!(pending(&rt, &m).unwrap().len(), 1);
+            assert!(d["artifacts"].as_array().unwrap().is_empty());
+            let (retry, covered, message, shared): (i64, u64, String, u64) = rt.db().unwrap().query_row(
+                "SELECT retry_after_utc,completed_asr_ms,(SELECT error_code FROM analysis_jobs ORDER BY rowid DESC LIMIT 1),(SELECT count(*) FROM summary_model_backoff) FROM summary_schedules WHERE meeting_id=?",
+                [&m], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            assert!(
+                retry
+                    >= before
+                        + match attempt {
+                            1 => 30,
+                            2 => 120,
+                            _ => 300,
+                        }
+            );
+            assert_eq!(covered, 0);
+            assert_eq!(
+                shared, 0,
+                "output errors must not block other meetings' model"
+            );
+            assert!(message.starts_with("模型输出校验失败：summary[3].kind"));
+        }
+        set_schedule(&rt, &m, 2, true, "realtime").unwrap();
+        let job = analysis::submit_auto(rt.clone(), &m, 3).unwrap();
+        wait(&rt, &m, &job);
+        join(&rt);
+        server.join().unwrap();
+        let d = rt.detail(&m).unwrap();
+        assert_eq!(d["schedule"]["failures"], 0);
+        assert!(d["schedule"]["paused_reason"].is_null());
+        assert!(pending(&rt, &m).unwrap().is_empty());
         drop(rt);
         std::fs::remove_dir_all(root).unwrap();
     }

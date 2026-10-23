@@ -20,6 +20,7 @@ details[a].jobs=[{id:'new-success',type:'stage',state:'succeeded',error:null},{i
 details[b].jobs=[{id:'latest-json-failure',type:'final_map',state:'failed',error:'模型结构化结果无效'}];
 const assistantConversations={};let assistantPreferences={voice_enabled:false,wake_word:'小舵同学',silence_ms:1200,speak_answers:true,collections:[]};let voiceState={state:'off',meeting_id:a,can_enable:true,reason:'disabled',message:'语音唤醒未开启'};
 const assistantOpen=(mid,general)=>{mid=general?null:mid??Object.values(details).find(m=>['recording','paused','interrupted'].includes(m.state))?.id;const key=mid??'general';if(!assistantConversations[key])assistantConversations[key]={id:mid??'general-chat',meeting_id:mid??null,title:mid?details[mid].title:'与小舵聊一聊',turns:[],proposals:[]};return assistantConversations[key]};
+const preparationFixture=structuredClone(details[c]);
 window.testCalls=[];
 window.testAudioStarts=[];
 const NativeAudioContext=window.AudioContext;
@@ -27,13 +28,16 @@ window.AudioContext=class extends NativeAudioContext {
  createBufferSource(){const node=super.createBufferSource();const start=node.start.bind(node);node.start=(at)=>{window.testAudioStarts.push({at,duration:node.buffer.duration});start(at);};return node;}
 };
 const profiles=[{profile_id:'p1',config_version:1,display_name:'合成本地模型',base_url:'http://127.0.0.1:11434/v1',model:'fixture',credential_valid:true,has_api_key:false,archived:false,is_local:true,latest_version:1,bound_meetings:3,context_tokens:32768,max_output_tokens:4096,timeout_seconds:10,last_test:null}];
-let prefs={analysis_paused:false,default_source_mask:1,default_input_device:0};
+let prefs={analysis_paused:false,default_source_mask:1,default_input_device:0,debug_mode:false};
 const collections=[{id:'k1',name:'合成项目词库',kind:'terms',version:1,archived:false,term_count:2,characters:0,bound_meetings:0},{id:'k2',name:'合成项目背景',kind:'documents',version:1,archived:false,term_count:0,characters:32,bound_meetings:0}];
-for(const d of Object.values(details)){d.model_profile=profiles[0];d.capture_epoch='epoch-'+d.id;d.knowledge=[];}
+for(const d of Object.values(details)){d.paragraphs=d.segments.length?[{id:'p-'+d.segments[0].id,start_ms:d.segments[0].start_ms,end_ms:d.segments.at(-1).end_ms,text:d.segments.map(s=>s.text).join(''),segment_ids:d.segments.map(s=>s.id),members:d.segments.map(s=>({segment_id:s.id,revision:s.revision})),open:d.state==='recording',reason:'growing',boundary_source:'fixture'}]:[];d.model_profile=profiles[0];d.capture_epoch='epoch-'+d.id;d.knowledge=[];}
 const capabilities=d=>({phase:d.state==='ready'?'preparation':['recording','paused','interrupted'].includes(d.state)?'live':'after',has_audio:d.duration_ms>0,has_confirmed_text:!!d.segments.length,has_minutes:!!d.artifacts.find(a=>a.type==='minutes'),has_actions:!!d.actions.length,model_ready:d.analysis_mode!=='transcript_only',can_analyze:d.state!=='ready'&&!!d.segments.length&&d.analysis_mode!=='transcript_only'&&!prefs.analysis_paused,analysis_paused:prefs.analysis_paused});
-window.__TAURI_INTERNALS__={transformCallback:()=>1,unregisterCallback:()=>{},invoke:async(cmd,args)=>{
- if(cmd==='plugin:event|listen')return 1;if(cmd==='plugin:event|unlisten')return;
+const syntheticCallbacks=new Map(),syntheticListeners=new Map();let syntheticCallbackId=0,syntheticListenerId=0;
+window.emitSyntheticEvent=(name,payload)=>{for(const [id,row] of syntheticListeners)if(row.event===name)syntheticCallbacks.get(row.handler)?.({event:name,id,payload});};
+window.__TAURI_INTERNALS__={transformCallback:fn=>{const id=++syntheticCallbackId;syntheticCallbacks.set(id,fn);return id;},unregisterCallback:id=>syntheticCallbacks.delete(id),invoke:async(cmd,args)=>{
+ if(cmd==='plugin:event|listen'){const id=++syntheticListenerId;syntheticListeners.set(id,args);return id;}if(cmd==='plugin:event|unlisten'){syntheticListeners.delete(args.eventId);return;}
 
+ if(cmd==='launch_request'){const pending=window.syntheticLaunchRequests??[];if(args?.acknowledge===pending[0]?.id)pending.shift();return structuredClone(pending[0]??null);}
  if(cmd!=='dispatch')throw Error('Unexpected outer IPC');
  const op=args.operation;testCalls.push(op);const d=details[op.meeting_id];let result;
  switch(op.kind){
@@ -44,9 +48,9 @@ window.__TAURI_INTERNALS__={transformCallback:()=>1,unregisterCallback:()=>{},in
  case 'set_audio_enhancement':if(d.state!=='ready')throw Error('frozen');d.enhancement.mode=op.mode;if(op.echo_cancellation!==undefined)d.enhancement.echo_cancellation=op.echo_cancellation;result={saved:true};break;
  case 'export':result={exported:true};break;
  case 'model_profiles':result={profiles,default_profile_id:'p1'};break;
- case 'templates':result=[{id:'general',name:'通用会议',version:1,instructions:'核对目标、结论和行动'},details[b].template];break;
+ case 'templates':result=[{id:'general',name:'通用会议',version:1,instructions:'核对目标、结论和行动'},{id:'weekly',name:'周会',version:1,instructions:'进展、卡点与下周计划'},details[b].template];break;
  case 'devices':result=[];break;
- case 'read_transcript_snapshot':result={meeting_id:d.id,title:d.title,source:op.source,timestamps:op.timestamps,through_ms:60000,hash:'fixture-hash',text:op.source==='original'?'原始识别文本\n第二段测试文字。':'人工修订的测试文字。\n第二段测试文字。',segments:d.segments.map((s,i)=>({segment_id:s.id,start_ms:s.start_ms,revision:op.source==='original'?1:s.revision,text:op.source==='original'&&i===0?'原始识别文本':s.text}))};break;
+ case 'read_transcript_snapshot':result={meeting_id:d.id,title:d.title,source:op.source,timestamps:op.timestamps,through_ms:60000,hash:'fixture-hash',paragraphs:d.paragraphs.map(p=>({...p,text:p.segment_ids.map((id,i)=>op.source==='original'&&i===0?'原始识别文本':d.segments.find(s=>s.id===id).text).join('')})),text:op.source==='original'?'原始识别文本\n第二段测试文字。':'人工修订的测试文字。\n第二段测试文字。',segments:d.segments.map((s,i)=>({segment_id:s.id,start_ms:s.start_ms,revision:op.source==='original'?1:s.revision,text:op.source==='original'&&i===0?'原始识别文本':s.text}))};break;
  case 'playback':{const end=Math.min(op.start_ms+30000,d.duration_ms);result={start_ms:op.start_ms,end_ms:end,samples:Array.from({length:(end-op.start_ms)*16},(_,i)=>Math.round(2000*Math.sin(2*Math.PI*440*(op.start_ms*16+i)/16000)))};break;}
  case 'copy_transcript':result={meeting_id:d.id,title:d.title,through_ms:60000,segments:d.segments};break;
  case 'set_summary_schedule':Object.assign(d.schedule,{enabled:op.enabled,mode:op.mode,version:d.schedule.version+1});result={saved:true};break;
@@ -60,12 +64,14 @@ window.__TAURI_INTERNALS__={transformCallback:()=>1,unregisterCallback:()=>{},in
  case 'save_assistant_settings':assistantPreferences=op.settings;voiceState=op.settings.voice_enabled?{state:'standby',meeting_id:a,wake_word:op.settings.wake_word,message:'待唤醒'}:{state:'off',meeting_id:a,can_enable:true,reason:'disabled',message:'语音唤醒未开启'};result=assistantPreferences;break;
  case 'assistant_voice_status':result=voiceState;break;
  case 'assistant_voice_command':if(op.action==='listen')voiceState={state:'listening',meeting_id:a,message:'合成输入：请说话，停顿后自动提交'};else if(op.action==='cancel')voiceState={state:'standby',meeting_id:a,message:'合成输入已取消'};else if(op.action==='submit'){const c=assistantOpen(a);c.turns.push({id:crypto.randomUUID(),source:'voice',question:'合成语音问题：目前目标是什么？',state:'succeeded',answer:{blocks:[{kind:'suggestion',text:'建议先澄清验收条件。',sources:[]}],evidence:[]}});voiceState={state:'standby',meeting_id:a,message:'合成语音回合已写入聊天'};}result={accepted:true};break;
+ case 'prepare_asr':await new Promise(resolve=>setTimeout(resolve,6000));result={ready:true};break;
+ case 'delete':if(['recording','paused','interrupted'].includes(d.state))throw Error('请先结束会议');delete details[op.meeting_id];result={deleted:true};break;
  case 'record':if(op.action==='stop')throw Error('结束必须确认');d.state=op.action==='pause'?'paused':'recording';d.version++;if(op.action!=='pause')d.capture_epoch+='-new';d.capabilities=capabilities(d);result=d;break;
  case 'finish_meeting':if(op.expected_version!==d.version||op.capture_epoch!==d.capture_epoch)throw Error('录制会话已变化');d.state='finalizing';d.version++;d.capabilities=capabilities(d);result=d;break;
- case 'save_product_preferences':prefs={analysis_paused:op.analysis_paused,default_source_mask:op.default_source_mask,default_input_device:op.default_input_device};result={saved:true};break;
+ case 'save_product_preferences':prefs={analysis_paused:op.analysis_paused,default_source_mask:op.default_source_mask,default_input_device:op.default_input_device,debug_mode:op.debug_mode};result={saved:true};break;
  case 'save_preparation':if(d.state!=='ready'||d.version!==op.expected_version)throw Error('准备版本已变化');Object.assign(d,{title:op.title,assistant_id:op.assistant_id,source_mask:op.source_mask,context:op.context,version:d.version+1});result={saved:true};break;
- case 'create':{const id=crypto.randomUUID();details[id]={...structuredClone(details[c]),id,title:op.title,assistant_id:op.assistant_id,actions:[],notes:[],state:'ready',version:1,analysis_mode:'local',model_profile:profiles[0]};result={id};break;}
- case 'follow_up':{const id=crypto.randomUUID();details[id]={...structuredClone(details[c]),id,title:d.title+' · 续会',parent_meeting_id:d.id,context:d.context,version:1};result={id};break;}
+ case 'create':{const id=crypto.randomUUID();details[id]={...structuredClone(preparationFixture),id,title:op.title,assistant_id:op.assistant_id,actions:[],notes:[],state:'ready',version:1,analysis_mode:'local',model_profile:profiles[0]};result={id};break;}
+ case 'follow_up':{const id=crypto.randomUUID();details[id]={...structuredClone(preparationFixture),id,title:d.title+' · 续会',parent_meeting_id:d.id,context:d.context,version:1};result={id};break;}
  case 'knowledge_reindex':result={rebuilt:true};break;
  case 'knowledge_list':result=collections.filter(k=>op.include_archived||!k.archived);break;
  case 'knowledge_get':{const k=collections.find(k=>k.id===op.set_id);result={...k,content:k.kind==='documents'?'合成项目背景，只用于隔离测试。':'',terms:k.kind==='terms'?[{id:'entity1',canonical:'王鹤',aliases:['王贺'],category:'人名'}]:[]};break;}
@@ -92,11 +98,20 @@ window.__TAURI_INTERNALS__={transformCallback:()=>1,unregisterCallback:()=>{},in
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port',type=int,default=1421)
-    parser.add_argument('--scenario',choices=['normal','voice-lifecycle','render-recovery','minutes-overlap'],default='normal')
+    parser.add_argument('--scenario',choices=['normal','voice-lifecycle','render-recovery','minutes-overlap','launch-cold','launch-active','launch-edit'],default='normal')
     args=parser.parse_args()
     dist=ROOT/'apps/desktop/dist'
     scenario = ""
-    if args.scenario == 'voice-lifecycle':
+    if args.scenario in ('launch-cold', 'launch-active'):
+        scenario = "window.syntheticLaunchRequests=[{id:'launch-fixture-1',title:'链接合成周会 A&B',meeting_type:'weekly'}];"
+        if args.scenario == 'launch-cold':
+            scenario += "details[a].state='completed';details[a].capabilities=capabilities(details[a]);"
+    elif args.scenario == 'launch-edit':
+        scenario = """
+details[a].state='completed';details[a].capabilities=capabilities(details[a]);let syntheticLaunchId=0;
+document.addEventListener('DOMContentLoaded',()=>{const b=document.createElement('button');b.textContent='发送合成新建请求';b.onclick=()=>{(window.syntheticLaunchRequests??=[]).push({id:'warm-'+(++syntheticLaunchId),title:'网页合成新会议',meeting_type:'weekly'});window.emitSyntheticEvent('launch-link',null);};document.body.prepend(b);});
+"""
+    elif args.scenario == 'voice-lifecycle':
         scenario = """
 const syntheticChat=assistantOpen(a);
 syntheticChat.turns=[

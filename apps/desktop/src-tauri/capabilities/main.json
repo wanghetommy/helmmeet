@@ -8,6 +8,7 @@
   "permissions": [
     "allow-get-system-status",
     "allow-dispatch",
+    "allow-launch-request",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

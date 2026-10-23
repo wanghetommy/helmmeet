@@ -46,12 +46,12 @@ pub fn capabilities(rt: &Runtime, d: &Value) -> Result<Value, String> {
         && d["model_profile"]["archived"] != true;
     let paused = globally_paused(rt)?;
     Ok(
-        json!({"phase":match meeting_core::product::phase(state){meeting_core::product::Phase::Preparation=>"preparation",meeting_core::product::Phase::Live=>"live",meeting_core::product::Phase::After=>"after"},"has_audio":has_audio,"has_confirmed_text":text>0,"has_minutes":d["artifacts"].as_array().is_some_and(|a|a.iter().any(|a|a["type"]=="minutes")),"has_actions":d["actions"].as_array().is_some_and(|a|!a.is_empty()),"model_ready":model,"analysis_paused":paused,"can_analyze":meeting_core::product::can_analyze(state,text,model,paused)}),
+        json!({"phase":match meeting_core::product::phase(state){meeting_core::product::Phase::Preparation=>"preparation",meeting_core::product::Phase::Live=>"live",meeting_core::product::Phase::After=>"after"},"has_audio":has_audio,"has_confirmed_text":text>0,"has_minutes":d["artifacts"].as_array().is_some_and(|a|a.iter().any(|a|a["type"]=="stage" || a["type"]=="minutes")),"has_actions":d["actions"].as_array().is_some_and(|a|!a.is_empty()),"model_ready":model,"analysis_paused":paused,"can_analyze":meeting_core::product::can_analyze(state,text,model,paused)}),
     )
 }
 pub fn preferences(rt: &Runtime) -> Result<Value, String> {
     let db = rt.db()?;
-    let mut q=db.prepare("SELECT key,value FROM app_preferences WHERE key IN ('analysis_paused','default_source_mask','default_input_device')").map_err(err)?;
+    let mut q=db.prepare("SELECT key,value FROM app_preferences WHERE key IN ('analysis_paused','default_source_mask','default_input_device','debug_mode')").map_err(err)?;
     let mut result = json!({});
     for row in q
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -67,6 +67,7 @@ pub fn set_preferences(
     paused: bool,
     source: i32,
     device: u32,
+    debug_mode: bool,
 ) -> Result<Value, String> {
     if !(1..=3).contains(&source) {
         return Err("默认音源无效".into());
@@ -84,6 +85,7 @@ pub fn set_preferences(
         ("analysis_paused", paused.to_string()),
         ("default_source_mask", source.to_string()),
         ("default_input_device", device.to_string()),
+        ("debug_mode", debug_mode.to_string()),
     ] {
         tx.execute(
             "UPDATE app_preferences SET value=? WHERE key=?",
@@ -277,8 +279,12 @@ mod tests {
             "transcript_only"
         );
         models::authorize(&rt, &mid, d["version"].as_u64().unwrap(), false, 0, None).unwrap();
-        set_preferences(&rt, true, 3, 0).unwrap();
-        set_preferences(&rt, false, 3, 0).unwrap();
+        set_preferences(&rt, true, 3, 0, false).unwrap();
+        set_preferences(&rt, false, 3, 0, false).unwrap();
+        assert_eq!(preferences(&rt).unwrap()["debug_mode"], false);
+        set_preferences(&rt, false, 3, 0, true).unwrap();
+        assert_eq!(preferences(&rt).unwrap()["debug_mode"], true);
+        set_preferences(&rt, false, 3, 0, false).unwrap();
         assert_eq!(rt.detail(&mid).unwrap()["analysis_mode"], "transcript_only");
         let next = meeting(&rt);
         {
@@ -293,13 +299,42 @@ mod tests {
             false
         );
         assert!(analysis::submit(rt.clone(), &next, "stage", "", "all").is_err());
-        set_preferences(&rt, true, 3, 0).unwrap();
+        set_preferences(&rt, true, 3, 0, false).unwrap();
         assert_eq!(rt.detail(&next).unwrap()["analysis_mode"], "local");
         assert_eq!(
             rt.detail(&next).unwrap()["capabilities"]["analysis_paused"],
             true
         );
         assert!(analysis::submit(rt.clone(), &next, "stage", "", "all").is_err());
+        drop(rt);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn deleting_a_prepared_meeting_removes_only_that_draft_and_cannot_start_it() {
+        let (root, rt) = setup();
+        let draft = meeting(&rt);
+        let other = meeting(&rt);
+        preparation(
+            &rt,
+            &draft,
+            1,
+            "待删除准备",
+            "weekly",
+            1,
+            json!({"goal":"合成目标"}),
+        )
+        .unwrap();
+        crate::commands::run(
+            rt.clone(),
+            crate::commands::Request::Delete {
+                meeting_id: draft.clone(),
+            },
+        )
+        .unwrap();
+        assert!(rt.detail(&draft).is_err());
+        assert_eq!(rt.detail(&other).unwrap()["state"], "ready");
+        assert!(crate::audio::start(rt.clone(), &draft, 1, 0, false).is_err());
+        assert!(rt.capture.lock().unwrap().is_none());
         drop(rt);
         std::fs::remove_dir_all(root).unwrap();
     }

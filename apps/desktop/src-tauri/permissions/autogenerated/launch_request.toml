@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-launch-request"
+description = "Enables the launch_request command without any pre-configured scope."
+commands.allow = ["launch_request"]
+
+[[permission]]
+identifier = "deny-launch-request"
+description = "Denies the launch_request command without any pre-configured scope."
+commands.deny = ["launch_request"]

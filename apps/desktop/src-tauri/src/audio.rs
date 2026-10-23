@@ -224,6 +224,9 @@ fn write_header(file: &mut File, samples: u32) -> Result<(), String> {
 }
 pub fn read_wav(path: &Path) -> Result<Vec<f32>, String> {
     let raw = std::fs::read(path).map_err(err)?;
+    read_wav_bytes(&raw)
+}
+pub fn read_wav_bytes(raw: &[u8]) -> Result<Vec<f32>, String> {
     if raw.len() < 12 || &raw[0..4] != b"RIFF" || &raw[8..12] != b"WAVE" {
         return Err("无效 WAV 文件".into());
     }
@@ -633,6 +636,9 @@ impl Writer {
         for track in tracks.values_mut() {
             track.host_origin = Some(origin);
         }
+        let activity_epoch = owner.db().ok().and_then(|db|db.query_row(
+            "SELECT id FROM recording_epochs WHERE meeting_id=? AND wall_end IS NULL ORDER BY rowid DESC LIMIT 1",
+            [&mid],|r|r.get::<_,String>(0)).ok()).unwrap_or_default();
         let mut route_tracker = (|| {
             let db = owner.db().ok()?;
             let enabled: bool = db
@@ -767,6 +773,15 @@ impl Writer {
                         let target = frame.host.saturating_sub(origin) / 62500;
                         match track.frame(&owner, &mid, base, target, &frame.samples) {
                             Ok(correction) => {
+                                crate::activity::feed(
+                                    &owner,
+                                    &mid,
+                                    &activity_epoch,
+                                    frame.source,
+                                    frame.host,
+                                    base + target / 16,
+                                    &frame.samples,
+                                );
                                 if frame.source == 0 {
                                     crate::voice::feed(&owner, &mid, frame.host, &frame.samples);
                                 }

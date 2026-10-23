@@ -31,6 +31,8 @@ pub enum Request {
         source: String,
         utterance_id: Option<String>,
         scope: Option<String>,
+        #[serde(default)]
+        review: bool,
     },
     AssistantCancel {
         turn_id: String,
@@ -49,11 +51,28 @@ pub enum Request {
     SaveAssistantSettings {
         settings: Value,
     },
+    SetCalibration {
+        meeting_id: String,
+        expected_version: u64,
+        enabled: bool,
+        #[serde(default = "default_calibration_mode")]
+        mode: String,
+    },
+    RunCalibration {
+        meeting_id: String,
+        expected_version: u64,
+    },
+    ConfirmCalibration {
+        meeting_id: String,
+        paragraph_id: String,
+        expected_version: u64,
+    },
     ProductPreferences,
     SaveProductPreferences {
         analysis_paused: bool,
         default_source_mask: i32,
         default_input_device: u32,
+        debug_mode: bool,
     },
     SavePreparation {
         meeting_id: String,
@@ -151,6 +170,7 @@ pub enum Request {
     ClearConversation {
         meeting_id: String,
     },
+    PrepareAsr,
     Record {
         meeting_id: String,
         action: String,
@@ -267,8 +287,19 @@ pub enum Request {
         participants: String,
         terms: String,
     },
+    SaveMeetingInfo {
+        meeting_id: String,
+        expected_version: u64,
+        title: String,
+        assistant_id: String,
+        goal: String,
+        agenda: String,
+        participants: String,
+        terms: String,
+    },
     Rename {
         meeting_id: String,
+        expected_version: u64,
         title: String,
     },
     Cancel {
@@ -307,6 +338,9 @@ fn raw_variant() -> String {
 fn text_source() -> String {
     "text".into()
 }
+fn default_calibration_mode() -> String {
+    "standard".into()
+}
 fn valid_text(text: &str, max: usize) -> Result<(), String> {
     if text.trim().is_empty() || text.len() > max {
         Err("文本为空或超过长度限制".into())
@@ -331,13 +365,15 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             source,
             utterance_id,
             scope,
-        } => crate::assistant::submit_scoped(
+            review,
+        } => crate::assistant::submit_with_review(
             rt,
             &conversation_id,
             &question,
             &source,
             utterance_id,
             scope.as_deref().unwrap_or("all"),
+            review,
         ),
         Request::AssistantCancel { turn_id } => crate::assistant::cancel(&rt, &turn_id),
         Request::AssistantClear { conversation_id } => {
@@ -350,16 +386,33 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
         Request::SaveAssistantSettings { settings } => {
             crate::assistant::save_settings(&rt, settings)
         }
+        Request::SetCalibration {
+            meeting_id,
+            expected_version,
+            enabled,
+            mode,
+        } => crate::calibration::set_enabled(&rt, &meeting_id, expected_version, enabled, &mode),
+        Request::RunCalibration {
+            meeting_id,
+            expected_version,
+        } => crate::calibration::run_now(&rt, &meeting_id, expected_version),
+        Request::ConfirmCalibration {
+            meeting_id,
+            paragraph_id,
+            expected_version,
+        } => crate::calibration::confirm(&rt, &meeting_id, &paragraph_id, expected_version),
         Request::ProductPreferences => crate::product::preferences(&rt),
         Request::SaveProductPreferences {
             analysis_paused,
             default_source_mask,
             default_input_device,
+            debug_mode,
         } => crate::product::set_preferences(
             &rt,
             analysis_paused,
             default_source_mask,
             default_input_device,
+            debug_mode,
         ),
         Request::SavePreparation {
             meeting_id,
@@ -433,6 +486,7 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             assistant_id,
         } => rt.create(&title, &assistant_id),
         Request::Detail { meeting_id } => rt.detail(&meeting_id),
+        Request::PrepareAsr => crate::asr::prepare(&rt),
         Request::Record {
             meeting_id,
             action,
@@ -491,7 +545,7 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             )
         }
         Request::SaveAsrSettings { language } => {
-            if !["zh", "en", "auto"].contains(&language.as_str()) {
+            if !["zh", "zh-Hans", "zh-Hant", "en", "auto"].contains(&language.as_str()) {
                 return Err("语言选项无效".into());
             }
             let mut cfg = rt.config.lock().map_err(|_| "配置锁异常")?;
@@ -850,15 +904,66 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             tx.commit().map_err(err)?;
             Ok(json!({"saved":true}))
         }
-        Request::Rename { meeting_id, title } => {
+        Request::SaveMeetingInfo {
+            meeting_id,
+            expected_version,
+            title,
+            assistant_id,
+            goal,
+            agenda,
+            participants,
+            terms,
+        } => {
             rt.check_id(&meeting_id)?;
-            valid_text(&title, 500)?;
-            rt.db()?
-                .execute(
-                    "UPDATE meetings SET title=?,version=version+1 WHERE id=?",
-                    params![title, meeting_id],
+            let title = title.trim();
+            valid_text(title, 500)?;
+            if goal.len() + agenda.len() + participants.len() + terms.len() > 30000 {
+                return Err("会议信息过长".into());
+            }
+            let mut db = rt.db()?;
+            let tx = db.transaction().map_err(err)?;
+            let count: u32 = tx
+                .query_row(
+                    "SELECT count(*) FROM assistant_templates WHERE id=?",
+                    [&assistant_id],
+                    |r| r.get(0),
                 )
                 .map_err(err)?;
+            if count != 1 {
+                return Err("助手不存在".into());
+            }
+            if tx
+                .execute(
+                    "UPDATE meetings SET title=?,template_source='selected',assistant_id=?,template_version=(SELECT version FROM assistant_templates WHERE id=?),context_json=?,generation=generation+1,version=version+1 WHERE id=? AND version=? AND state!='deleting'",
+                    params![title, assistant_id, assistant_id, json!({"goal":goal,"agenda":agenda,"participants":participants,"terms":terms}).to_string(), meeting_id, expected_version],
+                )
+                .map_err(err)?
+                != 1
+            {
+                return Err("会议已更新，请刷新后重试".into());
+            }
+            tx.execute(
+                "UPDATE artifacts SET status='stale' WHERE meeting_id=?",
+                [&meeting_id],
+            )
+            .map_err(err)?;
+            tx.commit().map_err(err)?;
+            Ok(json!({"saved":true}))
+        }
+        Request::Rename {
+            meeting_id,
+            expected_version,
+            title,
+        } => {
+            rt.check_id(&meeting_id)?;
+            let title = title.trim();
+            valid_text(title, 500)?;
+            if rt.db()?.execute(
+                "UPDATE meetings SET title=?,version=version+1 WHERE id=? AND version=? AND state!='deleting'",
+                params![title, meeting_id, expected_version],
+            ).map_err(err)? != 1 {
+                return Err("会议已更新，请刷新后重试".into());
+            }
             Ok(json!({"saved":true}))
         }
         Request::Cancel { meeting_id } => {
@@ -885,7 +990,6 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             if capture.as_ref().is_some_and(|s| s.meeting == meeting_id) {
                 return Err("请先结束录制再删除".into());
             }
-            drop(capture);
             let mut db = rt.db()?;
             let tx = db.transaction().map_err(err)?;
             tx.execute(
@@ -900,6 +1004,7 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             .map_err(err)?;
             tx.commit().map_err(err)?;
             drop(db);
+            drop(capture);
             cleanup(&rt)?;
             Ok(json!({"deleted":true}))
         }

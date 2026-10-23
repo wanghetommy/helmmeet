@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { call, desktop, meetingPhase, type Action, type Artifact, type Detail, type KnowledgeSet, type Meeting, type ModelDirectory, type ProductPreferences, type Segment, type Settings, type Template } from './bridge';
+import { call, desktop, meetingPhase, type Action, type Artifact, type Detail, type KnowledgeSet, type Meeting, type ModelDirectory, type NewMeetingLaunch, type ProductPreferences, type Segment, type Settings, type Template } from './bridge';
+import { useLaunchRequests } from './useLaunchRequests';
 import { PcmPlayback, type PcmChunk } from './PcmPlayback';
 import type { PreparationInput } from './MeetingPreparation';
 import type { Selection } from './KnowledgeLibrary';
@@ -11,9 +12,11 @@ export function useMeetingController() {
   const [settings, setSettings] = useState<Settings>(); const [templates, setTemplates] = useState<Template[]>([]); const [directory, setDirectory] = useState<ModelDirectory>({ profiles: [], default_profile_id: null }); const [sets, setSets] = useState<KnowledgeSet[]>([]);
   const [devices, setDevices] = useState<{ id: number; name: string }[]>([]); const [inputDevice, setInputDevice] = useState(0); const [source, setSource] = useState(1); const [language, setLanguage] = useState('zh');
   const [error, setError] = useState(''); const [notice, setNotice] = useState(''); const [busy, setBusy] = useState(false); const [recordBusy, setRecordBusy] = useState(false); const [loading, setLoading] = useState(desktop); const [modal, setModal] = useState('');
+  const [startStage, setStartStage] = useState(''); const startAttempt = useRef(0);
+  const [preparationSeed, setPreparationSeed] = useState<NewMeetingLaunch>();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false); const [recordOpen, setRecordOpen] = useState(false); const [playerOpen, setPlayerOpen] = useState(false); const [split, setSplit] = useState(55);
   const [listQuery, setListQuery] = useState(''); const [listFilter, setListFilter] = useState('all'); const [settingsSection, setSettingsSection] = useState('文本模型');
-  const [search, setSearch] = useState(''); const [question, setQuestion] = useState(''); const [scope, setScope] = useState('all'); const [note, setNote] = useState(''); const [tab, setTab] = useState('会议总结'); const [transcriptTab, setTranscriptTab] = useState('实时记录'); const [artifactId, setArtifactId] = useState(''); const [focusSegment, setFocusSegment] = useState('');
+  const [search, setSearch] = useState(''); const [question, setQuestion] = useState(''); const [scope, setScope] = useState('all'); const [note, setNote] = useState(''); const [tab, setTab] = useState('会议纪要'); const [transcriptTab, setTranscriptTab] = useState('实时记录'); const [artifactId, setArtifactId] = useState(''); const [focusSegment, setFocusSegment] = useState('');
   const [title, setTitle] = useState(''); const [editText, setEditText] = useState(''); const [editSegment, setEditSegment] = useState<Segment>(); const [editArtifact, setEditArtifact] = useState<Artifact>(); const [editAction, setEditAction] = useState<Action>(); const [proposalId, setProposalId] = useState<string>(); const [template, setTemplate] = useState<Template>();
   const [context, setContext] = useState({ goal: '', agenda: '', participants: '', terms: '', assistant_id: 'general' }); const [modelChoice, setModelChoice] = useState(''); const [bindings, setBindings] = useState<Selection[]>([]); const [historical, setHistorical] = useState<{ text: string; revision: number; start_ms: number }>();
   const [endTarget, setEndTarget] = useState<{ id: string; title: string; state: string; duration_ms: number; version: number; epoch: string }>(); const [endStale, setEndStale] = useState(false);
@@ -21,7 +24,7 @@ export function useMeetingController() {
   const [audioVariant, setAudioVariant] = useState('raw'); const [playing, setPlaying] = useState(false); const [volume, setVolume] = useState(1); const [position, setPosition] = useState(0);
   const playback = useRef<PcmPlayback | null>(null); const selectedRef = useRef(selected); selectedRef.current = selected; const modalRef = useRef(modal); modalRef.current = modal;
   const listRef = useRef(meetings); listRef.current = meetings; const drafts = useRef<Record<string, Draft>>({}); const beforeLeave = useRef<(() => Promise<void>) | null>(null); const createdDraftId = useRef<string | undefined>(undefined);
-  const defaults: ProductPreferences = settings?.product ?? { analysis_paused: false, default_source_mask: 1, default_input_device: 0 };
+  const defaults: ProductPreferences = settings?.product ?? { analysis_paused: false, default_source_mask: 1, default_input_device: 0, debug_mode: false };
   const refresh = useCallback(async () => setMeetings(await call<Meeting[]>({ kind: 'list' })), []);
   const reloadModels = useCallback(async () => setDirectory(await call<ModelDirectory>({ kind: 'model_profiles' })), []);
   const reloadSets = useCallback(async () => { if (desktop) setSets(await call<KnowledgeSet[]>({ kind: 'knowledge_list', include_archived: true })); }, []);
@@ -33,13 +36,13 @@ export function useMeetingController() {
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(''), 5000); return () => clearTimeout(timer); }, [notice]);
   useEffect(() => { if (detail) setSource(detail.source_mask); }, [detail?.id]);
   const phase = detail ? meetingPhase(detail) : selected === 'new' ? 'preparation' : undefined;
-  useEffect(() => { const d = drafts.current[selected]; setArtifactId(d?.artifactId ?? ''); setSearch(d?.search ?? ''); setQuestion(d?.question ?? ''); setScope(d?.scope === 'selection' ? 'all' : d?.scope ?? 'all'); setNote(d?.note ?? ''); setTab(d?.tab ?? '会议总结'); setTranscriptTab(d?.transcriptTab ?? '实时记录'); setFocusSegment(''); setPlayerOpen(false); setPlaying(false); setPosition(0); setAudioVariant('raw'); playback.current?.stop(false); }, [selected]);
+  useEffect(() => { const d = drafts.current[selected]; setArtifactId(d?.artifactId ?? ''); setSearch(d?.search ?? ''); setQuestion(d?.question ?? ''); setScope(d?.scope === 'selection' ? 'all' : d?.scope ?? 'all'); setNote(d?.note ?? ''); setTab(d?.tab === '会议总结' ? '会议纪要' : d?.tab ?? '会议纪要'); setTranscriptTab(d?.transcriptTab ?? '实时记录'); setFocusSegment(''); setPlayerOpen(false); setPlaying(false); setPosition(0); setAudioVariant('raw'); playback.current?.stop(false); }, [selected]);
   const previousPhase = useRef<{ id: string; phase: typeof phase }>({ id: '', phase: undefined });
   useEffect(() => { if (phase === 'live') { setSidebarCollapsed(true); setRecordOpen(true); } if (phase === 'after') { setRecordOpen(false); if (drafts.current[selected]?.phase !== 'after' || (previousPhase.current.id === selected && previousPhase.current.phase === 'live')) setTab('会议纪要'); } previousPhase.current = { id: selected, phase }; }, [selected, phase]);
   useEffect(() => { const player = new PcmPlayback((mid, start, variant, end) => call<PcmChunk>({ kind: 'playback', meeting_id: mid, start_ms: start, audio_variant: variant, end_ms: end }), value => { setPosition(value.position); setPlaying(value.playing); }, setError); playback.current = player; return () => { void player.close(); playback.current = null; }; }, []);
   const registerLeave = useCallback((save: (() => Promise<void>) | null) => { beforeLeave.current = save; }, []);
   const stash = () => { if (selected) drafts.current[selected] = { phase, question, note, scope, search, tab, transcriptTab, artifactId, scrollTop: drafts.current[selected]?.scrollTop ?? 0, follow: drafts.current[selected]?.follow ?? true }; };
-  const navigate = async (nextView: View, nextId = '') => { if (recordBusy) return; try { await beforeLeave.current?.(); stash(); setSelected(nextId); setDetail(undefined); setView(nextView); setModal(''); createdDraftId.current = undefined; if (nextId === 'new') setSource(defaults.default_source_mask); } catch { /* Saving error is already displayed; preserve the preparation page. */ } };
+  const navigate = async (nextView: View, nextId = '', seed?: NewMeetingLaunch) => { if (recordBusy) return false; try { await beforeLeave.current?.(); stash(); setSelected(nextId); setDetail(undefined); setView(nextView); setModal(''); createdDraftId.current = undefined; if (nextId === 'new') { setSource(defaults.default_source_mask); setPreparationSeed(seed); } return true; } catch { return false; /* Saving error is already displayed; preserve the preparation page. */ } };
   const select = (m: Meeting) => void navigate('meetings', m.id);
   const perform = async (work: () => Promise<unknown>) => { if (busy) return; setBusy(true); setError(''); const mid = selectedRef.current; try { await work(); await refresh(); if (mid && mid === selectedRef.current && mid !== 'new') await refreshDetail(); } catch (e) { setError(String(e)); } finally { setBusy(false); } };
   const op = (kind: string, values: Record<string, unknown> = {}) => call<unknown>({ kind, meeting_id: selected, ...values });
@@ -48,9 +51,16 @@ export function useMeetingController() {
   const requestEndRef = useRef(requestEnd); requestEndRef.current = requestEnd;
   useEffect(() => { if (!desktop) return; let stop: (() => void) | undefined; let live = true; void listen('request-end-meeting', () => { const active = listRef.current.find(m => ['recording', 'paused', 'interrupted'].includes(m.state)); if (active) void requestEndRef.current(active.id); }).then(fn => { if (live) stop = fn; else fn(); }).catch(() => {}); const keyboard = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'e') { e.preventDefault(); const active = listRef.current.find(m => ['recording', 'paused', 'interrupted'].includes(m.state)); if (active) void requestEndRef.current(active.id); } }; window.addEventListener('keydown', keyboard); return () => { live = false; stop?.(); window.removeEventListener('keydown', keyboard); }; }, []);
   const finish = async () => { if (!endTarget || recordBusy || endStale) return; setRecordBusy(true); try { const d = await call<Detail>({ kind: 'finish_meeting', meeting_id: endTarget.id, expected_version: endTarget.version, capture_epoch: endTarget.epoch }); if (selectedRef.current === d.id) setDetail(d); await refresh(); setModal(''); setNotice(`「${endTarget.title}」录制已结束，已有内容已保存`); } catch (e) { setEndStale(true); setError(String(e)); } finally { setRecordBusy(false); } };
+  const cancelPreparation = () => {
+    if (recordBusy && startStage !== 'loading') return;
+    startAttempt.current++; beforeLeave.current = null; createdDraftId.current = undefined;
+    setRecordBusy(false); setStartStage(''); setSelected(''); setDetail(undefined); setView('meetings'); setModal(''); setError('');
+  };
   const commitPreparation = async (value: PreparationInput, start: boolean) => {
-    if (recordBusy) return; setRecordBusy(true); setError(''); let mid = selected === 'new' ? createdDraftId.current : selected;
+    if (recordBusy) return; const attempt = ++startAttempt.current; setRecordBusy(true); setError(''); let mid = selected === 'new' ? createdDraftId.current : selected;
     try {
+      if (start) { setStartStage('loading'); await call({ kind: 'prepare_asr' }); if (attempt !== startAttempt.current) return; }
+      setStartStage('saving');
       if (!mid) { mid = (await call<{ id: string }>({ kind: 'create', title: value.title, assistant_id: value.assistant_id })).id; createdDraftId.current = mid; }
       let d = await call<Detail>({ kind: 'detail', meeting_id: mid });
       await call({ kind: 'save_preparation', meeting_id: mid, expected_version: d.version, title: value.title, assistant_id: value.assistant_id, source_mask: value.source_mask, context: value.context });
@@ -61,17 +71,28 @@ export function useMeetingController() {
       const before = (d.knowledge ?? []).map(k => ({ set_id: k.set_id, version: k.version })).sort((a, b) => a.set_id.localeCompare(b.set_id)); const after = [...value.bindings].sort((a, b) => a.set_id.localeCompare(b.set_id));
       if (JSON.stringify(before) !== JSON.stringify(after)) { await call({ kind: 'bind_knowledge', meeting_id: mid, expected_version: d.version, bindings: value.bindings }); d = await call<Detail>({ kind: 'detail', meeting_id: mid }); }
       if (value.enhancement_mode !== d.enhancement.mode || value.echo_cancellation !== d.enhancement.echo_cancellation) await call({ kind: 'set_audio_enhancement', meeting_id: mid, mode: value.enhancement_mode, echo_cancellation: value.echo_cancellation });
-      if (value.auto_summary !== d.schedule.enabled) await call({ kind: 'set_summary_schedule', meeting_id: mid, expected_version: d.schedule.version, enabled: value.auto_summary, mode: 'realtime' });
-      if (start) await call({ kind: 'record', meeting_id: mid, action: 'start', source_mask: value.source_mask, input_device: inputDevice });
+      if (value.auto_summary !== d.schedule.enabled || value.summary_mode !== d.schedule.mode) await call({ kind: 'set_summary_schedule', meeting_id: mid, expected_version: d.schedule.version, enabled: value.auto_summary, mode: value.summary_mode });
+      if (start) { setStartStage('starting'); await call({ kind: 'record', meeting_id: mid, action: 'start', source_mask: value.source_mask, input_device: inputDevice }); }
       const current = await call<Detail>({ kind: 'detail', meeting_id: mid }); beforeLeave.current = null; setSelected(mid); setDetail(current); setView('meetings'); await refresh(); setNotice(start ? '录音正在保存' : '准备信息已保存');
-    } catch (e) { setError(String(e)); if (mid) { setSelected(mid); try { setDetail(await call<Detail>({ kind: 'detail', meeting_id: mid })); } catch { /* Preserve the original error. */ } } throw e; } finally { setRecordBusy(false); }
+    } catch (e) { if (attempt !== startAttempt.current) return; setError(String(e)); if (mid) { setSelected(mid); try { setDetail(await call<Detail>({ kind: 'detail', meeting_id: mid })); } catch { /* Preserve the original error. */ } } throw e; } finally { if (attempt === startAttempt.current) { setRecordBusy(false); setStartStage(''); } }
   };
   const play = async (start: number) => { if (!detail) return; const end = audioVariant === 'enhanced' ? Math.min(detail.duration_ms, detail.enhancement.playable_through_ms) : detail.duration_ms; if (start >= end) { setError('该位置音频尚未就绪，可稍后重试或选择原声'); return; } setPlayerOpen(true); await playback.current?.play(detail.id, start, end, audioVariant); };
   const openInfo = () => { if (!detail) return; setTitle(detail.title); setContext({ goal: detail.context.goal ?? '', agenda: detail.context.agenda ?? '', participants: detail.context.participants ?? '', terms: detail.context.terms ?? '', assistant_id: detail.assistant_id }); setModal('会议信息'); };
   const configure = () => { void reloadModels().catch(e => setError(String(e))); setModelChoice(detail?.model_profile ? `${detail.model_profile.profile_id}:${detail.model_profile.config_version}` : (() => { const p = directory.profiles.find(p => p.profile_id === directory.default_profile_id && !p.archived); return p ? `${p.profile_id}:${p.config_version}` : ''; })()); setModal('分析设置'); };
   const switchModel = (enabled: boolean) => perform(async () => { const p = directory.profiles.find(p => `${p.profile_id}:${p.config_version}` === modelChoice) ?? detail?.model_profile; if (!p || !detail) throw Error('请选择可用配置'); await op('switch_meeting_model', { expected_version: detail.version, profile_id: p.profile_id, config_version: p.config_version, enabled, interval_minutes: 0 }); setModal(''); });
+  const preferences = (patch: Partial<ProductPreferences>) => perform(async () => {
+    await call({ kind: 'save_product_preferences', ...defaults, ...patch });
+    await loadSettings();
+  });
   const activeMeeting = meetings.find(m => ['recording', 'paused', 'interrupted'].includes(m.state));
+  const launch = useLaunchRequests({
+    ready: !loading,
+    canOpen: !busy && !recordBusy && !modal && !meetings.some(m => ['recording', 'paused', 'interrupted', 'finalizing'].includes(m.state)),
+    autoOpen: view === 'meetings' && !selected,
+    open: request => navigate('meetings', 'new', request),
+    fail: setError,
+  });
   const minute = detail?.artifacts.filter(a => a.type === 'minutes').find(a => a.id === artifactId) ?? detail?.artifacts.find(a => a.type === 'minutes');
-  return { view, selected, selectedRef, detail, setDetail, meetings, settings, templates, setTemplates, directory, sets, devices, inputDevice, setInputDevice, source, setSource, language, setLanguage, error, setError, notice, setNotice, busy, recordBusy, loading, modal, setModal, sidebarCollapsed, setSidebarCollapsed, recordOpen, setRecordOpen, playerOpen, setPlayerOpen, split, setSplit, listQuery, setListQuery, listFilter, setListFilter, settingsSection, setSettingsSection, search, setSearch, question, setQuestion, scope, setScope, note, setNote, tab, setTab, transcriptTab, setTranscriptTab, artifactId, setArtifactId, focusSegment, setFocusSegment, title, setTitle, editText, setEditText, editSegment, setEditSegment, editArtifact, setEditArtifact, editAction, setEditAction, proposalId, setProposalId, template, setTemplate, context, setContext, modelChoice, setModelChoice, bindings, setBindings, historical, setHistorical, endTarget, endStale, deviceDraft, setDeviceDraft, audioVariant, setAudioVariant, playing, setPlaying, volume, setVolume, position, setPosition, playback, drafts, defaults, phase, refresh, reloadModels, reloadSets, loadSettings, refreshDetail, registerLeave, navigate, select, perform, op, record, requestEnd, finish, commitPreparation, play, openInfo, configure, switchModel, activeMeeting, minute };
+  return { launch, preparationSeed, startStage, cancelPreparation, view, selected, selectedRef, detail, setDetail, meetings, settings, templates, setTemplates, directory, sets, devices, inputDevice, setInputDevice, source, setSource, language, setLanguage, error, setError, notice, setNotice, busy, recordBusy, loading, modal, setModal, sidebarCollapsed, setSidebarCollapsed, recordOpen, setRecordOpen, playerOpen, setPlayerOpen, split, setSplit, listQuery, setListQuery, listFilter, setListFilter, settingsSection, setSettingsSection, search, setSearch, question, setQuestion, scope, setScope, note, setNote, tab, setTab, transcriptTab, setTranscriptTab, artifactId, setArtifactId, focusSegment, setFocusSegment, title, setTitle, editText, setEditText, editSegment, setEditSegment, editArtifact, setEditArtifact, editAction, setEditAction, proposalId, setProposalId, template, setTemplate, context, setContext, modelChoice, setModelChoice, bindings, setBindings, historical, setHistorical, endTarget, endStale, deviceDraft, setDeviceDraft, audioVariant, setAudioVariant, playing, setPlaying, volume, setVolume, position, setPosition, playback, drafts, defaults, phase, refresh, reloadModels, reloadSets, loadSettings, refreshDetail, registerLeave, navigate, select, perform, op, record, requestEnd, finish, commitPreparation, play, openInfo, configure, switchModel, preferences, activeMeeting, minute };
 }
 export type MeetingController = ReturnType<typeof useMeetingController>;
