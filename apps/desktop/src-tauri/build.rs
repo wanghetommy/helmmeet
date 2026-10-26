@@ -1,4 +1,5 @@
 fn main() {
+    // Existing dispatch exposes voice status and the bounded refresh_ack action; no new Tauri command.
     let target = std::env::var("TARGET").expect("Cargo target");
     let arch = match target.as_str() {
         "aarch64-apple-darwin" => "arm64",
@@ -97,6 +98,8 @@ fn main() {
     for framework in ["AVFoundation", "ScreenCaptureKit", "CoreMedia", "CoreAudio"] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
+    // Versioned assistant/template policies, fixed-text voice previews and answer modes use typed dispatch;
+    // no new shell, filesystem or model-service capability is exposed.
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "get_system_status",

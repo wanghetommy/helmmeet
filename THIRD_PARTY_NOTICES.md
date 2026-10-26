@@ -5,6 +5,7 @@ HelmMeet source uses the repository Apache-2.0 license. Dependencies retain thei
 | Component | Purpose | Upstream / license |
 | --- | --- | --- |
 | Tauri 2 | macOS shell and IPC | https://github.com/tauri-apps/tauri · MIT OR Apache-2.0 |
+| unicode-segmentation 1.13.3 | Lossless reading boundaries at Unicode graphemes | https://github.com/unicode-rs/unicode-segmentation · MIT OR Apache-2.0 |
 | React / React DOM | UI | https://github.com/facebook/react · MIT |
 | Vite | UI build | https://github.com/vitejs/vite · MIT |
 | whisper-rs 0.16.0 / sys 0.15.0 | Rust wrappers | https://github.com/tazz4843/whisper-rs · see pinned package LICENSE |

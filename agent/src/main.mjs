@@ -82,7 +82,7 @@ function stream(model,context,options){
 }
 async function run(request){
   maxModelCalls=Math.max(1,Math.min(6,Number.isInteger(request.model_budget)?request.model_budget:6));
-  const resources={getExtensions:()=>({extensions:[],errors:[],runtime:createExtensionRuntime()}),getSkills:()=>({skills:[],diagnostics:[]}),getPrompts:()=>({prompts:[],diagnostics:[]}),getThemes:()=>({themes:[],diagnostics:[]}),getAgentsFiles:()=>({agentsFiles:[]}),getSystemPrompt:()=>buildPersona(request.assistant_name),getSystemPromptSource:()=>undefined,getAppendSystemPrompt:()=>[],getAppendSystemPromptSources:()=>[],extendResources:()=>{},reload:async()=>{}};
+  const resources={getExtensions:()=>({extensions:[],errors:[],runtime:createExtensionRuntime()}),getSkills:()=>({skills:[],diagnostics:[]}),getPrompts:()=>({prompts:[],diagnostics:[]}),getThemes:()=>({themes:[],diagnostics:[]}),getAgentsFiles:()=>({agentsFiles:[]}),getSystemPrompt:()=>buildPersona(request.assistant_name, request.behavior),getSystemPromptSource:()=>undefined,getAppendSystemPrompt:()=>[],getAppendSystemPromptSources:()=>[],extendResources:()=>{},reload:async()=>{}};
   const runtime=await ModelRuntime.create({credentials:{read:async()=>undefined,list:async()=>[],modify:async()=>{throw Error("凭据由宿主管理");},delete:async()=>{}},modelsPath:null,allowModelNetwork:false,refreshOnCreate:false});
   runtime.registerProvider('helmmeet',{api:'openai-completions',apiKey:'local-broker-no-secret',baseUrl:'http://127.0.0.1/disabled',streamSimple:stream,models:[{id:'bound-model',name:'用户绑定模型',input:['text'],reasoning:false,contextWindow:request.context_tokens,maxTokens:request.max_tokens,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}]});
   const tools=TOOL_DEFS.map(([name,description,properties])=>({name,label:name,description,parameters:{type:'object',properties,additionalProperties:false},execute:async(toolCallId,args,signal)=>{const result=await rpc('tool_request',{name,args,tool_call_id:toolCallId},signal);if(result.retrieval_exhausted||result.budget_exhausted)forceFinal=true;return {content:[{type:'text',text:JSON.stringify(result)}],details:{}};}}));
@@ -114,12 +114,12 @@ async function run(request){
       // final JSON object. This prevents a repair prompt from opening another
       // unbounded tool loop and repeatedly landing in the same generic error.
       forceFinal=true;
-      if(attempt===0)await session.prompt('本轮回答未通过宿主结构/引用校验：'+String(verdict.error??'格式无效')+'。现在进入最终修复回合，只输出一个JSON对象，顶层必须是blocks数组；sources只能使用本轮实际返回的完整source_id字符串，不能引用未读取或与助手播报重叠的原文。建议或无法确认的内容使用suggestion/unanswered且sources为空；不要调用工具、不要输出Markdown或解释文字。');
+      if(attempt===0)await session.prompt('本轮回答未通过宿主结构/引用校验：'+String(verdict.error??'格式无效')+'。现在进入最终修复回合，只输出一个JSON对象，顶层必须是blocks数组；sources只能使用本轮实际返回的完整source_id字符串，不能引用未读取或与助手播报重叠的原文。本轮已经发生格式/引用错误，不得新输出basis=experience来替代失败；请修复原回答，或使用reason=validation_failed的unanswered且sources为空；不能把格式/引用校验错误说成会议没有讨论或缺少上下文；不要调用工具、不要输出Markdown或解释文字。');
       else {
         // Never turn a second validation miss into a user-visible generic
         // failure. Return a safe, explicitly incomplete answer; the host can
         // persist it and the user can retry without losing the conversation.
-        send({type:'result',text:JSON.stringify({blocks:[{kind:'unanswered',text:'我暂时无法把本轮回答可靠绑定到已读取的原文依据；原文仍保留，请重试或缩小问题范围。',sources:[]}]})});
+        send({type:'result',text:JSON.stringify({blocks:[{kind:'unanswered',reason:'validation_failed',text:'这轮回答的格式或引用校验未通过，暂时无法给出可靠答复。原文仍保留，请重试。',sources:[]}]})});
         return;
       }
     }

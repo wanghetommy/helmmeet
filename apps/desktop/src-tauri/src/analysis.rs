@@ -1148,10 +1148,7 @@ fn submit_inner(
                 .as_str()
                 .unwrap_or("general")
                 .to_string();
-            let instructions = detail["template"]["instructions"]
-                .as_str()
-                .unwrap_or("整理本场讨论、决定、风险与行动，引用原文")
-                .to_string();
+            let instructions = crate::templates::minutes_instructions(&detail["template"]);
             let history = if output_kind == "answer" && context_allowed {
                 let db = rt.db()?;
                 let mut stmt=db.prepare("SELECT t.question,a.content_json FROM conversation_turns t JOIN meetings m ON m.id=t.meeting_id JOIN artifacts a ON a.id=t.artifact_id WHERE t.meeting_id=? AND t.epoch=m.chat_epoch ORDER BY t.rowid DESC LIMIT 8").map_err(err)?;

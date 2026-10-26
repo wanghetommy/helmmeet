@@ -347,7 +347,7 @@ pub fn decode(
     pcm: &[f32],
     language: &str,
 ) -> Result<Vec<(u64, u64, String)>, String> {
-    decode_with_partial(context, pcm, language, None, None, "")
+    decode_with_partial(context, pcm, language, None, None, "", None)
 }
 
 fn whisper_language(language: &str) -> Option<&'static str> {
@@ -478,6 +478,7 @@ fn decode_with_partial(
     partial: Option<Box<dyn FnMut(whisper_rs::SegmentCallbackData)>>,
     stop: Option<StopToken>,
     initial_prompt: &str,
+    question: Option<(Arc<Runtime>, u64)>,
 ) -> Result<Vec<(u64, u64, String)>, String> {
     if stop.as_ref().is_some_and(StopToken::is_stopped) {
         return Err("转写已取消，原音频保留待下次处理".into());
@@ -488,20 +489,27 @@ fn decode_with_partial(
     }
     let mut state = context.create_state().map_err(|_| "无法创建推理状态")?;
     let mut p = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    if let Some(token) = stop.as_ref() {
-        unsafe extern "C" fn abort(data: *mut std::ffi::c_void) -> bool {
-            // The borrowed token stays alive and unmoved through state.full().
-            // Native inference invokes this only synchronously within full().
-            unsafe { (&*data.cast::<StopToken>()).is_stopped() }
+    struct Abort {
+        stop: Option<StopToken>,
+        question: Option<(Arc<Runtime>, u64)>,
+    }
+    impl Abort {
+        fn cancelled(&self) -> bool {
+            self.stop.as_ref().is_some_and(StopToken::is_stopped)
+                || self
+                    .question
+                    .as_ref()
+                    .is_some_and(|(rt, epoch)| !crate::voice::request_is_current(rt, *epoch))
         }
-        unsafe {
-            p.set_abort_callback(Some(abort));
-            p.set_abort_callback_user_data(
-                (token as *const StopToken)
-                    .cast_mut()
-                    .cast::<std::ffi::c_void>(),
-            );
-        }
+    }
+    let abort = Abort { stop, question };
+    unsafe extern "C" fn should_abort(data: *mut std::ffi::c_void) -> bool {
+        // `abort` is immovable and alive until synchronous state.full returns.
+        unsafe { (&*data.cast::<Abort>()).cancelled() }
+    }
+    unsafe {
+        p.set_abort_callback(Some(should_abort));
+        p.set_abort_callback_user_data((&abort as *const Abort).cast_mut().cast());
     }
     p.set_segment_callback_safe_lossy::<_, Box<dyn FnMut(whisper_rs::SegmentCallbackData)>>(
         partial,
@@ -640,6 +648,7 @@ pub fn spawn(rt: Arc<Runtime>) -> Worker {
                     None,
                     Some(stop.clone()),
                     &voice_prompt,
+                    Some((rt.clone(), question.request_epoch)),
                 );
                 match result {
                     Ok(parts) if !stop.is_stopped() => crate::voice::recognized(
@@ -689,6 +698,7 @@ pub fn spawn(rt: Arc<Runtime>) -> Worker {
                     Some(callback),
                     Some(stop.clone()),
                     lexicon["prompt"].as_str().unwrap_or(""),
+                    None,
                 )
             });
             // Cancellation cannot acknowledge coverage or commit partial text.

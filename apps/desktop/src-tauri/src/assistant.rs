@@ -61,7 +61,10 @@ pub fn settings(rt: &Runtime) -> Result<Value, String> {
             |r| r.get(0),
         )
         .map_err(err)?;
-    serde_json::from_str(&raw).map_err(err)
+    let mut value: Value = serde_json::from_str(&raw).map_err(err)?;
+    value["tts"] = crate::tts::settings(rt)?;
+    value["behavior"] = crate::assistant_policy::current(rt)?;
+    Ok(value)
 }
 pub fn save_settings(rt: &Runtime, v: Value) -> Result<Value, String> {
     let word = v["wake_word"].as_str().ok_or("请输入唤醒词")?.trim();
@@ -88,8 +91,34 @@ pub fn save_settings(rt: &Runtime, v: Value) -> Result<Value, String> {
         )?;
     }
     let value = json!({"voice_enabled":v["voice_enabled"].as_bool().ok_or("语音开关无效")?,"wake_word":word,"silence_ms":silence,"speak_answers":v["speak_answers"].as_bool().ok_or("播报开关无效")?,"collections":collections});
+    let tts = if v["tts"].is_object() {
+        Some(crate::tts::validate_settings(rt, &v["tts"])?)
+    } else {
+        None
+    };
     let mut db = rt.db()?;
     let tx = db.transaction().map_err(err)?;
+    let tts_changed = if let Some(tts) = tts {
+        let old: String = tx
+            .query_row(
+                "SELECT value FROM app_preferences WHERE key='tts_settings'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        let changed = serde_json::from_str::<Value>(&old).map_err(err)? != tts;
+        tx.execute(
+            "UPDATE app_preferences SET value=? WHERE key='tts_settings'",
+            [tts.to_string()],
+        )
+        .map_err(err)?;
+        changed
+    } else {
+        false
+    };
+    if v["behavior"].is_object() {
+        crate::assistant_policy::save(&tx, &v["behavior"])?;
+    }
     let old: String = tx
         .query_row(
             "SELECT value FROM app_preferences WHERE key='assistant_settings'",
@@ -108,8 +137,21 @@ pub fn save_settings(rt: &Runtime, v: Value) -> Result<Value, String> {
     }
     tx.commit().map_err(err)?;
     drop(db);
-    crate::voice::invalidate(rt);
-    Ok(value)
+    if tts_changed {
+        rt.voice.ack.invalidate();
+    }
+    if old["voice_enabled"] != value["voice_enabled"]
+        || old["wake_word"] != value["wake_word"]
+        || old["silence_ms"] != value["silence_ms"]
+        || old["speak_answers"] != value["speak_answers"]
+        || tts_changed
+    {
+        crate::voice::invalidate(rt);
+    }
+    let mut result = value;
+    result["tts"] = crate::tts::settings(rt)?;
+    result["behavior"] = crate::assistant_policy::current(rt)?;
+    Ok(result)
 }
 pub fn open(rt: &Runtime, meeting: Option<String>, general: bool) -> Result<Value, String> {
     let meeting = if general {
@@ -168,12 +210,15 @@ pub fn detail(rt: &Runtime, cid: &str) -> Result<Value, String> {
     valid_uuid(cid)?;
     let db = rt.db()?;
     let (mid,title,epoch):(Option<String>,String,u64)=db.query_row("SELECT c.meeting_id,coalesce(m.title,c.title),c.epoch FROM assistant_conversations c LEFT JOIN meetings m ON m.id=c.meeting_id WHERE c.id=?",[cid],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(err)?;
-    let mut q=db.prepare("SELECT t.id,t.question,t.source,t.state,t.response_json,t.error,t.created_at,t.model_json,a.content_json,p.completed,p.total,p.model_calls,p.estimated_calls,p.through_ms,p.phase FROM assistant_turns t LEFT JOIN conversation_turns old ON old.job_id=t.legacy_job_id LEFT JOIN artifacts a ON a.id=old.artifact_id LEFT JOIN assistant_review_progress p ON p.turn_id=t.id WHERE t.conversation_id=? AND t.epoch=? ORDER BY t.rowid DESC LIMIT 120").map_err(err)?;
+    let mut q=db.prepare("SELECT t.id,t.question,t.source,t.state,t.response_json,t.error,t.created_at,t.model_json,a.content_json,p.completed,p.total,p.model_calls,p.estimated_calls,p.through_ms,p.phase,t.speech_interrupted,t.snapshot_json FROM assistant_turns t LEFT JOIN conversation_turns old ON old.job_id=t.legacy_job_id LEFT JOIN artifacts a ON a.id=old.artifact_id LEFT JOIN assistant_review_progress p ON p.turn_id=t.id WHERE t.conversation_id=? AND t.epoch=? ORDER BY t.rowid DESC LIMIT 120").map_err(err)?;
     let mut turns=q.query_map(params![cid,epoch],|r|{
         let response:Option<String>=r.get(4)?;let legacy:Option<String>=r.get(8)?;
         let result=response.and_then(|s|serde_json::from_str::<Value>(&s).ok()).or_else(||legacy.and_then(|s|serde_json::from_str::<Value>(&s).ok()).map(|v|json!({"legacy":true,"blocks":v["summary"].as_array().into_iter().flatten().map(|s|json!({"kind":"legacy","text":s["text"],"sources":s["evidence"]})).collect::<Vec<_>>(),"evidence":[]})));
         let model:Option<String>=r.get(7)?;let model=model.and_then(|s|serde_json::from_str::<Value>(&s).ok());
-        Ok(json!({"id":r.get::<_,String>(0)?,"question":r.get::<_,String>(1)?,"source":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"answer":result,"error":r.get::<_,Option<String>>(5)?,"created_at":r.get::<_,String>(6)?,"model_name":model.as_ref().map(|m|&m["display_name"]),"review":if let Some(done)=r.get::<_,Option<u64>>(9)? {json!({"completed":done,"total":r.get::<_,u64>(10)?,"model_calls":r.get::<_,u64>(11)?,"estimated_calls":r.get::<_,u64>(12)?,"through_ms":r.get::<_,u64>(13)?,"phase":r.get::<_,String>(14)?})} else {Value::Null}}))
+        let frozen:Value=r.get::<_,Option<String>>(16)?.and_then(|s|serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
+        let mut policy=frozen["context"]["behavior"].clone();
+        if let Some(mode)=result.as_ref().and_then(|v|v["mode"].as_str()) {if let Some((label,_))=meeting_core::dialogue::answer_mode(mode){policy["actual_mode"]=json!(mode);policy["mode_label"]=json!(label);}}
+        Ok(json!({"policy":policy,"id":r.get::<_,String>(0)?,"question":r.get::<_,String>(1)?,"source":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"speech_interrupted":r.get::<_,bool>(15)?,"answer":result,"error":r.get::<_,Option<String>>(5)?,"created_at":r.get::<_,String>(6)?,"model_name":model.as_ref().map(|m|&m["display_name"]),"review":if let Some(done)=r.get::<_,Option<u64>>(9)? {json!({"completed":done,"total":r.get::<_,u64>(10)?,"model_calls":r.get::<_,u64>(11)?,"estimated_calls":r.get::<_,u64>(12)?,"through_ms":r.get::<_,u64>(13)?,"phase":r.get::<_,String>(14)?})} else {Value::Null}}))
     }).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
     turns.reverse();
     if let Some(mid) = mid.as_deref() {
@@ -212,7 +257,32 @@ pub fn detail(rt: &Runtime, cid: &str) -> Result<Value, String> {
 
     let mut q=db.prepare("SELECT p.id,p.turn_id,p.payload_json,p.state,p.result_json FROM assistant_proposals p JOIN assistant_turns t ON t.id=p.turn_id WHERE t.conversation_id=? AND t.epoch=? ORDER BY p.rowid").map_err(err)?;
     let proposals=q.query_map(params![cid,epoch],|r|Ok(json!({"id":r.get::<_,String>(0)?,"turn_id":r.get::<_,String>(1)?,"payload":serde_json::from_str::<Value>(&r.get::<_,String>(2)?).unwrap_or(Value::Null),"state":r.get::<_,String>(3)?,"result":r.get::<_,Option<String>>(4)?.and_then(|s|serde_json::from_str::<Value>(&s).ok())}))).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
-    Ok(json!({"id":cid,"meeting_id":mid,"title":title,"turns":turns,"proposals":proposals}))
+    let mut template = if let Some(mid) = mid.as_deref() {
+        crate::templates::bound(&db, mid)?
+    } else {
+        Value::Null
+    };
+    if let Some(key) = template["id"].as_str() {
+        let latest: u64 = db
+            .query_row(
+                "SELECT version FROM assistant_templates WHERE id=?",
+                [key],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        template["latest_version"] = json!(latest);
+    }
+    let meeting_version = if let Some(mid) = mid.as_deref() {
+        db.query_row("SELECT version FROM meetings WHERE id=?", [mid], |r| {
+            r.get::<_, u64>(0)
+        })
+        .map_err(err)?
+    } else {
+        0
+    };
+    Ok(
+        json!({"id":cid,"meeting_id":mid,"title":title,"turns":turns,"proposals":proposals,"template":template,"meeting_version":meeting_version}),
+    )
 }
 pub fn clear(rt: &Runtime, cid: &str) -> Result<Value, String> {
     valid_uuid(cid)?;
@@ -486,6 +556,7 @@ fn snapshot(rt: &Runtime, mid: Option<&str>, scope: &str) -> Result<Value, Strin
     }
     Ok(json!({"context":context,"evidence":evidence}))
 }
+#[cfg(test)]
 pub fn submit(
     rt: Arc<Runtime>,
     cid: &str,
@@ -495,6 +566,7 @@ pub fn submit(
 ) -> Result<Value, String> {
     submit_scoped(rt, cid, question, source, utterance, "all")
 }
+#[cfg(test)]
 pub fn submit_scoped(
     rt: Arc<Runtime>,
     cid: &str,
@@ -505,6 +577,7 @@ pub fn submit_scoped(
 ) -> Result<Value, String> {
     submit_with_review(rt, cid, question, source, utterance, scope, false)
 }
+#[cfg(test)]
 pub fn submit_with_review(
     rt: Arc<Runtime>,
     cid: &str,
@@ -514,6 +587,29 @@ pub fn submit_with_review(
     scope: &str,
     review_requested: bool,
 ) -> Result<Value, String> {
+    submit_with_mode(
+        rt,
+        cid,
+        question,
+        source,
+        utterance,
+        scope,
+        review_requested,
+        "auto",
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub fn submit_with_mode(
+    rt: Arc<Runtime>,
+    cid: &str,
+    question: &str,
+    source: &str,
+    utterance: Option<String>,
+    scope: &str,
+    review_requested: bool,
+    mode: &str,
+) -> Result<Value, String> {
+    meeting_core::dialogue::answer_mode(mode).ok_or("问答方式无效")?;
     rt.ensure_running()?;
     valid_uuid(cid)?;
     if !matches!(scope, "all" | "recent")
@@ -559,6 +655,8 @@ pub fn submit_with_review(
     let config = configuration(&rt, mid.as_deref())?;
     let mut snapshot = snapshot(&rt, mid.as_deref(), scope)?;
     snapshot["context"]["conversation_id"] = json!(cid);
+    snapshot["context"]["behavior"] =
+        crate::assistant_policy::freeze_with_mode(&rt, &snapshot["context"], mode)?;
     if review_requested && (mid.is_none() || scope != "all") {
         return Err("整场审阅需要选择本场全部原文".into());
     }
@@ -971,7 +1069,20 @@ fn run_pi_once(
         .stderr(Stdio::null());
     let mut child = Process(command.spawn().map_err(|_| "小舵隔离运行时无法启动")?);
     let mut input = child.0.stdin.take().ok_or("Agent输入不可用")?;
-    writeln!(input,"{}",json!({"type":"start","assistant_name":settings(rt)?["wake_word"],"question":question,"scope":snapshot["context"],"history":history,"context_tokens":config.context_tokens,"max_tokens":config.max_output_tokens,"checkpoint":checkpoint,"compact_only":compact_only,"model_budget":remaining_models(turn)})).map_err(|_|"Agent启动消息失败")?;
+    // Expression policy belongs in the system prompt once, not repeated in
+    // scope, context_pack and get_context where it would displace evidence.
+    let mut scope = snapshot["context"].clone();
+    if let Some(context) = scope.as_object_mut() {
+        context.remove("behavior");
+    }
+    let assistant_name = match snapshot["context"]["behavior"]["assistant_name"].as_str() {
+        Some(name) => name.to_owned(),
+        None => settings(rt)?["wake_word"]
+            .as_str()
+            .unwrap_or("小舵同学")
+            .to_owned(),
+    };
+    writeln!(input,"{}",json!({"type":"start","assistant_name":assistant_name,"behavior":snapshot["context"]["behavior"],"question":question,"scope":scope,"history":history,"context_tokens":config.context_tokens,"max_tokens":config.max_output_tokens,"checkpoint":checkpoint,"compact_only":compact_only,"model_budget":remaining_models(turn)})).map_err(|_|"Agent启动消息失败")?;
     let stdout = child.0.stdout.take().ok_or("Agent输出不可用")?;
     let (tx, rx) = mpsc::sync_channel(4);
     let reader = std::thread::spawn(move || {
@@ -994,6 +1105,7 @@ fn run_pi_once(
     let mut models = 0;
     let mut seen = HashMap::new();
     let mut prepared: Option<Value> = None;
+    let mut validation_failed = false;
     let mut tool_cache = std::collections::HashSet::new();
     let mut no_growth = 0;
     let model_limit = remaining_models(turn);
@@ -1191,14 +1303,30 @@ fn run_pi_once(
                 );
             }
             Some("result") if !compact_only => {
-                let mut answer =
-                    validate_answer(m["text"].as_str().ok_or("Agent没有回答正文")?, &seen)?;
+                let mut answer = validate_answer_scoped(
+                    m["text"].as_str().ok_or("Agent没有回答正文")?,
+                    &seen,
+                    meeting_core::answer_policy::AdviceScope {
+                        validation_failed,
+                        ..advice_scope(snapshot, prepared.as_ref(), question)
+                    },
+                )?;
                 answer["coverage"] = json!({"scope":snapshot["context"]["scope"],"through_ms":snapshot["context"]["asr_through_ms"],"transcript_returned":seen.values().filter(|e|e["kind"]=="meeting" && e["partial"]!=true).count(),"transcript_excerpts":seen.values().filter(|e|e["kind"]=="meeting" && e["partial"]==true).count(),"basis":prepared.as_ref().map(|p|p["basis"].clone()),"memory_processed":snapshot["context"]["meeting_memory"]["processed_segments"],"memory_total":snapshot["context"]["meeting_memory"]["segments_total"],"memory_pending":snapshot["context"]["meeting_memory"]["pending_segments"],"chat_history_rows":prepared.as_ref().map(|p|p["chat_history"]["rows"].as_array().map_or(0,Vec::len)),"chat_summary_pending":prepared.as_ref().map(|p|p["chat_history"]["pending_turns"].clone()),"asr_missing_ranges":snapshot["context"]["asr_missing_ranges"],"recording_through_ms":snapshot["context"]["recording_through_ms"],"playback_overlap_segments":snapshot["evidence"].as_array().into_iter().flatten().filter(|e|e["assistant_playback_overlap"]==true).count(),"transcript_total":snapshot["evidence"].as_array().into_iter().flatten().filter(|e|e["kind"]=="meeting").count()});
                 return Ok(answer);
             }
-            Some("validate") => match validate_answer(m["text"].as_str().unwrap_or(""), &seen) {
+            Some("validate") => match validate_answer_scoped(
+                m["text"].as_str().unwrap_or(""),
+                &seen,
+                meeting_core::answer_policy::AdviceScope {
+                    validation_failed,
+                    ..advice_scope(snapshot, prepared.as_ref(), question)
+                },
+            ) {
                 Ok(_) => json!({"ok":true}),
-                Err(e) => json!({"ok":false,"error":e}),
+                Err(e) => {
+                    validation_failed = true;
+                    json!({"ok":false,"error":e})
+                }
             },
             Some("failure") => {
                 let reason = m["error"]
@@ -1319,6 +1447,13 @@ fn evidence_page(rows: &[Value], offset: usize, char_offset: usize, limit: usize
 }
 fn bounded_context(context: &Value, limit: usize) -> Value {
     let mut result = context.clone();
+    if let Some(context) = result.as_object_mut() {
+        context.remove("behavior");
+        if let Some(template) = context.get_mut("template").and_then(Value::as_object_mut) {
+            template.remove("policy");
+            template.remove("instructions");
+        }
+    }
     // Keep the most recent user records and meeting memory facts. Omitted records
     // remain searchable; permission/scope/watermarks are never summarized away.
     for pointer in [
@@ -1551,7 +1686,48 @@ fn normalize_reference(value: &Value, seen: &HashMap<String, Value>) -> Result<S
     canonical_reference(raw, seen)
 }
 
+fn advice_scope(
+    snapshot: &Value,
+    pack: Option<&Value>,
+    question: &str,
+) -> meeting_core::answer_policy::AdviceScope {
+    let context = &snapshot["context"];
+    let complete = pack.is_some_and(|p| {
+        p["coverage"]["full_transcript"] == true
+            && p["coverage"]["partial"] == false
+            && p["chat_history"]["partial"] == false
+            && p["chat_history"]["pending_turns"].as_u64() == Some(0)
+    }) && context["scope"] == "all"
+        && context["asr_missing_ranges"].as_u64() == Some(0)
+        && context["asr_through_ms"]
+            .as_u64()
+            .zip(context["recording_through_ms"].as_u64())
+            .is_some_and(|(asr, recording)| asr >= recording)
+        && !snapshot["evidence"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| e["assistant_playback_overlap"] == true);
+    meeting_core::answer_policy::AdviceScope {
+        meeting: context["kind"] == "meeting",
+        complete,
+        meeting_only: meeting_core::answer_policy::meeting_only(question),
+        validation_failed: false,
+    }
+}
+#[cfg(test)]
 pub fn validate_answer(text: &str, seen: &HashMap<String, Value>) -> Result<Value, String> {
+    validate_answer_scoped(
+        text,
+        seen,
+        meeting_core::answer_policy::AdviceScope::default(),
+    )
+}
+fn validate_answer_scoped(
+    text: &str,
+    seen: &HashMap<String, Value>,
+    scope: meeting_core::answer_policy::AdviceScope,
+) -> Result<Value, String> {
     let mut value = unwrap_answer(analysis::parse(text)?);
     let mut blocks = value["blocks"]
         .as_array()
@@ -1562,6 +1738,13 @@ pub fn validate_answer(text: &str, seen: &HashMap<String, Value>) -> Result<Valu
         return Err("小舵回答条目无效：blocks数量必须为1到16条".into());
     }
     let mut used = HashMap::new();
+    let mixed = blocks.iter().any(|b| {
+        matches!(
+            b["kind"].as_str(),
+            Some("meeting_fact" | "knowledge" | "user_record")
+        )
+    });
+    let mut experience_started = false;
     for b in &mut blocks {
         let kind = b["kind"]
             .as_str()
@@ -1580,6 +1763,56 @@ pub fn validate_answer(text: &str, seen: &HashMap<String, Value>) -> Result<Valu
             b["sources"] = b["evidence"].clone();
         }
         let refs = b["sources"].as_array().cloned().unwrap_or_default();
+        if let Some(basis) = b.get("basis") {
+            if basis != "experience" || kind != "suggestion" || !refs.is_empty() {
+                return Err("经验建议必须使用kind=suggestion、basis=experience及空sources；有依据的事实请另列条目".into());
+            }
+            if scope.validation_failed {
+                return Err("本轮已发生格式或引用校验错误，不能改用经验建议掩盖；请修复原回答或明确返回validation_failed".into());
+            }
+            if scope.meeting_only {
+                *b = json!({"kind":"unanswered","text":"目前我还没找到足以回答这个问题的会议依据；你要求只依据会议，我先不补充经验判断。","sources":[],"reason":"insufficient_evidence"});
+                continue;
+            }
+            if !experience_started {
+                b["text"] = json!(scope.introduce(b["text"].as_str().unwrap(), mixed));
+                experience_started = true;
+            }
+            if b["text"].as_str().unwrap().len() > 9000 {
+                return Err("经验建议含来源说明后超过正文长度限制".into());
+            }
+        }
+        if let Some(reason) = b.get("reason") {
+            if kind != "unanswered"
+                || !matches!(
+                    reason.as_str(),
+                    Some("insufficient_evidence" | "validation_failed")
+                )
+                || !refs.is_empty()
+            {
+                return Err("未回答原因无效或携带了不适用的引用".into());
+            }
+        }
+        if scope.validation_failed && kind == "unanswered" {
+            *b = json!({"kind":"unanswered","reason":"validation_failed","text":"这轮回答的格式或引用校验未通过，暂时无法给出可靠答复。原文仍保留，请重试。","sources":[]});
+            continue;
+        }
+        if scope.validation_failed
+            && kind == "suggestion"
+            && !refs.iter().any(|reference| {
+                normalize_reference(reference, seen)
+                    .ok()
+                    .and_then(|key| seen.get(&key))
+                    .is_some_and(|e| {
+                        matches!(e["kind"].as_str(), Some("meeting" | "knowledge" | "record"))
+                    })
+            })
+        {
+            return Err(
+                "格式或引用修复不能转成无依据的通用建议；请修复引用或明确返回validation_failed"
+                    .into(),
+            );
+        }
         if refs.len() > 20
             || (matches!(kind.as_str(), "meeting_fact" | "knowledge" | "user_record")
                 && refs.is_empty())
@@ -1606,13 +1839,26 @@ pub fn validate_answer(text: &str, seen: &HashMap<String, Value>) -> Result<Valu
                 ));
             }
             normalized.push(Value::String(key.clone()));
-            used.insert(key, e);
+        }
+        if scope.meeting_only
+            && kind == "suggestion"
+            && !normalized.iter().any(|key| {
+                seen.get(key.as_str().unwrap())
+                    .is_some_and(|e| e["kind"] == "meeting")
+            })
+        {
+            *b = json!({"kind":"unanswered","reason":"insufficient_evidence","text":"目前我还没找到足以支持这条建议的会议依据；你要求只依据会议，我先不补充经验判断。","sources":[]});
+            continue;
+        }
+        for key in &normalized {
+            let key = key.as_str().unwrap();
+            used.insert(key.to_owned(), &seen[key]);
         }
         b["sources"] = Value::Array(normalized);
     }
     value["blocks"] = Value::Array(blocks.clone());
     Ok(
-        json!({"blocks":blocks,"evidence":used.values().collect::<Vec<_>>(),"engine":"pi-coding-agent/1.3.0"}),
+        json!({"blocks":blocks,"evidence":used.values().collect::<Vec<_>>(),"engine":"pi-coding-agent/1.3.0","mode":value["mode"].as_str().filter(|m|meeting_core::dialogue::answer_mode(m).is_some())}),
     )
 }
 
@@ -1776,6 +2022,205 @@ mod tests {
             assert!(Instant::now() < until, "turn timeout");
             std::thread::sleep(Duration::from_millis(30));
         }
+    }
+    #[test]
+    fn experience_advice_is_marked_once_and_never_relabels_bad_facts_or_validation_errors() {
+        use meeting_core::answer_policy::AdviceScope;
+        let partial = AdviceScope {
+            meeting: true,
+            complete: false,
+            meeting_only: false,
+            validation_failed: false,
+        };
+        let mut seen = HashMap::new();
+        seen.insert(
+            "meeting:synthetic:1".into(),
+            json!({"source_id":"meeting:synthetic:1","kind":"meeting","text":"本场预算已确定"}),
+        );
+        let advice = json!({"blocks":[{"kind":"suggestion","basis":"experience","text":"我建议先小范围测试。","sources":[]}]});
+        let answer = validate_answer_scoped(&advice.to_string(), &seen, partial).unwrap();
+        assert!(answer["blocks"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("目前我还没找到相关讨论。"));
+        assert_eq!(answer["blocks"][0]["basis"], "experience");
+        assert_eq!(answer["evidence"], json!([]));
+        assert_eq!(
+            validate_answer_scoped(&answer.to_string(), &seen, partial).unwrap(),
+            answer
+        );
+        assert!(validate_answer_scoped(
+            &advice.to_string(),
+            &seen,
+            AdviceScope {
+                validation_failed: true,
+                ..partial
+            }
+        )
+        .is_err());
+        let full = validate_answer_scoped(
+            &advice.to_string(),
+            &seen,
+            AdviceScope {
+                complete: true,
+                ..partial
+            },
+        )
+        .unwrap();
+        assert!(full["blocks"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("前面我们还没讨论这一点。"));
+        let mut mixed = advice.clone();
+        mixed["blocks"].as_array_mut().unwrap().insert(0,json!({"kind":"meeting_fact","text":"本场预算已确定。","sources":["meeting:synthetic:1"]}));
+        let mixed = validate_answer_scoped(&mixed.to_string(), &seen, partial).unwrap();
+        assert_eq!(mixed["blocks"][0]["text"], "本场预算已确定。");
+        assert!(mixed["blocks"][1]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("这部分还没找到"));
+        assert_eq!(mixed["evidence"].as_array().unwrap().len(), 1);
+        let only = validate_answer_scoped(
+            &advice.to_string(),
+            &seen,
+            AdviceScope {
+                meeting_only: true,
+                ..partial
+            },
+        )
+        .unwrap();
+        assert_eq!(only["blocks"][0]["kind"], "unanswered");
+        assert_eq!(only["blocks"][0]["reason"], "insufficient_evidence");
+        assert!(!only.to_string().contains("先小范围测试"));
+        let unmarked =
+            json!({"blocks":[{"kind":"suggestion","text":"我建议先测试。","sources":[]}]});
+        let only_unmarked = validate_answer_scoped(
+            &unmarked.to_string(),
+            &seen,
+            AdviceScope {
+                meeting_only: true,
+                ..partial
+            },
+        )
+        .unwrap();
+        assert_eq!(only_unmarked["blocks"][0]["kind"], "unanswered");
+        assert_eq!(only_unmarked["evidence"], json!([]));
+
+        let failure = json!({"blocks":[{"kind":"unanswered","reason":"validation_failed","text":"这轮回答的格式或引用校验未通过，请重试。","sources":[]}]});
+        let failure = validate_answer_scoped(&failure.to_string(), &seen, partial).unwrap();
+        assert_eq!(failure["blocks"][0]["reason"], "validation_failed");
+        assert!(!failure.to_string().contains("根据我的"));
+        for block in [
+            json!({"kind":"meeting_fact","basis":"experience","text":"虚构事实","sources":[]}),
+            json!({"kind":"suggestion","basis":"experience","text":"虚构引用","sources":["meeting:unknown:1"]}),
+            json!({"kind":"meeting_fact","text":"无依据事实","sources":[]}),
+        ] {
+            assert!(
+                validate_answer_scoped(&json!({"blocks":[block]}).to_string(), &seen, partial)
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn only_complete_unfiltered_current_scope_can_claim_no_prior_discussion() {
+        let snap = json!({"context":{"kind":"meeting","scope":"all","asr_missing_ranges":0,"asr_through_ms":2000,"recording_through_ms":2000},"evidence":[]});
+        let pack = json!({"coverage":{"full_transcript":true,"partial":false},"chat_history":{"partial":false,"pending_turns":0}});
+        assert!(advice_scope(&snap, Some(&pack), "给一点建议").complete);
+        for (field, value) in [
+            ("scope", json!("recent")),
+            ("asr_missing_ranges", json!(1)),
+            ("asr_through_ms", json!(1000)),
+        ] {
+            let mut altered = snap.clone();
+            altered["context"][field] = value;
+            assert!(!advice_scope(&altered, Some(&pack), "给一点建议").complete);
+        }
+        let mut overlap = snap.clone();
+        overlap["evidence"] = json!([{"assistant_playback_overlap":true}]);
+        assert!(!advice_scope(&overlap, Some(&pack), "给建议").complete);
+        for field in ["coverage", "chat_history"] {
+            let mut altered = pack.clone();
+            altered[field]["partial"] = json!(true);
+            assert!(!advice_scope(&snap, Some(&altered), "给建议").complete);
+        }
+        assert!(advice_scope(&snap, Some(&pack), "只依据本次会议").meeting_only);
+        assert!(!advice_scope(&snap, None, "给建议").complete);
+    }
+    #[test]
+    fn real_pi_broker_persists_experience_preface_and_blocks_it_for_meeting_only_question() {
+        let (_tmp, rt) = setup();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        profile(&rt, &format!("http://{}", listener.local_addr().unwrap()));
+        let (mid, _) = seed(&rt, "合成经验回答", "本场讨论产品名称，没有预算分配记录。");
+        let c = open(&rt, Some(mid), false).unwrap();
+        let cid = c["id"].as_str().unwrap();
+        let server = std::thread::spawn(move || {
+            for n in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = receive(&mut stream);
+                assert!(request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["role"] == "system"
+                        && m["content"]
+                            .as_str()
+                            .is_some_and(|t| t.contains("会议依据不足时的经验回答规则")
+                                && t.contains("persona的性格")
+                                && t.contains("本场模板"))));
+                let content = if n == 2 {
+                    "INVALID JSON".to_owned()
+                } else {
+                    json!({"blocks":[{"kind":"suggestion","basis":"experience","text":"我建议先小范围测试，再决定是否扩大预算。","sources":[]}]}).to_string()
+                };
+                let body =
+                    json!({"choices":[{"finish_reason":"stop","message":{"content":content}}]})
+                        .to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        for (q, experience) in [
+            ("按你的经验，预算分配可以怎么做？", true),
+            ("只依据本次会议回答预算分配，不要补充经验", false),
+        ] {
+            let turn = submit(rt.clone(), cid, q, "text", None).unwrap();
+            assert_eq!(
+                wait(&rt, turn["turn_id"].as_str().unwrap()),
+                "succeeded",
+                "{}",
+                detail(&rt, cid).unwrap()
+            );
+            let history = detail(&rt, cid).unwrap();
+            let answer = &history["turns"].as_array().unwrap().last().unwrap()["answer"];
+            assert_eq!(answer["evidence"], json!([]));
+            if experience {
+                assert_eq!(answer["blocks"][0]["basis"], "experience");
+                assert!(answer["blocks"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("目前我还没找到相关讨论。"));
+            } else {
+                assert_eq!(answer["blocks"][0]["kind"], "unanswered");
+                assert_eq!(answer["blocks"][0]["reason"], "insufficient_evidence");
+                assert!(!answer.to_string().contains("小范围测试"));
+            }
+        }
+        let turn = submit(rt.clone(), cid, "合成格式失败问题", "text", None).unwrap();
+        assert_eq!(
+            wait(&rt, turn["turn_id"].as_str().unwrap()),
+            "succeeded",
+            "{}",
+            detail(&rt, cid).unwrap()
+        );
+        let history = detail(&rt, cid).unwrap();
+        let failure = &history["turns"].as_array().unwrap().last().unwrap()["answer"];
+        assert_eq!(failure["blocks"][0]["reason"], "validation_failed");
+        assert!(!failure.to_string().contains("根据我的"));
+        assert!(failure["blocks"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("格式或引用校验"));
+        server.join().unwrap();
     }
     #[test]
     fn unanswered_voice_turns_remain_null_without_fabricated_answer_objects() {
@@ -2115,7 +2560,23 @@ mod tests {
                         .map(|m| {
                             serde_json::from_str::<Value>(m["content"].as_str().unwrap()).unwrap()
                         });
-                    let message = if n == 0 {
+                    let pack = messages
+                        .iter()
+                        .filter_map(|m| m["content"].as_str())
+                        .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .find_map(|v| v.get("context_pack").cloned())
+                        .unwrap();
+                    assert!(pack["context"].get("behavior").is_none());
+                    if first_source.is_null() {
+                        first_source = pack["rows"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|r| r["kind"] == "meeting")
+                            .map_or(Value::Null, |r| r["source_id"].clone());
+                    }
+                    let full_pack = pack["coverage"]["full_transcript"] == true;
+                    let message = if n == 0 && !full_pack {
                         json!({"content":null,"tool_calls":[{"id":format!("context-{n}"),"type":"function","function":{"name":"get_context","arguments":"{}"}}]})
                     } else {
                         let offset = last
@@ -2123,17 +2584,27 @@ mod tests {
                             .and_then(|v| v["next_offset"].as_u64())
                             .unwrap_or(0);
                         if let Some(data) = last.as_ref().filter(|v| v["rows"].is_array()) {
-                            assert_ne!(data["budget_exhausted"], true);
-                            assert!(!data["rows"].as_array().unwrap().is_empty());
+                            if data["budget_exhausted"] == true {
+                                assert_eq!(data["partial"], true);
+                            } else {
+                                assert!(!data["rows"].as_array().unwrap().is_empty());
+                            }
                             if first_source.is_null() {
                                 first_source = data["rows"][0]["source_id"].clone();
                             }
                             assert!(data["rows"][0]["meeting_id"].is_null());
                         }
-                        let complete = last
-                            .as_ref()
-                            .is_some_and(|v| v["rows"].is_array() && v["next_offset"].is_null());
-                        if complete || request["tools"].as_array().is_none_or(Vec::is_empty) {
+                        let complete = full_pack
+                            || last.as_ref().is_some_and(|v| {
+                                v["rows"].is_array() && v["next_offset"].is_null()
+                            });
+                        let exhausted = last.as_ref().is_some_and(|v| {
+                            v["budget_exhausted"] == true || v["retrieval_exhausted"] == true
+                        });
+                        if complete
+                            || exhausted
+                            || request["tools"].as_array().is_none_or(Vec::is_empty)
+                        {
                             assert!(n <= 4, "must leave the final model call for repair");
                             let mut blocks = vec![
                                 json!({"kind":"meeting_fact","text":"已读原文提到核对范围。","sources":[first_source]}),
@@ -2435,6 +2906,172 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+    }
+    #[test]
+    fn composed_template_and_one_turn_mode_reach_same_model_and_persist_in_detail() {
+        let (_tmp, rt) = setup();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        profile(
+            &rt,
+            &format!("http://{}/v1", listener.local_addr().unwrap()),
+        );
+        let (mid, _) = seed(&rt, "合成组合规则", "合成原文");
+        let custom=crate::templates::save(&rt,crate::templates::Input{id:None,name:"合成业务模板".into(),instructions:"合成纪要专用规则".into(),policy:Some(json!({"goal":"合成业务目标","criteria":"合成业务标准","qa_rules":"合成当前问答规则"})),expected_version:None}).unwrap();
+        rt.db()
+            .unwrap()
+            .execute(
+                "UPDATE meetings SET assistant_id=?,template_version=1 WHERE id=?",
+                params![custom["id"].as_str().unwrap(), mid],
+            )
+            .unwrap();
+        let convo = open(&rt, Some(mid), false).unwrap();
+        let cid = convo["id"].as_str().unwrap();
+        let server = std::thread::spawn(move || {
+            for mode in ["judge", "auto"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let input = receive(&mut stream);
+                let system = input["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["role"] == "system")
+                    .unwrap()["content"]
+                    .as_str()
+                    .unwrap();
+                for text in ["合成业务目标", "合成业务标准", "合成当前问答规则"]
+                {
+                    assert!(system.contains(text), "{text}");
+                }
+                assert!(system.contains(&format!("本轮问答方式：\"{mode}\"")));
+                assert!(!system.contains("合成纪要专用规则"));
+                let content=json!({"mode":if mode=="auto" {"clarify"} else {mode},"blocks":[{"kind":"suggestion","text":"合成回应。","sources":[]}]}).to_string();
+                let body =
+                    json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]})
+                        .to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        for mode in ["judge", "auto"] {
+            let turn = submit_with_mode(
+                rt.clone(),
+                cid,
+                "合成问题",
+                "text",
+                None,
+                "all",
+                false,
+                mode,
+            )
+            .unwrap();
+            assert_eq!(
+                wait(&rt, turn["turn_id"].as_str().unwrap()),
+                "succeeded",
+                "{}",
+                detail(&rt, cid).unwrap()
+            );
+        }
+        server.join().unwrap();
+        let d = detail(&rt, cid).unwrap();
+        assert_eq!(d["turns"][0]["policy"]["answer_mode"], "judge");
+        assert_eq!(d["turns"][1]["policy"]["answer_mode"], "auto");
+        assert_eq!(d["turns"][1]["policy"]["actual_mode"], "clarify");
+        assert_eq!(d["template"]["version"], 1);
+    }
+    #[test]
+    fn waking_during_model_thinking_cancels_inflight_turn_and_new_question_wins() {
+        let (_tmp, rt) = setup();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        profile(
+            &rt,
+            &format!("http://{}/v1", listener.local_addr().unwrap()),
+        );
+        let (mid, _) = seed(&rt, "合成思考打断", "合成原文");
+        rt.db()
+            .unwrap()
+            .execute("UPDATE meetings SET state='recording' WHERE id=?", [&mid])
+            .unwrap();
+        rt.db().unwrap().execute("INSERT INTO recording_sources(meeting_id,source,state,device) VALUES (?,'microphone','active',0)",[&mid]).unwrap();
+        let c = open(&rt, Some(mid.clone()), false).unwrap();
+        let cid = c["id"].as_str().unwrap();
+        let (arrived, receiving) = std::sync::mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(10);
+            let accept = || loop {
+                if let Ok((stream, _)) = listener.accept() {
+                    stream.set_nonblocking(false).unwrap();
+                    break stream;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "new question was blocked by cancelled model request"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let mut old = accept();
+            let old_request = receive(&mut old);
+            assert!(!old_request.to_string().contains("合成新版人设"));
+            arrived.send(()).unwrap(); // first request deliberately has no response
+            let mut new = accept();
+            let input = receive(&mut new);
+            assert!(input.to_string().contains("新的合成问题"));
+            assert!(input.to_string().contains("合成新版人设"));
+            let content =
+                json!({"blocks":[{"kind":"suggestion","text":"合成新回答。","sources":[]}]})
+                    .to_string();
+            let body = json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]})
+                .to_string();
+            write!(new,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            // A late response to the old request must never become a new answer.
+            let _ = write!(
+                old,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        let initial_behavior_version = crate::assistant_policy::current(&rt).unwrap()["version"]
+            .as_u64()
+            .unwrap();
+        let first = submit(rt.clone(), cid, "旧的合成问题", "voice", Some(id())).unwrap();
+        receiving.recv_timeout(Duration::from_secs(6)).unwrap();
+        let began = Instant::now();
+        crate::voice::interrupt_answer(&rt, &mid).unwrap();
+        let mut preferences = settings(&rt).unwrap();
+        preferences["behavior"]["persona_prompt"] = json!("合成新版人设");
+        save_settings(&rt, preferences).unwrap();
+        let second = submit(rt.clone(), cid, "新的合成问题", "voice", Some(id())).unwrap();
+        assert_eq!(wait(&rt, second["turn_id"].as_str().unwrap()), "succeeded");
+        assert!(began.elapsed() < Duration::from_secs(4));
+        server.join().unwrap();
+        for h in rt.analysis_threads.lock().unwrap().drain(..) {
+            h.join().unwrap();
+        }
+        assert_eq!(wait(&rt, first["turn_id"].as_str().unwrap()), "cancelled");
+        let snapshots: Vec<String> = rt
+            .db()
+            .unwrap()
+            .prepare(
+                "SELECT snapshot_json FROM assistant_turns WHERE conversation_id=? ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map([cid], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&snapshots[0]).unwrap()["context"]["behavior"]["version"],
+            initial_behavior_version
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&snapshots[1]).unwrap()["context"]["behavior"]["version"],
+            initial_behavior_version + 1
+        );
+        let turns = detail(&rt, cid).unwrap();
+        assert!(turns["turns"][0]["answer"].is_null());
+        assert_eq!(
+            turns["turns"][1]["answer"]["blocks"][0]["text"],
+            "合成新回答。"
+        );
     }
     #[test]
     fn cancellation_kills_queued_agent_before_any_http_dispatch() {

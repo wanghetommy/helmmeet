@@ -10,3 +10,11 @@ test('validated answers retain citations while unsafe optional metadata cannot c
  assert.equal(readAssistantAnswer({...input,blocks:[{kind:'suggestion',text:'合成建议',sources:[{}]}]}),undefined);
  assert.equal(readAssistantAnswer({...input,evidence:[null]}),undefined);
 });
+
+test('experience provenance and technical failure remain readable without raw evidence metadata',()=>{
+ const text='目前我还没找到相关讨论。根据我的知识与经验，我建议先小范围测试。';
+ const result=readAssistantAnswer({blocks:[{kind:'suggestion',basis:'experience',text,sources:[]}],evidence:[]})!;
+ assert.equal(result.blocks[0]?.text,text);assert.deepEqual(result.evidence,[]);
+ const failure=readAssistantAnswer({blocks:[{kind:'unanswered',reason:'validation_failed',text:'这轮回答的格式或引用校验未通过，请重试。',sources:[]}],evidence:[]})!;
+ assert.match(failure.blocks[0]!.text,/格式或引用校验/);assert(!failure.blocks[0]!.text.includes('经验'));
+});

@@ -155,6 +155,11 @@ pub fn prepare(
         })
         .transpose()?;
     if let Some(o) = context.as_object_mut() {
+        o.remove("behavior");
+        if let Some(template) = o.get_mut("template").and_then(Value::as_object_mut) {
+            template.remove("policy");
+            template.remove("instructions");
+        }
         o.remove("meeting_memory");
         o.remove("user_records");
     }

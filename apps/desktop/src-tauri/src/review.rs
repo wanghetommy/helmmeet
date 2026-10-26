@@ -186,7 +186,7 @@ pub fn run(
     let before = assistant::remaining_models(turn);
     for batch in batches {
         progress(rt, turn, parts.len(), "reading")?;
-        let input = json!({"task_type":"answer","question":question,"transcript":batch,"instruction":"这是整场审阅的一个原文批次，仅记录与当前问题有关的事实/决定/风险/未决事项，保留否定和改口；用第一人称简洁表达，不展示过程。无相关内容summary=[]。每批最多6项，保留各自原文引用，不猜测负责人、数字或共识；section=answer。"});
+        let input = json!({"task_type":"answer","question":question,"meeting_rules":snapshot["context"]["behavior"]["meeting_template"],"transcript":batch,"instruction":"这是整场审阅的一个原文批次，仅记录与当前问题有关的事实/决定/风险/未决事项，保留否定和改口；用第一人称简洁表达，不展示过程。无相关内容summary=[]。每批最多6项，保留各自原文引用，不猜测负责人、数字或共识；section=answer。"});
         let calls = assistant::remaining_models(turn);
         let Some(value) = cached_request(rt, turn, config, snapshot, question, input, check)?
         else {
@@ -211,7 +211,7 @@ pub fn run(
                 continue;
             }
             progress(rt, turn, completed, "merging")?;
-            let input = json!({"task_type":"answer","question":question,"parts":pair,"instruction":"合并整场分批审阅结果，保留开头目标、后续调整、冲突和最终状态，区分建议与决定；同一事实引用不超过32条，必要时拆分。简洁回答当前问题，不展示思考过程，不补造事实，section=answer，总计不超过1000中文字。"});
+            let input = json!({"task_type":"answer","question":question,"meeting_rules":snapshot["context"]["behavior"]["meeting_template"],"parts":pair,"instruction":"合并整场分批审阅结果，保留开头目标、后续调整、冲突和最终状态，区分建议与决定；同一事实引用不超过32条，必要时拆分。简洁回答当前问题，不展示思考过程，不补造事实，section=answer，总计不超过1000中文字。"});
             if let Some(value) = cached_request(rt, turn, config, snapshot, question, input, check)?
             {
                 reduced.push(value);

@@ -16,5 +16,5 @@ class ParagraphMigration(unittest.TestCase):
         db.execute("DELETE FROM meetings WHERE id='a'")
         self.assertEqual(db.execute('SELECT count(*) FROM speech_pauses').fetchone()[0],0)
         self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(),[])
-        self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],18)
+        self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],24)
         db.close()

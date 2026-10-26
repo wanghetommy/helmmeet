@@ -1,0 +1,67 @@
+{
+  "source": "https://docs.volcengine.com/docs/DoubaoVoice/Tonelist-1?lang=zh",
+  "checked_at": "2026-10-25",
+  "resource_id": "seed-tts-2.0",
+  "voices": [
+    {
+      "group": "通用场景",
+      "name": "小何 2.0",
+      "id": "zh_female_xiaohe_uranus_bigtts",
+      "language": "语种：中文、支持30+语种识别"
+    },
+    {
+      "group": "通用场景",
+      "name": "Vivi 2.0",
+      "id": "zh_female_vv_uranus_bigtts",
+      "language": "语种：中文、日文、印尼、墨西哥西班牙语、支持30+语种识别"
+    },
+    {
+      "group": "通用场景",
+      "name": "云舟 2.0",
+      "id": "zh_male_m191_uranus_bigtts",
+      "language": "语种：中文、支持30+语种识别"
+    },
+    {
+      "group": "通用场景",
+      "name": "小天 2.0",
+      "id": "zh_male_taocheng_uranus_bigtts",
+      "language": "语种：中文、支持30+语种识别"
+    },
+    {
+      "group": "通用场景",
+      "name": "刘飞 2.0",
+      "id": "zh_male_liufei_uranus_bigtts",
+      "language": "中文、支持30+语种识别"
+    },
+    {
+      "group": "通用场景",
+      "name": "知性女声 2.0",
+      "id": "zh_female_zhixingnv_uranus_bigtts",
+      "language": "中文、支持30+语种识别"
+    },
+    {
+      "group": "通用场景",
+      "name": "清新女声 2.0",
+      "id": "zh_female_qingxinnvsheng_uranus_bigtts",
+      "language": "中文、支持30+语种识别"
+    },
+    {
+      "group": "视频配音",
+      "name": "流畅女声 2.0",
+      "id": "zh_female_liuchangnv_uranus_bigtts",
+      "language": "中文、支持30+语种识别"
+    },
+    {
+      "group": "客服场景",
+      "name": "暖阳女声 2.0",
+      "id": "zh_female_kefunvsheng_uranus_bigtts",
+      "language": "中文、支持30+语种识别"
+    },
+    {
+      "group": "视频配音",
+      "name": "儒雅逸辰 2.0",
+      "id": "zh_male_ruyayichen_uranus_bigtts",
+      "language": "中文、支持30+语种识别"
+    }
+  ]
+}

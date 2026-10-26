@@ -56,6 +56,7 @@ pub fn transcript(
     } else {
         paragraphs
     };
+    let paragraphs = crate::paragraphs::readable(paragraphs);
     let text = format_transcript(&paragraphs, timestamps);
     let hash = format!(
         "{:x}",
@@ -79,7 +80,7 @@ pub fn format_transcript(rows: &[Value], timestamps: bool) -> String {
                 } else {
                     String::new()
                 },
-                v["text"].as_str().unwrap_or("")
+                meeting_core::reading::blocks(v["text"].as_str().unwrap_or("")).join("\n\n")
             )
         })
         .collect::<Vec<_>>()
@@ -609,6 +610,8 @@ mod tests {
                 id: Some("review".into()),
                 name: "新评审".into(),
                 instructions: "新模板".into(),
+                policy: None,
+                expected_version: Some(1),
             },
         )
         .unwrap();

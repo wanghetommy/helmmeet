@@ -2,6 +2,17 @@ import AVFoundation
 import AppKit
 import Darwin
 
+let maximumVoicePCMSamples = 16000 * 45
+
+// The C ABI and the player must apply the same limit. Validate before copying
+// caller memory; the injected sink also permits device-free boundary tests.
+func submitVoicePCM(_ input: UnsafePointer<Float>, _ count: Int32, play: ([Float]) -> Int32) -> Int32 {
+    guard count > 0, count <= maximumVoicePCMSamples else { return 1 }
+    let pcm = Array(UnsafeBufferPointer(start: input, count: Int(count)))
+    guard pcm.allSatisfy({ $0.isFinite && abs($0) <= 1 }) else { return 1 }
+    return play(pcm)
+}
+
 // Runs on the main queue. No input node is ever accessed. Buffer synthesis is
 // bounded before playback; Rust owns permission, turn validity and cancellation.
 final class AssistantSpeaker {
@@ -70,18 +81,32 @@ final class AssistantSpeaker {
                 if converter == nil { converter = PacketConverter(copy.format, target) }
                 guard let converted = converter?.convert(copy) else { self.stop(); self.status = -1; return }
                 pcm.append(contentsOf: converted)
-                if pcm.count > 16000 * 45 { self.stop(); self.status = -1 }
+                if pcm.count > maximumVoicePCMSamples { self.stop(); self.status = -1 }
             }
         }
         return 0
     }
     func playPCM(_ pcm: [Float]) -> Int32 {
-        guard !pcm.isEmpty, pcm.count <= 16000 * 4,
+        guard !pcm.isEmpty, pcm.count <= maximumVoicePCMSamples,
               pcm.allSatisfy({ $0.isFinite && abs($0) <= 1 }) else { return 1 }
         stop()
         guard !screenLocked else { status = -1; return 1 }
         play(pcm, generation)
         return status == 2 ? 0 : 1
+    }
+    func finishPlayback(_ token: UInt64, _ playbackToken: UInt64, notBefore: UInt64) {
+        guard generation == token, playbackGeneration == playbackToken else { return }
+        let now = mach_absolute_time()
+        if now < notBefore {
+            // Keep the engine alive through the complete scheduled PCM and the
+            // output route latency even if a device reports completion early.
+            let delay = AVAudioTime.seconds(forHostTime: notBefore - now)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.finishPlayback(token, playbackToken, notBefore: notBefore)
+            }
+            return
+        }
+        player?.stop(); engine?.stop(); player = nil; engine = nil; status = 0
     }
     func play(_ pcm: [Float], _ token: UInt64) {
         guard generation == token, !screenLocked else { return }
@@ -97,9 +122,10 @@ final class AssistantSpeaker {
         engine = audio; player = node; reference = pcm
         let time = mach_absolute_time() + AVAudioTime.hostTime(forSeconds: 0.05)
         referenceStart = UInt64((AVAudioTime.seconds(forHostTime: time) + audio.outputNode.presentationLatency) * 1_000_000_000)
+        let end = time + AVAudioTime.hostTime(forSeconds: Double(pcm.count) / format.sampleRate + audio.outputNode.presentationLatency)
         status = 2
         node.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { [weak self] _ in
-            DispatchQueue.main.async { guard let self = self, self.generation == token, self.playbackGeneration == playbackToken else { return }; self.player?.stop(); self.engine?.stop(); self.player = nil; self.engine = nil; self.status = 0 }
+            DispatchQueue.main.async { self?.finishPlayback(token, playbackToken, notBefore: end) }
         }
         node.play(at: AVAudioTime(hostTime: time))
     }
@@ -112,11 +138,11 @@ private func getSpeaker() -> AssistantSpeaker { if speaker == nil { speaker = As
     return onVoiceMain { getSpeaker().speak(owned) }
 }
 @_cdecl("hm_voice_play_pcm") public func hmVoicePlayPCM(_ input: UnsafePointer<Float>, _ count: Int32) -> Int32 {
-    guard count > 0, count <= 16000 * 4 else { return 1 }
     // Own the caller's PCM before moving to the main queue. Uses the same player,
     // cancellation fence and timestamped AEC reference as synthesized answers.
-    let pcm = Array(UnsafeBufferPointer(start: input, count: Int(count)))
-    return onVoiceMain { getSpeaker().playPCM(pcm) }
+    return submitVoicePCM(input, count) { pcm in
+        onVoiceMain { getSpeaker().playPCM(pcm) }
+    }
 }
 @_cdecl("hm_voice_stop") public func hmVoiceStop() { onVoiceMain { speaker?.stop() } }
 @_cdecl("hm_voice_state") public func hmVoiceState() -> Int32 { onVoiceMain { getSpeaker().screenLocked ? -2 : getSpeaker().status } }

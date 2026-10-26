@@ -33,6 +33,7 @@ pub enum Request {
         scope: Option<String>,
         #[serde(default)]
         review: bool,
+        mode: Option<String>,
     },
     AssistantCancel {
         turn_id: String,
@@ -42,8 +43,14 @@ pub enum Request {
     },
     AssistantSettings,
     AssistantVoiceStatus,
+    PreviewWakeAck {
+        tts: Option<Value>,
+        expected_id: Option<u64>,
+        selection_order: Option<u64>,
+    },
     AssistantVoiceCommand {
         action: String,
+        mode: Option<String>,
     },
     AssistantAccept {
         proposal_id: String,
@@ -242,6 +249,13 @@ pub enum Request {
         id: Option<String>,
         name: String,
         instructions: String,
+        policy: Option<Value>,
+        expected_version: Option<u64>,
+    },
+    AdoptTemplate {
+        meeting_id: String,
+        expected_version: u64,
+        template_version: u64,
     },
     Analyze {
         meeting_id: String,
@@ -366,7 +380,8 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             utterance_id,
             scope,
             review,
-        } => crate::assistant::submit_with_review(
+            mode,
+        } => crate::assistant::submit_with_mode(
             rt,
             &conversation_id,
             &question,
@@ -374,13 +389,22 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             utterance_id,
             scope.as_deref().unwrap_or("all"),
             review,
+            mode.as_deref().unwrap_or("auto"),
         ),
         Request::AssistantCancel { turn_id } => crate::assistant::cancel(&rt, &turn_id),
         Request::AssistantClear { conversation_id } => {
             crate::assistant::clear(&rt, &conversation_id)
         }
-        Request::AssistantVoiceStatus => crate::voice::status(&rt),
-        Request::AssistantVoiceCommand { action } => crate::voice::command(&rt, &action),
+        Request::AssistantVoiceStatus => crate::voice::ui_status(&rt),
+        Request::PreviewWakeAck {
+            tts,
+            expected_id,
+            selection_order,
+        } => crate::voice::preview_ack(&rt, tts, expected_id, selection_order),
+        Request::AssistantVoiceCommand { action, mode } => match mode {
+            Some(mode) => crate::voice::command_with_mode(&rt, &action, &mode),
+            None => crate::voice::command(&rt, &action),
+        },
         Request::AssistantSettings => crate::assistant::settings(&rt),
         Request::AssistantAccept { proposal_id } => crate::assistant::accept(&rt, &proposal_id),
         Request::SaveAssistantSettings { settings } => {
@@ -740,31 +764,28 @@ pub fn run(rt: Arc<Runtime>, request: Request) -> Result<Value, String> {
             tx.commit().map_err(err)?;
             Ok(json!({"cleared":true}))
         }
-        Request::Templates => {
-            let db = rt.db()?;
-            let mut s = db
-                .prepare(
-                    "SELECT id,version,name,instructions FROM assistant_templates ORDER BY name",
-                )
-                .map_err(err)?;
-            let v=s.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"version":r.get::<_,u32>(1)?,"name":r.get::<_,String>(2)?,"instructions":r.get::<_,String>(3)?}))).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
-            Ok(json!(v))
-        }
+        Request::Templates => crate::templates::list(&rt),
         Request::SaveTemplate {
-            id: template,
+            id,
             name,
             instructions,
-        } => {
-            valid_text(&name, 200)?;
-            valid_text(&instructions, 12000)?;
-            let template = template.unwrap_or_else(id);
-            let mut db = rt.db()?;
-            let tx = db.transaction().map_err(err)?;
-            tx.execute("INSERT INTO assistant_templates VALUES (?,1,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,instructions=excluded.instructions,version=version+1",params![template,name,instructions]).map_err(err)?;
-            tx.execute("INSERT INTO template_versions SELECT id,version,name,instructions FROM assistant_templates WHERE id=?",[&template]).map_err(err)?;
-            tx.commit().map_err(err)?;
-            Ok(json!({"id":template}))
-        }
+            policy,
+            expected_version,
+        } => crate::templates::save(
+            &rt,
+            crate::templates::Input {
+                id,
+                name,
+                instructions,
+                policy,
+                expected_version,
+            },
+        ),
+        Request::AdoptTemplate {
+            meeting_id,
+            expected_version,
+            template_version,
+        } => crate::templates::adopt(&rt, &meeting_id, expected_version, template_version),
         Request::Analyze {
             meeting_id,
             analysis_type,
@@ -1212,8 +1233,9 @@ fn csv(value: &str) -> String {
 pub fn export_text(detail: &Value, format: &str) -> String {
     if format == "txt" {
         return crate::workspace::format_transcript(
-            detail["segments"]
+            detail["paragraphs"]
                 .as_array()
+                .or_else(|| detail["segments"].as_array())
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
             true,

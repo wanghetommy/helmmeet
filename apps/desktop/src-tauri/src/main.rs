@@ -6,6 +6,7 @@ mod asr;
 mod assistant;
 mod assistant_context;
 mod assistant_history;
+mod assistant_policy;
 mod audio;
 mod calibration;
 mod commands;
@@ -29,7 +30,12 @@ mod processing;
 mod product;
 mod review;
 mod routes;
+mod templates;
+mod tts;
 mod voice;
+mod voice_output;
+mod wake_ack;
+mod wake_preview;
 mod workspace;
 
 use serde::Serialize;
@@ -392,6 +398,17 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("启动 HelmMeet 失败");
     app.run(move |app, event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = event {
+            // Closing the window intentionally hides the app to the menu bar.
+            // macOS sends Reopen when the user clicks the Dock icon while the
+            // process is still alive; restore the existing window explicitly.
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Opened { ref urls } = event {
             for url in urls {

@@ -82,7 +82,7 @@ class ModelProfileMigrations(unittest.TestCase):
         self.db.close()
 
     def test_latest_schema_and_immutable_model_versions(self):
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 18)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 24)
         for statement in ("UPDATE model_configs SET config_json='{}'", 'DELETE FROM model_configs'):
             with self.assertRaises(sqlite3.IntegrityError):
                 self.db.execute(statement)
@@ -242,3 +242,152 @@ class DuozhouMigration(unittest.TestCase):
         for table in ['assistant_conversations','assistant_turns','assistant_proposals','assistant_playback_events']:
             self.assertEqual(self.db.execute('SELECT count(*) FROM '+table).fetchone()[0],0)
         self.assertEqual(self.db.execute('PRAGMA foreign_key_check').fetchall(),[])
+
+class AssistantBehaviorMigration(unittest.TestCase):
+    def test_v20_upgrade_preserves_preferences_and_history(self):
+        import json
+        db=sqlite3.connect(':memory:')
+        db.execute('PRAGMA foreign_keys=ON')
+        for migration in sorted(MIGRATION.parent.glob('*.sql')):
+            if migration.name < '0021': db.executescript(migration.read_text())
+        db.execute("INSERT INTO meetings(id,title,timezone,created_at) VALUES ('m','synthetic','Asia/Shanghai','now')")
+        db.execute("INSERT INTO assistant_conversations VALUES ('c','m','synthetic',0,'now')")
+        db.execute("INSERT INTO assistant_turns(id,conversation_id,epoch,question,source,state,response_json,created_at) VALUES ('t','c',0,'synthetic','voice','succeeded','{}','now')")
+        db.execute("UPDATE app_preferences SET value='1' WHERE key='debug_mode'")
+        old=db.execute("SELECT key,value FROM app_preferences ORDER BY key").fetchall()
+        db.commit()
+        db.executescript((MIGRATION.parent/'0021_assistant_behavior.sql').read_text())
+        self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],21)
+        self.assertEqual(db.execute("SELECT key,value FROM app_preferences WHERE key!='assistant_behavior_version' ORDER BY key").fetchall(),old)
+        self.assertEqual(db.execute("SELECT response_json,speech_interrupted FROM assistant_turns WHERE id='t'").fetchone(),('{}',0))
+        policy=json.loads(db.execute('SELECT value FROM assistant_behavior_versions').fetchone()[0])
+        self.assertEqual([policy[k] for k in ('simple_seconds','medium_seconds','complex_seconds')],[10,20,30])
+        for sql in ('DELETE FROM assistant_behavior_versions',"UPDATE assistant_behavior_versions SET value='{}'"):
+            with self.assertRaises(sqlite3.IntegrityError): db.execute(sql)
+        self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(),[])
+        db.close()
+
+
+class PersonaDimensionsMigration(unittest.TestCase):
+    def upgrade(self, custom):
+        import json
+        db=sqlite3.connect(':memory:')
+        db.execute('PRAGMA foreign_keys=ON')
+        for migration in sorted(MIGRATION.parent.glob('*.sql')):
+            if migration.name < '0022': db.executescript(migration.read_text())
+        policy=json.loads(db.execute('SELECT value FROM assistant_behavior_versions WHERE version=1').fetchone()[0])
+        if custom:
+            policy['persona_prompt']='保留我的自定义经历和口吻'
+            policy['complex_seconds']=45
+            db.execute("INSERT INTO assistant_behavior_versions VALUES (5,?,'synthetic')",(json.dumps(policy,ensure_ascii=False),))
+            db.execute("UPDATE app_preferences SET value='5' WHERE key='assistant_behavior_version'")
+        old=db.execute('SELECT version,value,created_at FROM assistant_behavior_versions ORDER BY version').fetchall()
+        db.execute("INSERT INTO meetings(id,title,timezone,created_at) VALUES ('m','synthetic','Asia/Shanghai','now')")
+        db.execute("INSERT INTO assistant_conversations VALUES ('c','m','synthetic',0,'now')")
+        db.execute("INSERT INTO assistant_turns(id,conversation_id,epoch,question,source,state,snapshot_json,created_at) VALUES ('t','c',0,'synthetic','text','succeeded',?,'now')",(json.dumps({'context':{'behavior':policy}}),))
+        before=db.execute("SELECT snapshot_json FROM assistant_turns WHERE id='t'").fetchone()[0]
+        preferences=db.execute("SELECT key,value FROM app_preferences WHERE key!='assistant_behavior_version' ORDER BY key").fetchall()
+        db.commit()
+        db.executescript((MIGRATION.parent/'0022_persona_dimensions.sql').read_text())
+        self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],22)
+        version=int(db.execute("SELECT value FROM app_preferences WHERE key='assistant_behavior_version'").fetchone()[0])
+        self.assertEqual(version,6 if custom else 2)
+        for row in old:
+            self.assertEqual(db.execute('SELECT version,value,created_at FROM assistant_behavior_versions WHERE version=?',(row[0],)).fetchone(),row)
+        new=json.loads(db.execute('SELECT value FROM assistant_behavior_versions WHERE version=?',(version,)).fetchone()[0])
+        self.assertEqual(set(new['persona']),{'personality','education','expression','catchphrases','thinking_models','expertise'})
+        self.assertEqual(new['persona_prompt'],policy['persona_prompt'] if custom else '')
+        self.assertEqual(new['complex_seconds'],policy['complex_seconds'])
+        self.assertEqual(db.execute("SELECT snapshot_json FROM assistant_turns WHERE id='t'").fetchone()[0],before)
+        self.assertEqual(db.execute("SELECT key,value FROM app_preferences WHERE key!='assistant_behavior_version' ORDER BY key").fetchall(),preferences)
+        self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(),[])
+        db.close()
+
+    def test_upgrade_default_to_dimensions_without_rewriting_history(self): self.upgrade(False)
+    def test_upgrade_custom_prompt_preserves_text_timing_and_versions(self): self.upgrade(True)
+
+
+class PersonaConsolidationMigration(unittest.TestCase):
+    def test_v22_merges_four_fields_without_losing_custom_text_or_history(self):
+        import json
+        for mode in ('default','custom','empty','duplicate','maximum'):
+            with self.subTest(mode=mode):
+                db=sqlite3.connect(':memory:')
+                db.execute('PRAGMA foreign_keys=ON')
+                for migration in sorted(MIGRATION.parent.glob('*.sql')):
+                    if migration.name < '0023': db.executescript(migration.read_text())
+                policy=json.loads(db.execute('SELECT value FROM assistant_behavior_versions WHERE version=2').fetchone()[0])
+                if mode=='custom':
+                    policy['persona'].update(expression='先给判断，再给一个例子。',catchphrases='先看关键点',expertise='研发协作经验',education='自定义跨学科背景')
+                elif mode=='empty':
+                    policy['persona'].update(expression='',catchphrases='',expertise='',education='')
+                elif mode=='duplicate':
+                    policy['persona'].update(expression='短句；先看关键点',catchphrases='先看关键点',expertise='研发实践；自定义背景',education='自定义背景')
+                elif mode=='maximum':
+                    policy['persona'].update(expression='风'*400,catchphrases='语'*120,expertise='经'*600,education='背'*500)
+                policy['persona_prompt']='保留补充文本'
+                policy['medium_seconds']=25
+                db.execute("INSERT INTO assistant_behavior_versions VALUES (7,?,'synthetic')",(json.dumps(policy,ensure_ascii=False),))
+                db.execute("UPDATE app_preferences SET value='7' WHERE key='assistant_behavior_version'")
+                versions=db.execute('SELECT version,value,created_at FROM assistant_behavior_versions ORDER BY version').fetchall()
+                db.execute("INSERT INTO meetings(id,title,timezone,created_at) VALUES ('m','synthetic','Asia/Shanghai','now')")
+                db.execute("INSERT INTO assistant_conversations VALUES ('c','m','synthetic',0,'now')")
+                frozen=json.dumps({'context':{'behavior':policy}},ensure_ascii=False)
+                db.execute("INSERT INTO assistant_turns(id,conversation_id,epoch,question,source,state,snapshot_json,created_at) VALUES ('t','c',0,'synthetic','text','succeeded',?,'now')",(frozen,))
+                prefs=db.execute("SELECT key,value FROM app_preferences WHERE key!='assistant_behavior_version' ORDER BY key").fetchall()
+                db.commit()
+                db.executescript((MIGRATION.parent/'0023_persona_consolidation.sql').read_text())
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],23)
+                self.assertEqual(db.execute("SELECT value FROM app_preferences WHERE key='assistant_behavior_version'").fetchone()[0],'8')
+                new=json.loads(db.execute('SELECT value FROM assistant_behavior_versions WHERE version=8').fetchone()[0])
+                persona=new['persona']; previous=policy['persona']
+                self.assertEqual(set(persona),{'personality','expression','thinking_models','expertise'})
+                self.assertEqual(new['persona_prompt'],policy['persona_prompt'])
+                self.assertEqual(new['medium_seconds'],25)
+                self.assertEqual(persona['personality'],previous['personality'])
+                self.assertEqual(persona['thinking_models'],previous['thinking_models'])
+                if mode=='default':
+                    self.assertIn(previous['catchphrases'],persona['expression'])
+                    self.assertNotIn(previous['education'],persona['expertise'])
+                    self.assertNotIn('管理学、组织行为学',persona['expertise'])
+                elif mode=='empty':
+                    self.assertEqual(persona['expression'],'')
+                    self.assertEqual(persona['expertise'],'')
+                else:
+                    self.assertIn(previous['expression'],persona['expression'])
+                    self.assertIn(previous['expertise'],persona['expertise'])
+                    self.assertEqual(persona['expression'].count(previous['catchphrases']),1)
+                    self.assertEqual(persona['expertise'].count(previous['education']),1)
+                self.assertLessEqual(len(persona['expression']),800)
+                self.assertLessEqual(len(persona['expertise']),1200)
+                self.assertEqual(db.execute('SELECT version,value,created_at FROM assistant_behavior_versions WHERE version<8 ORDER BY version').fetchall(),versions)
+                self.assertEqual(db.execute("SELECT snapshot_json FROM assistant_turns WHERE id='t'").fetchone()[0],frozen)
+                self.assertEqual(db.execute("SELECT key,value FROM app_preferences WHERE key!='assistant_behavior_version' ORDER BY key").fetchall(),prefs)
+                self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(),[])
+                db.close()
+
+class ComposedAssistantMigration(unittest.TestCase):
+    def test_upgrade_adds_common_rules_and_versioned_guidance_without_rewriting_history(self):
+        import json
+        db=sqlite3.connect(':memory:');db.execute('PRAGMA foreign_keys=ON')
+        for migration in sorted(MIGRATION.parent.glob('*.sql')):
+            if migration.name<'0024':db.executescript(migration.read_text())
+        db.execute("INSERT INTO assistant_templates VALUES ('custom',1,'synthetic','保留纪要规则')")
+        db.execute("INSERT INTO template_versions VALUES ('custom',1,'synthetic','保留纪要规则')")
+        version=int(db.execute("SELECT value FROM app_preferences WHERE key='assistant_behavior_version'").fetchone()[0])
+        old=json.loads(db.execute('SELECT value FROM assistant_behavior_versions WHERE version=?',(version,)).fetchone()[0]);old['persona_prompt']='保留自定义通用要求';old['simple_seconds']=8
+        db.execute("INSERT INTO assistant_behavior_versions VALUES (9,?,'synthetic')",(json.dumps(old,ensure_ascii=False),));db.execute("UPDATE app_preferences SET value='9' WHERE key='assistant_behavior_version'")
+        versions=db.execute('SELECT * FROM assistant_behavior_versions ORDER BY version').fetchall();templates=db.execute('SELECT * FROM template_versions').fetchall();db.commit()
+        db.executescript((MIGRATION.parent/'0024_composed_assistant.sql').read_text())
+        new=json.loads(db.execute('SELECT value FROM assistant_behavior_versions WHERE version=10').fetchone()[0])
+        self.assertIn('保留自定义通用要求',new['persona_prompt']);self.assertIn('不替参会人宣布决定',new['persona_prompt'])
+        self.assertEqual(new['persona'],old['persona']);self.assertEqual(new['simple_seconds'],8)
+        self.assertEqual(db.execute('SELECT * FROM assistant_behavior_versions WHERE version<=9 ORDER BY version').fetchall(),versions)
+        self.assertEqual(db.execute('SELECT * FROM template_versions').fetchall(),templates)
+        rules=json.loads(db.execute("SELECT policy_json FROM template_guidance WHERE template_id='custom'").fetchone()[0]);self.assertEqual(rules['criteria'],'保留纪要规则')
+        self.assertEqual(set(rules),{'goal','criteria','qa_rules'})
+        for sql in ("UPDATE template_guidance SET policy_json='{}'",'DELETE FROM template_guidance',"INSERT INTO template_guidance VALUES ('missing',1,'{}')"):
+            with self.assertRaises(sqlite3.IntegrityError):db.execute(sql)
+        self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(),[])
+        self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],24)
+        db.close()

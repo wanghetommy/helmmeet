@@ -3,6 +3,18 @@ use crate::db::err;
 use meeting_core::paragraph::{self, Pause, Segment};
 use rusqlite::Connection;
 use serde_json::{json, Value};
+/// Apply reading layout only after calibration has selected the displayed text.
+pub fn readable(mut paragraphs: Vec<Value>) -> Vec<Value> {
+    for p in &mut paragraphs {
+        p["reading_blocks"] = json!(meeting_core::reading::blocks(
+            p["text"].as_str().unwrap_or("")
+        ));
+        if let Some(raw) = p["raw_text"].as_str() {
+            p["raw_reading_blocks"] = json!(meeting_core::reading::blocks(raw));
+        }
+    }
+    paragraphs
+}
 pub fn join(parts: impl IntoIterator<Item = String>) -> String {
     let mut text = String::new();
     for part in parts {
@@ -90,6 +102,80 @@ pub fn project(
 mod tests {
     use super::*;
     use std::sync::Arc;
+    #[test]
+    fn reading_blocks_preserve_calibration_sources_copy_export_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(crate::models::tests::MemoryVault::default());
+        let rt = crate::db::Runtime::open_with_vault(dir.path().into(), vault.clone()).unwrap();
+        let mid = rt.create("合成阅读排版", "general").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let sid = crate::db::id();
+        let pid = format!("p-{sid}");
+        let raw = "原".repeat(480);
+        let corrected = format!("{}。", "校".repeat(59)).repeat(8);
+        let manifest = json!([{"segment_id":sid,"revision":1}]);
+        {
+            let db = rt.db().unwrap();
+            db.execute(
+                "UPDATE meetings SET state='completed',recording_duration_ms=10000 WHERE id=?",
+                [&mid],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO transcript_segments VALUES (?,?,0,10000,'mixed',1,'final')",
+                rusqlite::params![sid, mid],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO transcript_revisions VALUES (?,1,?,?,'asr','synthetic')",
+                rusqlite::params![sid, mid, raw],
+            )
+            .unwrap();
+            db.execute("INSERT INTO transcript_calibrations(id,meeting_id,paragraph_id,source_manifest_json,source_revision,raw_text,corrected_text,changes_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,'[]','needs_review','synthetic','synthetic')", rusqlite::params![crate::db::id(),mid,pid,manifest.to_string(),1,raw,corrected]).unwrap();
+        }
+        let detail = rt.detail(&mid).unwrap();
+        let p = &detail["paragraphs"][0];
+        assert_eq!(detail["paragraphs"].as_array().unwrap().len(), 1);
+        assert_eq!(p["id"], pid);
+        assert_eq!(p["members"], manifest);
+        assert_eq!(p["text"], corrected);
+        assert_eq!(p["raw_text"], raw);
+        assert_eq!(p["reading_blocks"].as_array().unwrap().len(), 4);
+        assert_eq!(p["raw_reading_blocks"].as_array().unwrap().len(), 2);
+        assert_eq!(p["calibration"]["status"], "needs_review");
+        assert_eq!(detail["segments"][0]["text"], raw);
+        assert_eq!(detail["segments"][0]["revision"], 1);
+        let current = crate::workspace::transcript(&rt, &mid, "current", true).unwrap();
+        let original = crate::workspace::transcript(&rt, &mid, "original", false).unwrap();
+        assert_eq!(
+            current["paragraphs"][0]["reading_blocks"],
+            p["reading_blocks"]
+        );
+        assert_eq!(original["paragraphs"][0]["text"], raw);
+        assert_eq!(
+            original["paragraphs"][0]["reading_blocks"],
+            p["raw_reading_blocks"]
+        );
+        assert_eq!(
+            current["text"].as_str().unwrap().matches("[00:00]").count(),
+            1
+        );
+        assert_eq!(current["text"].as_str().unwrap().matches("\n\n").count(), 3);
+        assert_eq!(
+            crate::commands::export_text(&detail, "txt"),
+            current["text"].as_str().unwrap()
+        );
+        assert_eq!(
+            crate::workspace::transcript(&rt, &mid, "current", true).unwrap()["hash"],
+            current["hash"]
+        );
+        drop(rt);
+        let rt = crate::db::Runtime::open_with_vault(dir.path().into(), vault).unwrap();
+        assert_eq!(rt.detail(&mid).unwrap()["paragraphs"], detail["paragraphs"]);
+        assert_eq!(rt.db().unwrap().query_row("SELECT count(*) FROM transcript_calibrations WHERE meeting_id=? AND status='needs_review'", [&mid], |r|r.get::<_,u64>(0)).unwrap(), 1);
+    }
     #[test]
     fn vad_boundaries_wait_for_asr_and_recover_without_rewriting_evidence() {
         let dir = tempfile::tempdir().unwrap();

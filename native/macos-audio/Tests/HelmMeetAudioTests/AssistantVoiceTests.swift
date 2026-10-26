@@ -3,12 +3,111 @@ import AVFoundation
 import XCTest
 @testable import HelmMeetAudio
 final class AssistantVoiceTests: XCTestCase {
+    func testOptInAuditedShortVoicesPlayCompletelyWithoutCapture() throws {
+        guard let folder = ProcessInfo.processInfo.environment["HELMMEET_TEST_WAKE_AUDIT_FOLDER"] else { throw XCTSkip("Explicit fixed voice preview playback only; no microphone") }
+        let clips = try ["zh_female_xiaohe_uranus_bigtts", "zh_female_kefunvsheng_uranus_bigtts"].map { name -> [Float] in
+            let data = try Data(contentsOf: URL(fileURLWithPath: folder).appendingPathComponent(name + ".pcm"))
+            XCTAssertEqual(data.count % 2, 0)
+            let bytes = [UInt8](data)
+            let pcm = stride(from: 0, to: bytes.count, by: 2).map { i in Float(Int16(bitPattern: UInt16(bytes[i]) | UInt16(bytes[i + 1]) << 8)) / 32768 }
+            XCTAssertGreaterThan(pcm.count, 1600)
+            return Array(repeating: Float(0), count: 3200) + pcm + Array(repeating: Float(0), count: 5600)
+        }
+        let done = expectation(description: "two audited fixed responses finish")
+        var speaker: AssistantSpeaker?
+        DispatchQueue.main.async {
+            speaker = AssistantSpeaker()
+            func playNext(_ index: Int) {
+                guard index < clips.count else { done.fulfill(); return }
+                let pcm = clips[index]
+                XCTAssertEqual(speaker!.playPCM(pcm), 0)
+                XCTAssertEqual(speaker!.reference, pcm)
+                let duration = Double(pcm.count) / 16000
+                DispatchQueue.main.asyncAfter(deadline: .now() + duration - 0.2) { XCTAssertEqual(speaker!.status, 2, "The last syllable and drain must remain scheduled") }
+                DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.6) {
+                    XCTAssertEqual(speaker!.status, 0)
+                    XCTAssertNil(speaker!.player)
+                    playNext(index + 1)
+                }
+            }
+            playNext(0)
+        }
+        wait(for: [done], timeout: 8)
+        speaker?.stop()
+    }
+    func testEarlyCompletionWaitsForTheScheduledEndWithoutAudioDevices() {
+        let done = expectation(description: "full PCM time before teardown")
+        DispatchQueue.main.async {
+            let speaker = AssistantSpeaker()
+            speaker.status = 2
+            let end = mach_absolute_time() + AVAudioTime.hostTime(forSeconds: 0.15)
+            speaker.finishPlayback(speaker.generation, speaker.playbackGeneration, notBefore: end)
+            XCTAssertEqual(speaker.status, 2, "An early callback must not cut off the clip")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
+                XCTAssertEqual(speaker.status, 2)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                XCTAssertEqual(speaker.status, 0)
+                XCTAssertNil(speaker.engine)
+                done.fulfill()
+            }
+        }
+        wait(for: [done], timeout: 3)
+    }
+    func testStoppedDrainCannotCloseANewerPlaybackWithoutAudioDevices() {
+        let done = expectation(description: "cancelled teardown stays cancelled")
+        DispatchQueue.main.async {
+            let speaker = AssistantSpeaker()
+            speaker.status = 2
+            let end = mach_absolute_time() + AVAudioTime.hostTime(forSeconds: 0.1)
+            speaker.finishPlayback(speaker.generation, speaker.playbackGeneration, notBefore: end)
+            speaker.stop()
+            XCTAssertEqual(speaker.status, 0, "Explicit stop must bypass the drain wait")
+            speaker.status = 2 // A new generation, with no real player/device.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                XCTAssertEqual(speaker.status, 2, "Old completion must not stop the new response")
+                speaker.finishPlayback(speaker.generation, speaker.playbackGeneration &- 1, notBefore: 0)
+                XCTAssertEqual(speaker.status, 2, "A late buffer callback must also be ignored")
+                speaker.finishPlayback(speaker.generation, speaker.playbackGeneration, notBefore: 0)
+                XCTAssertEqual(speaker.status, 0)
+                done.fulfill()
+            }
+        }
+        wait(for: [done], timeout: 3)
+    }
     func testPCMRejectsInvalidInputWithoutOpeningAudioDevices() {
         let speaker = AssistantSpeaker()
-        for pcm: [Float] in [[], [.nan], [.infinity], [1.1], Array(repeating: 0, count: 64001)] {
+        for pcm: [Float] in [[], [.nan], [.infinity], [1.1], Array(repeating: 0, count: maximumVoicePCMSamples + 1)] {
             XCTAssertEqual(speaker.playPCM(pcm), 1)
             XCTAssertEqual(speaker.status, 0)
             XCTAssertNil(speaker.engine)
+        }
+    }
+    func testCABIInputLongerThanFourSecondsReachesPlayerWithoutDevices() {
+        for count in [16000 * 5, maximumVoicePCMSamples] {
+            let pcm = Array(repeating: Float(0.1), count: count)
+            var delivered = 0
+            let result = pcm.withUnsafeBufferPointer { input in
+                submitVoicePCM(input.baseAddress!, Int32(count)) { received in
+                    delivered += 1
+                    XCTAssertEqual(received, pcm)
+                    return 0
+                }
+            }
+            XCTAssertEqual(result, 0)
+            XCTAssertEqual(delivered, 1)
+        }
+    }
+    func testCABIRejectsOversizedAndInvalidPCMBeforePlayerWithoutDevices() {
+        var sample: Float = 0
+        withUnsafePointer(to: &sample) { input in
+            for count: Int32 in [0, -1, Int32(maximumVoicePCMSamples + 1)] {
+                XCTAssertEqual(submitVoicePCM(input, count) { _ in XCTFail("Player must not be called"); return 0 }, 1)
+            }
+        }
+        let invalid: [Float] = [.nan]
+        invalid.withUnsafeBufferPointer { input in
+            XCTAssertEqual(submitVoicePCM(input.baseAddress!, 1) { _ in XCTFail("Player must not be called"); return 0 }, 1)
         }
     }
     func testOptInProvidedWakePCMPlaysEntireClipAndProvidesReference() throws {

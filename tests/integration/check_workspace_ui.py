@@ -18,8 +18,11 @@ for(const [id,title,state] of [[a,'合成会议 A','recording'],[b,'合成会议
 const c='33333333-3333-4333-8333-333333333333';details[c]={...structuredClone(details[b]),id:c,title:'合成准备 C',state:'ready',duration_ms:0,segments:[],artifacts:[],enhancement:{...details[b].enhancement,mode:'off',echo_cancellation:false,aec_applied_ms:0,aec_bypass_ms:0,aec_status:{state:'waiting',reason:'waiting_for_audio',delay_ms:null},state:'queued',processed_ms:0,total_ms:0,playable_through_ms:0}};
 details[a].jobs=[{id:'new-success',type:'stage',state:'succeeded',error:null},{id:'old-json-failure',type:'stage',state:'failed',error:'模型结构化结果无效'}];
 details[b].jobs=[{id:'latest-json-failure',type:'final_map',state:'failed',error:'模型结构化结果无效'}];
-const assistantConversations={};let assistantPreferences={voice_enabled:false,wake_word:'小舵同学',silence_ms:1200,speak_answers:true,collections:[]};let voiceState={state:'off',meeting_id:a,can_enable:true,reason:'disabled',message:'语音唤醒未开启'};
-const assistantOpen=(mid,general)=>{mid=general?null:mid??Object.values(details).find(m=>['recording','paused','interrupted'].includes(m.state))?.id;const key=mid??'general';if(!assistantConversations[key])assistantConversations[key]={id:mid??'general-chat',meeting_id:mid??null,title:mid?details[mid].title:'与小舵聊一聊',turns:[],proposals:[]};return assistantConversations[key]};
+const templatePolicy={goal:'合成目标：评估方案可行性。',criteria:'合成标准：目标、约束与风险证据。',qa_rules:'合成问答：先判断，再给验证建议。'};
+for(const d of Object.values(details))d.template.policy=structuredClone(templatePolicy);
+const templates=[{id:'general',name:'通用会议',version:1,instructions:'核对目标、结论和行动',policy:{...templatePolicy}},{id:'weekly',name:'周会',version:1,instructions:'进展、卡点与下周计划',policy:{...templatePolicy}},structuredClone(details[b].template)];
+const assistantConversations={};let assistantPreferences={behavior:{persona:{personality:'合成性格：坦诚温和。',expression:'合成表达风格：短句；惯用语按需使用“关键在于……”。',thinking_models:'合成思维模型：假设与证据。',expertise:'合成知识与经验：项目管理与复盘实践。'},default_persona:{personality:'合成性格：坦诚温和。',expression:'合成表达风格：短句；惯用语按需使用“关键在于……”。',thinking_models:'合成思维模型：假设与证据。',expertise:'合成知识与经验：项目管理与复盘实践。'},version:1,persona_prompt:'合成测试人设：直接简洁回答。',default_persona_prompt:'合成默认人设。',simple_seconds:10,medium_seconds:20,complex_seconds:30,conclusion_first:true,one_question:true},voice_enabled:false,wake_word:'小舵同学',silence_ms:1200,speak_answers:true,collections:[],tts:{enabled:false,profile_id:null,config_version:null,model:'seed-tts-2.0-standard',speaker:'zh_female_gaolengyujie_uranus_bigtts',fallback_local:true}};let voiceState={state:'off',meeting_id:a,can_enable:true,reason:'disabled',message:'语音唤醒未开启'};
+const assistantOpen=(mid,general)=>{mid=general?null:mid??Object.values(details).find(m=>['recording','paused','interrupted'].includes(m.state))?.id;const key=mid??'general';if(!assistantConversations[key])assistantConversations[key]={id:mid??'general-chat',meeting_id:mid??null,title:mid?details[mid].title:'与小舵聊一聊',turns:[],proposals:[]};const conv=assistantConversations[key];if(mid){conv.meeting_version=details[mid].version;conv.template={...structuredClone(details[mid].template),latest_version:templates.find(t=>t.id===details[mid].template.id)?.version??1};}return conv};
 const preparationFixture=structuredClone(details[c]);
 window.testCalls=[];
 window.testAudioStarts=[];
@@ -48,7 +51,9 @@ window.__TAURI_INTERNALS__={transformCallback:fn=>{const id=++syntheticCallbackI
  case 'set_audio_enhancement':if(d.state!=='ready')throw Error('frozen');d.enhancement.mode=op.mode;if(op.echo_cancellation!==undefined)d.enhancement.echo_cancellation=op.echo_cancellation;result={saved:true};break;
  case 'export':result={exported:true};break;
  case 'model_profiles':result={profiles,default_profile_id:'p1'};break;
- case 'templates':result=[{id:'general',name:'通用会议',version:1,instructions:'核对目标、结论和行动'},{id:'weekly',name:'周会',version:1,instructions:'进展、卡点与下周计划'},details[b].template];break;
+ case 'templates':result=templates;break;
+ case 'save_template':{let t=templates.find(t=>t.id===op.id);if(t&&t.version!==op.expected_version)throw Error('模板已更新');const next={id:op.id??crypto.randomUUID(),version:(t?.version??0)+1,name:op.name,instructions:op.instructions,policy:op.policy};if(t)Object.assign(t,next);else templates.push(next);result=next;break;}
+ case 'adopt_template':if(d.version!==op.expected_version)throw Error('会议版本已变化');d.template=structuredClone(templates.find(t=>t.id===d.template.id&&t.version===op.template_version));d.version++;result={adopted:true};break;
  case 'devices':result=[];break;
  case 'read_transcript_snapshot':result={meeting_id:d.id,title:d.title,source:op.source,timestamps:op.timestamps,through_ms:60000,hash:'fixture-hash',paragraphs:d.paragraphs.map(p=>({...p,text:p.segment_ids.map((id,i)=>op.source==='original'&&i===0?'原始识别文本':d.segments.find(s=>s.id===id).text).join('')})),text:op.source==='original'?'原始识别文本\n第二段测试文字。':'人工修订的测试文字。\n第二段测试文字。',segments:d.segments.map((s,i)=>({segment_id:s.id,start_ms:s.start_ms,revision:op.source==='original'?1:s.revision,text:op.source==='original'&&i===0?'原始识别文本':s.text}))};break;
  case 'playback':{const end=Math.min(op.start_ms+30000,d.duration_ms);result={start_ms:op.start_ms,end_ms:end,samples:Array.from({length:(end-op.start_ms)*16},(_,i)=>Math.round(2000*Math.sin(2*Math.PI*440*(op.start_ms*16+i)/16000)))};break;}
@@ -56,13 +61,13 @@ window.__TAURI_INTERNALS__={transformCallback:fn=>{const id=++syntheticCallbackI
  case 'set_summary_schedule':Object.assign(d.schedule,{enabled:op.enabled,mode:op.mode,version:d.schedule.version+1});result={saved:true};break;
  case 'assistant_open':result=assistantOpen(op.meeting_id,op.general);break;
  case 'assistant_list':result=[...Object.values(details).filter(d=>d.state!=='ready').map(d=>({id:d.id,meeting_id:d.id,title:d.title})),...Object.values(assistantConversations).filter(c=>!c.meeting_id).map(c=>({id:c.id,meeting_id:null,title:c.title}))];break;
- case 'assistant_detail':result=Object.values(assistantConversations).find(c=>c.id===op.conversation_id);if(!result)throw Error('合成会话不存在');break;
- case 'assistant_submit':{const c=Object.values(assistantConversations).find(c=>c.id===op.conversation_id);const id=crypto.randomUUID();c.turns.push({id,question:op.question,source:op.source,state:'succeeded',model_name:'合成假模型',answer:{blocks:[{kind:'suggestion',text:'建议先澄清目标的验收条件，再讨论行动。',sources:['method:duozhou-v1']}],evidence:[{source_id:'method:duozhou-v1',kind:'method',name:'小舵会议方法 v1',text:'目标需核对指标、基线和验收条件。'}]}});result={turn_id:id};break;}
+ case 'assistant_detail':result=Object.values(assistantConversations).find(c=>c.id===op.conversation_id);if(!result)throw Error('合成会话不存在');if(result.meeting_id)result=assistantOpen(result.meeting_id,false);break;
+ case 'assistant_submit':{const c=Object.values(assistantConversations).find(c=>c.id===op.conversation_id);const id=crypto.randomUUID();c.turns.push({id,question:op.question,source:op.source,state:'succeeded',model_name:'合成假模型',policy:{answer_mode:op.mode??'auto',actual_mode:op.mode==='auto'?'analyze':op.mode,mode_label:({auto:'分析',analyze:'分析',clarify:'澄清',diverge:'发散',judge:'判断',converge:'收敛'})[op.mode??'auto'],meeting_template:structuredClone(c.template),persona_prompt:assistantPreferences.behavior.persona_prompt},answer:{blocks:[{kind:'suggestion',text:'建议先澄清目标的验收条件，再讨论行动。',sources:['method:duozhou-v1']}],evidence:[{source_id:'method:duozhou-v1',kind:'method',name:'小舵会议方法 v1',text:'目标需核对指标、基线和验收条件。'}]}});result={turn_id:id};break;}
  case 'assistant_clear':Object.values(assistantConversations).find(c=>c.id===op.conversation_id).turns=[];result={cleared:true};break;
  case 'assistant_cancel':result={cancelled:true};break;
  case 'assistant_settings':result=assistantPreferences;break;
  case 'save_assistant_settings':assistantPreferences=op.settings;voiceState=op.settings.voice_enabled?{state:'standby',meeting_id:a,wake_word:op.settings.wake_word,message:'待唤醒'}:{state:'off',meeting_id:a,can_enable:true,reason:'disabled',message:'语音唤醒未开启'};result=assistantPreferences;break;
- case 'assistant_voice_status':result=voiceState;break;
+ case 'assistant_voice_status':{const turns=Object.values(assistantConversations).flatMap(c=>c.turns.map(t=>({...t,conversation_id:c.id,meeting_id:c.meeting_id})));const latest=turns.filter(t=>['pending','running'].includes(t.state)).at(-1)??turns.at(-1);result={...voiceState,dialogue:voiceState.dialogue??(latest?{id:latest.id,conversation_id:latest.conversation_id,meeting_id:latest.meeting_id,state:latest.state,source:latest.source}:null)};break;}
  case 'assistant_voice_command':if(op.action==='listen')voiceState={state:'listening',meeting_id:a,message:'合成输入：请说话，停顿后自动提交'};else if(op.action==='cancel')voiceState={state:'standby',meeting_id:a,message:'合成输入已取消'};else if(op.action==='submit'){const c=assistantOpen(a);c.turns.push({id:crypto.randomUUID(),source:'voice',question:'合成语音问题：目前目标是什么？',state:'succeeded',answer:{blocks:[{kind:'suggestion',text:'建议先澄清验收条件。',sources:[]}],evidence:[]}});voiceState={state:'standby',meeting_id:a,message:'合成语音回合已写入聊天'};}result={accepted:true};break;
  case 'prepare_asr':await new Promise(resolve=>setTimeout(resolve,6000));result={ready:true};break;
  case 'delete':if(['recording','paused','interrupted'].includes(d.state))throw Error('请先结束会议');delete details[op.meeting_id];result={deleted:true};break;
@@ -98,7 +103,7 @@ window.__TAURI_INTERNALS__={transformCallback:fn=>{const id=++syntheticCallbackI
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port',type=int,default=1421)
-    parser.add_argument('--scenario',choices=['normal','voice-lifecycle','render-recovery','minutes-overlap','launch-cold','launch-active','launch-edit'],default='normal')
+    parser.add_argument('--scenario',choices=['normal','tts-voices','reading-paragraphs','assistant-focus','assistant-status','assistant-interruption','voice-lifecycle','render-recovery','minutes-overlap','launch-cold','launch-active','launch-edit'],default='normal')
     args=parser.parse_args()
     dist=ROOT/'apps/desktop/dist'
     scenario = ""
@@ -110,6 +115,97 @@ def main():
         scenario = """
 details[a].state='completed';details[a].capabilities=capabilities(details[a]);let syntheticLaunchId=0;
 document.addEventListener('DOMContentLoaded',()=>{const b=document.createElement('button');b.textContent='发送合成新建请求';b.onclick=()=>{(window.syntheticLaunchRequests??=[]).push({id:'warm-'+(++syntheticLaunchId),title:'网页合成新会议',meeting_type:'weekly'});window.emitSyntheticEvent('launch-link',null);};document.body.prepend(b);});
+"""
+    elif args.scenario == 'tts-voices':
+        scenario = """
+assistantPreferences.tts.enabled=true;assistantPreferences.tts.profile_id='p1';assistantPreferences.tts.config_version=1;
+voiceState.wake_ack={state:'ready',speaker:assistantPreferences.tts.speaker,available:true,refreshing:false,error:null};
+const ttsInvoke=window.__TAURI_INTERNALS__.invoke;
+const prepareSyntheticAck=()=>{const speaker=assistantPreferences.tts.speaker;voiceState.wake_ack={state:'preparing',speaker,available:false,refreshing:true,error:null};setTimeout(()=>{voiceState.wake_ack={state:'ready',speaker,available:true,refreshing:false,error:null}},700)};
+window.__TAURI_INTERNALS__.invoke=async(cmd,args)=>{
+ const op=args?.operation;
+ if(cmd==='dispatch'&&op.kind==='preview_wake_ack'){
+  if(!op.tts){if(op.expected_id==null||voiceState.wake_preview?.id===op.expected_id){voiceState.wake_preview={...voiceState.wake_preview,state:'cancelled'};}return {accepted:true};}
+  const id=op.selection_order;const cached=['zh_female_xiaohe_uranus_bigtts','zh_female_kefunvsheng_uranus_bigtts'].includes(op.tts.speaker);
+  voiceState.wake_preview={id,speaker:op.tts.speaker,state:cached?'playing':'preparing',cached};
+  const play=()=>{if(voiceState.wake_preview?.id!==id||voiceState.wake_preview.state==='cancelled')return;voiceState.wake_preview.state='playing';setTimeout(()=>{if(voiceState.wake_preview?.id===id&&voiceState.wake_preview.state==='playing')voiceState.wake_preview.state='done'},2400)};
+  if(cached)play();else setTimeout(play,1600);return {accepted:true,id};
+ }
+ if(cmd==='dispatch'&&op.kind==='assistant_voice_command'&&op.action==='refresh_ack'){prepareSyntheticAck();return {accepted:true};}
+ const result=await ttsInvoke(cmd,args);
+ if(cmd==='dispatch'&&op.kind==='save_assistant_settings')prepareSyntheticAck();
+ return result;
+};
+document.addEventListener('DOMContentLoaded',()=>{const button=document.createElement('button');button.textContent='合成回应失败';button.style='position:fixed;left:12px;bottom:100px;z-index:100';button.onclick=()=>{if(voiceState.wake_preview)voiceState.wake_preview={...voiceState.wake_preview,state:'failed',error:'合成测试：音色不可用'};voiceState.wake_ack={state:'failed',speaker:assistantPreferences.tts.speaker,available:false,refreshing:false,error:'合成测试：音色不可用'}};document.body.append(button)});
+"""
+    elif args.scenario == 'reading-paragraphs':
+        scenario = """
+const readingBlocks=[
+'我们先看本周营销方案的目标。本次讨论需要明确目标客户、投放渠道和预算安排，同时把当前已有的数据与还需要验证的假设分开。初步建议先测试两个渠道，分别观察咨询量、有效线索和转化成本，再根据同一周期的数据判断是否继续投入，避免只凭曝光量就扩大预算。',
+'预算方面，可以先保留一部分作为测试费用，剩余资金等首轮结果出来后再决定分配。每个渠道需要使用相同的统计口径，并明确数据的记录时间和复盘方式。如果其中一个渠道咨询很多但实际转化较少，应先核对客户匹配度和沟通流程，再讨论是否调整内容或停止投放。',
+'下一步先整理现有客户反馈和渠道数据，再补齐测试方案中的验收条件。本次讨论尚未确认具体负责人和截止日期，因此暂时只记录待讨论事项。后续会议可以围绕测试结果比较不同方案的收益、风险和执行成本，形成有证据的选择，并明确哪些问题需要继续观察。'];
+const rawBlocks=readingBlocks.map(t=>t.replaceAll('营销','营削'));
+const p=details[a].paragraphs[0];p.text=readingBlocks.join('');p.raw_text=rawBlocks.join('');p.reading_blocks=readingBlocks;p.raw_reading_blocks=rawBlocks;p.calibration={status:'needs_review',changes:[]};
+details[a].segments[0].text=rawBlocks[0];details[a].segments[1].text=rawBlocks.slice(1).join('');
+details[a].calibration={enabled:true,mode:'standard',pending:0,succeeded:0,needs_review:1,failed:0};
+const readingInvoke=window.__TAURI_INTERNALS__.invoke;
+window.__TAURI_INTERNALS__.invoke=async(cmd,args)=>{
+ const op=args?.operation;
+ if(cmd==='dispatch'&&['read_transcript_snapshot','copy_transcript'].includes(op.kind)){
+  const blocks=op.source==='original'?rawBlocks:readingBlocks;
+  return {meeting_id:a,title:details[a].title,source:op.source,timestamps:op.timestamps,through_ms:60000,hash:'reading-fixture-hash',segments:details[a].segments,paragraphs:[{...p,text:blocks.join(''),reading_blocks:blocks}],text:(op.timestamps?'[00:00] ':'')+blocks.join('\\n\\n')};
+ }
+ if(cmd==='dispatch'&&op.kind==='confirm_calibration'){p.calibration.status='succeeded';details[a].calibration.needs_review=0;details[a].calibration.succeeded=1;return {confirmed:true,paragraph_id:p.id};}
+ return readingInvoke(cmd,args);
+};
+"""
+    elif args.scenario == 'assistant-focus':
+        scenario = """
+assistantPreferences.voice_enabled=true;
+const focusStates=[{state:'standby',message:'待唤醒'},{state:'listening',input_level:.4},{state:'thinking'},{state:'synthesizing'},{state:'speaking',audio_playing:true,speech:{provider:'api'}}];
+let focusPhase=0,focusLosses=0;
+voiceState={meeting_id:a,...focusStates[0]};
+document.addEventListener('DOMContentLoaded',()=>{
+ const report=document.createElement('output');report.setAttribute('aria-label','合成输入焦点验收');report.style='position:fixed;left:12px;bottom:100px;z-index:100;background:white;border:1px solid #aaa;padding:8px;font-size:12px;max-width:190px';document.body.append(report);
+ document.addEventListener('focusout',event=>{if(event.target.matches?.('.duozhou-compose textarea'))focusLosses++;});
+ setInterval(()=>{voiceState={meeting_id:a,...focusStates[++focusPhase%focusStates.length]};report.textContent=`合成焦点回归：工作区刷新${testCalls.filter(c=>c.kind==='list').length}次；会话刷新${testCalls.filter(c=>c.kind==='assistant_detail').length}次；输入离焦${focusLosses}次；当前焦点${document.activeElement?.getAttribute('aria-label')??document.activeElement?.tagName}`;},600);
+});
+"""
+    elif args.scenario == 'assistant-status':
+        scenario = """
+assistantPreferences.voice_enabled=true;
+voiceState={state:'standby',meeting_id:a,message:'待唤醒'};
+const statusChat=assistantOpen(a);
+const statusTurn={id:'status-fixture',conversation_id:statusChat.id,meeting_id:a,state:'running',source:'text'};
+document.addEventListener('DOMContentLoaded',()=>{
+ const panel=document.createElement('div');panel.style='position:fixed;left:12px;bottom:120px;z-index:100;background:white;border:1px solid #aaa;padding:8px;font-size:12px;max-width:180px';
+ const label=document.createElement('label');label.textContent='合成状态验收';const select=document.createElement('select');select.setAttribute('aria-label','合成助手状态');
+ const states={
+ '听会':{state:'standby',message:'待唤醒'},
+ '听讲话':{state:'listening',input_level:.65},
+ '识别问题':{state:'transcribing'},
+ '思考':{state:'thinking',turn_id:'status-fixture'},
+ '语音准备':{state:'synthesizing'},
+ '本机合成':{state:'speaking',audio_playing:false},
+ '语音回答':{state:'speaking',audio_playing:true,speech:{provider:'api'}},
+ '分段间隙':{state:'synthesizing',continuing:true},
+ '回答完毕':{state:'standby',outcome:'spoken'},
+ '文字思考':{state:'off',reason:'disabled',dialogue:statusTurn},
+ '文字完成':{state:'off',reason:'disabled',dialogue:{...statusTurn,state:'succeeded'}},
+ '暂停':{state:'off',reason:'meeting_paused'},
+ '关闭麦克风':{state:'off',reason:'microphone_disabled'},
+ '异常':{state:'error',message:'合成故障：模型服务暂不可用，请重试'}
+ };
+ for(const key of Object.keys(states)){const option=document.createElement('option');option.textContent=key;option.value=key;select.append(option);}
+ select.onchange=()=>{voiceState={meeting_id:a,...structuredClone(states[select.value]),updated_at_ms:Date.now()};statusChat.turns=['synthesizing','speaking'].includes(voiceState.state)?[{id:'complete-synthetic-answer',question:'合成问题：下一步如何推进？',source:'voice',state:'succeeded',answer:{blocks:[{kind:'suggestion',text:'我建议先确认验收标准，再比较两个方案的风险。',sources:[]}],evidence:[]}}]:[];};label.append(select);panel.append(label);document.body.append(panel);
+});
+"""
+    elif args.scenario == 'assistant-interruption':
+        scenario = """
+assistantPreferences.voice_enabled=true;
+voiceState={state:'thinking',meeting_id:a,turn_id:'thinking-fixture',message:'正在回答 · 可唤醒打断'};
+const syntheticChat=assistantOpen(a);
+syntheticChat.turns=[{id:'completed-fixture',source:'voice',question:'合成已完成问题',state:'succeeded',speech_interrupted:true,answer:{blocks:[{kind:'suggestion',text:'合成已完成回答全文保留。',sources:[]}],evidence:[]}},{id:'thinking-fixture',source:'voice',question:'合成正在思考的问题',state:'running',answer:null}];
 """
     elif args.scenario == 'voice-lifecycle':
         scenario = """

@@ -65,10 +65,10 @@ impl Runtime {
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(err)?;
-        if version > 18 {
+        if version > 24 {
             return Err("数据库版本较新，请使用匹配的应用版本".into());
         }
-        if version > 0 && version < 18 {
+        if version > 0 && version < 24 {
             let mut backup = Connection::open(root.join("before-migration.sqlite")).map_err(err)?;
             rusqlite::backup::Backup::new(&conn, &mut backup)
                 .map_err(err)?
@@ -191,8 +191,43 @@ impl Runtime {
             )
             .map_err(err)?;
         }
+        if version < 19 {
+            conn.execute_batch(include_str!("../../../../migrations/0019_tts_settings.sql"))
+                .map_err(err)?;
+        }
+        if version < 20 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0020_tts_agent_plan.sql"
+            ))
+            .map_err(err)?;
+        }
+        if version < 21 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0021_assistant_behavior.sql"
+            ))
+            .map_err(err)?;
+        }
+        if version < 22 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0022_persona_dimensions.sql"
+            ))
+            .map_err(err)?;
+        }
+        if version < 23 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0023_persona_consolidation.sql"
+            ))
+            .map_err(err)?;
+        }
+        if version < 24 {
+            conn.execute_batch(include_str!(
+                "../../../../migrations/0024_composed_assistant.sql"
+            ))
+            .map_err(err)?;
+        }
         crate::workspace::seed_templates(&conn)?;
         conn.execute("INSERT OR IGNORE INTO template_versions SELECT id,version,name,instructions FROM assistant_templates", []).map_err(err)?;
+        crate::templates::seed_missing(&conn)?;
         conn.execute("UPDATE summary_schedules SET tail_done=1", [])
             .map_err(err)?;
         conn.execute("UPDATE meetings SET state='interrupted',last_error='应用退出导致采集中断，请恢复或结束会议' WHERE state IN ('recording','paused')", []).map_err(err)?;
@@ -357,7 +392,9 @@ impl Runtime {
                 .unwrap_or(&[]),
             matches!(data["state"].as_str(), Some("recording" | "finalizing")),
         )?;
-        data["paragraphs"] = json!(crate::calibration::decorate(&db, meeting, projected)?);
+        data["paragraphs"] = json!(crate::paragraphs::readable(crate::calibration::decorate(
+            &db, meeting, projected
+        )?));
         data["calibration"] = crate::calibration::detail(&db, meeting)?;
         data["summary_pending_segments"]=json!(db.query_row("SELECT count(*) FROM transcript_segments s LEFT JOIN summary_coverage c ON c.meeting_id=s.meeting_id AND c.segment_id=s.id WHERE s.meeting_id=? AND (c.revision IS NULL OR c.revision!=s.current_revision)",[meeting],|r|r.get::<_,u64>(0)).map_err(err)?);
         data["summary_pending_bytes"]=json!(db.query_row("SELECT coalesce(sum(length(CAST(r.text AS BLOB))),0) FROM transcript_segments s JOIN transcript_revisions r ON r.segment_id=s.id AND r.revision=s.current_revision LEFT JOIN summary_coverage c ON c.meeting_id=s.meeting_id AND c.segment_id=s.id WHERE s.meeting_id=? AND s.state IN('final','edited') AND (c.revision IS NULL OR c.revision!=s.current_revision)",[meeting],|r|r.get::<_,u64>(0)).map_err(err)?);
@@ -376,7 +413,7 @@ impl Runtime {
                 |r| r.get::<_, String>(0)
             )
             .map_err(err)?);
-        data["template"] = db.query_row("SELECT v.template_id,v.version,v.name,v.instructions FROM template_versions v JOIN meetings m ON m.assistant_id=v.template_id AND m.template_version=v.version WHERE m.id=?",[meeting],|r|Ok(json!({"id":r.get::<_,String>(0)?,"version":r.get::<_,u32>(1)?,"name":r.get::<_,String>(2)?,"instructions":r.get::<_,String>(3)?}))).unwrap_or(json!(null));
+        data["template"] = crate::templates::bound(&db, meeting)?;
         drop(db);
         data["enhancement"] = crate::enhancement::detail(self, meeting)?;
         data["model_profile"] = crate::models::meeting_dto(self, meeting)?;
@@ -538,7 +575,7 @@ mod recovery_tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                 .unwrap(),
-            18
+            24
         );
         assert!(root.join("before-migration.sqlite").is_file());
         drop(rt);

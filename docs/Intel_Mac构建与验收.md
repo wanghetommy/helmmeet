@@ -2,7 +2,7 @@
 
 2026年10月19日 · R54/A54/TC-54 · 源码接入，Intel真人/设备验收待用户提供机器
 
-最新小舵首版双架构结果见[开发验证](./小舵全局助手开发验证.md)。下方“本轮工程结果”及ZIP校验值为小舵接入前的历史构建；当前新包以该开发验证中的.app与架构结果为准，旧ZIP不包含小舵功能。
+最新Intel包见本文末尾“2026年10月26日兼容检查与新包”，已包含R109及此前助手/TTS更新。下方“本轮工程结果”及其ZIP校验值是小舵接入前的历史构建，旧ZIP不包含小舵功能；小舵首版双架构结果见[开发验证](./小舵全局助手开发验证.md)。
 
 ## 支持范围
 
@@ -88,3 +88,16 @@ CI增加两个目标的编译矩阵，交叉目标只编译测试，不运行；
 - Intel传输压缩包：`target/x86_64-apple-darwin/release/bundle/macos/HelmMeet-macos-x86_64.zip`，5,971,955字节；解压临时副本后x86_64及严格签名校验通过，副本已清理。SHA256：`9e0649b5e2884a697965946b8d0cdd29cb777451d77cebbe24c0caeeb8604c91`，同目录提供`.zip.sha256`。
 
 补齐Git忽略例外，保证两份`build-support/*.ini`目标配置作为源码纳入版本控制候选，不被原`build-*/`通配规则屏蔽。没有提交/推送，本次未实际执行GitHub CI。未录制音频、调用远程模型或操作正式会议数据；真实Intel权限/采集/NS/AEC/中文实时性能及更广设备矩阵仍待验收。
+
+## 2026年10月26日兼容检查与新包
+
+按用户要求先做基础兼容检查，再执行`npm run desktop:build:intel -- --bundles app`。包包含当前R109经验回答规则、R108音色切换试听与缓存、R107完整回应播放等现有更新。
+
+- 打包前`npm run verify`通过：契约16、Agent10、存储33、typecheck、44份文档链接及生产构建；Intel严格全目标clippy通过（包括测试代码编译），fmt和差异检查通过。首次verify因外层沙箱不允许sandbox-exec嵌套失败，按正常本机权限重跑通过，未绕过应用自身隔离。
+- 在已有Rosetta下执行Intel Node运行时的9项Agent协议/人设/修复/压缩合成测试及APM C ABI self-test，均通过；打包后的Intel主程序`--check-audio-processing`也通过，处理1000个纯合成帧，未打开设备/数据库/UI、未联网。这些结果不是Intel实机验收。
+- 主程序、Node、Swift/APM/voice包装静态库均为x86_64；主程序Mach-O及Info.plist最低系统14.0，运行依赖仅系统库/框架。Pi第三方包原样包含x64和arm64两份可选native helper，加载器按process.arch选择，Intel使用darwin-x64；没有把可选arm64资源误判为主程序架构。GGML METAL/NATIVE/AVX/AVX2/FMA/F16C/BMI2/AVX512/AMX关闭，Intel无Whisper Metal特性。
+- 包内Agent main/persona与当前源码一致，离线KWS/VAD文件hash与锁定清单一致，未携带credentials.json、开发local.json或正式app.sqlite。应用本机ad-hoc deep/strict签名通过。
+
+独立产物：`artifacts/releases/20261026-intel-compatible/HelmMeet.app`；传输包：同目录`HelmMeet-macos-x86_64.zip`（100,482,276字节，约95.8MiB）。ZIP SHA256为`3de4b9b5f051d934c9676123a706f5cee2f6cc1fe3f5b2b131e562ac7a940c66`，同目录提供`.zip.sha256`。主程序SHA256为`b27eb42ba95abdabd2670fc08121ea825217dd465b1eecf4cf51978ad6af05c9`。压缩包校验及解压至临时目录后的deep/strict签名、主程序/Node架构和hash复核通过；临时副本已清理。
+
+本轮未重新运行完整Rust单测；R109此前已记录的输入预算单测失败仍保留，不能以本轮clippy通过认定已修复。真实Intel Mac的启动/权限/录音/ASR性能和外放双讲仍待验收；没有执行真实录音、TTS/模型远程调用，也未替换或重启正在运行的ARM应用。
